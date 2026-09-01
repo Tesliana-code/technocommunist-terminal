@@ -1470,3 +1470,211 @@ fn path_026_failure_domain_id_laundering_must_not_create_independence() {
         "FAILURE-DOMAIN LAUNDERING VIOLATION: renaming one underlying bottleneck into many failure-domain IDs created economic importance"
     );
 }
+
+#[test]
+fn path_027_shared_structural_bottleneck_must_be_graph_derived() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(bottlenecks, vec![CapabilityId("d".into())]);
+}
+
+#[test]
+fn path_027a_genuinely_independent_branches_have_no_shared_bottleneck() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // A -> B -> D
+    // A -> C -> E
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "e"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        Vec::<CapabilityId>::new(),
+        "INDEPENDENCE VIOLATION: disjoint branches were reported as converging"
+    );
+}
+
+#[test]
+fn path_027b_incoming_edge_count_alone_is_not_evidence_of_a_shared_bottleneck() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // Only one branch leaves A (through B). D has two incoming edges
+    // (from B and from E), but both are internal to the single branch
+    // under B, so D is not fed by two independent branches of A.
+    //
+    // A naive "count incoming edges to the node" implementation would
+    // wrongly flag D here.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("b", "e"),
+        DependencyEdge::new("e", "d"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        Vec::<CapabilityId>::new(),
+        "SEMANTIC VIOLATION: single-branch indegree was mistaken for branch convergence"
+    );
+}
+
+#[test]
+fn path_027c_unrelated_indegree_elsewhere_in_the_graph_is_not_evidence() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // A only reaches B -> D. Node Y has two incoming edges, but from X
+    // and Z, which are entirely unrelated to A. Y must not appear.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("z", "y"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        Vec::<CapabilityId>::new(),
+        "SEMANTIC VIOLATION: bottleneck was derived from an unrelated part of the graph"
+    );
+}
+
+#[test]
+fn path_027d_duplicate_edges_do_not_manufacture_an_independent_branch() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // A -> B repeated five times, A -> C once, both flowing into D.
+    // Repetition of one edge must not be treated as extra branches.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        vec![CapabilityId("d".into())],
+        "DUPLICATE-EDGE LAUNDERING VIOLATION: repeating an edge changed the structural result"
+    );
+}
+
+#[test]
+fn path_027e_cycles_terminate_and_do_not_manufacture_arbitrary_bottlenecks() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // A -> B -> A (cycle back to the source)
+    // B -> X -> X-loop (cycle not touching the source)
+    // B -> D, A -> C -> D
+    //
+    // Must terminate, must still find D as the genuine convergence, and
+    // must NOT report X (only reachable through B's single branch, and
+    // sitting in its own cycle) as shared.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        vec![CapabilityId("d".into())],
+        "CYCLE VIOLATION: a cycle either failed to terminate or manufactured a bogus bottleneck"
+    );
+}
+
+#[test]
+fn path_027f_metadata_identifiers_cannot_influence_a_topology_only_result() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // Same topology (A->B->D, A->C->D), described using edges derived
+    // from records that would carry wildly different DependencyPathId /
+    // FailureDomainId metadata upstream. DependencyEdge itself carries no
+    // such metadata, so the graph-derived result must be identical
+    // regardless of what those identifiers were.
+    let edges_domain_set_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let edges_domain_set_2 = vec![
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("c", "d"),
+        DependencyEdge::new("b", "d"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let result_1 = shared_structural_bottlenecks(&source, &edges_domain_set_1);
+    let result_2 = shared_structural_bottlenecks(&source, &edges_domain_set_2);
+
+    assert_eq!(
+        result_1, result_2,
+        "METADATA/ORDER LEAKAGE VIOLATION: topology-only result depended on edge ordering"
+    );
+    assert_eq!(result_1, vec![CapabilityId("d".into())]);
+}
+
+#[test]
+fn path_027g_reconvergence_before_the_final_node_propagates_downstream() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, shared_structural_bottlenecks};
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X -> D
+    //
+    // This is a documented policy choice, not an obvious fact: branches B
+    // and C converge first at X, then continue together to D. This
+    // implementation reports BOTH X and D as shared, because D remains
+    // reachable from both of A's original branches (see doc comment on
+    // shared_structural_bottlenecks). A "first convergence point only"
+    // policy would report just X. If PATH-028 picks a different policy,
+    // this assertion is the one that should change.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "d"),
+    ];
+
+    let bottlenecks = shared_structural_bottlenecks(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        bottlenecks,
+        vec![CapabilityId("d".into()), CapabilityId("x".into())],
+    );
+}

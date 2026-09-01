@@ -521,6 +521,133 @@ pub struct DependencyId(pub String);
 pub struct CapabilityId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DependencyEdge {
+    pub source: CapabilityId,
+    pub target: CapabilityId,
+}
+
+impl DependencyEdge {
+    pub fn new(source: &str, target: &str) -> Self {
+        Self {
+            source: CapabilityId(source.to_string()),
+            target: CapabilityId(target.to_string()),
+        }
+    }
+}
+
+/// Graph-derived structural bottlenecks reachable from `source`.
+///
+/// PATH-026 showed that identifier metadata (`DependencyPathId`,
+/// `FailureDomainId`) is not authoritative evidence of independence: the
+/// same underlying bottleneck could be relabeled into many identifiers to
+/// manufacture apparent independence. `DependencyEdge` deliberately carries
+/// no such metadata, so this function can only ever see topology.
+///
+/// A node is a shared structural bottleneck relative to `source` when it is
+/// reachable from at least two of `source`'s *distinct* immediate
+/// out-edges (its structural branches). This is deliberately not "count
+/// incoming edges to the node": a node can have many incoming edges from an
+/// unrelated part of the graph, or from within a single branch, without
+/// ever being fed by two independent branches of `source`.
+///
+/// Ambiguity (see PATH-027 research notes): if two branches reconverge at
+/// an intermediate node X before continuing on to D, this implementation
+/// reports *both* X and D as shared, because D remains reachable from both
+/// of source's original branches. An alternative policy would report only
+/// the first convergence point (X) and treat everything downstream of it as
+/// no longer attributable to "two branches" (since from X onward there is
+/// structurally only one path forward). This implementation takes the
+/// "downstream reachability" reading, not the "first convergence point"
+/// reading, and callers relying on the distinction should treat this as an
+/// open protocol question rather than settled semantics.
+pub fn shared_structural_bottlenecks(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Structural adjacency, deduped so a repeated edge cannot manufacture
+    // an additional branch or inflate a convergence count.
+    let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
+    let mut seen_edges: HashSet<(CapabilityId, CapabilityId)> = HashSet::new();
+
+    for edge in edges {
+        let key = (edge.source.clone(), edge.target.clone());
+        if seen_edges.insert(key) {
+            adjacency
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+        }
+    }
+
+    // Distinct structural branches leaving the source. A self-loop back to
+    // the source is not a downstream branch.
+    let mut branch_roots: Vec<CapabilityId> = Vec::new();
+    let mut seen_roots: HashSet<CapabilityId> = HashSet::new();
+    if let Some(children) = adjacency.get(source) {
+        for child in children {
+            if child != source && seen_roots.insert(child.clone()) {
+                branch_roots.push(child.clone());
+            }
+        }
+    }
+
+    // A single branch cannot converge with anything.
+    if branch_roots.len() < 2 {
+        return Vec::new();
+    }
+
+    // For each branch, compute its full downstream reachable set
+    // (including the branch root itself) with a bounded, visited-set BFS.
+    // The per-branch visited set is what makes this cycle-safe: a cycle
+    // just stops re-expanding a node it has already reached, rather than
+    // looping forever or inflating the convergence count.
+    //
+    // A cycle that leads back to `source` is not expanded further: once a
+    // branch's traversal reaches the source again, continuing on from
+    // there would walk back down *other* branches too (they all start at
+    // source), silently merging branches that are not actually connected
+    // to each other except through the shared origin. Treating source as a
+    // dead end keeps branches isolated from one another, which is the
+    // property this function is supposed to be measuring.
+    let mut convergence_count: HashMap<CapabilityId, usize> = HashMap::new();
+
+    for root in &branch_roots {
+        let mut visited: HashSet<CapabilityId> = HashSet::new();
+        let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+        visited.insert(root.clone());
+        queue.push_back(root.clone());
+
+        while let Some(node) = queue.pop_front() {
+            if node == *source {
+                continue;
+            }
+            if let Some(children) = adjacency.get(&node) {
+                for child in children {
+                    if visited.insert(child.clone()) {
+                        queue.push_back(child.clone());
+                    }
+                }
+            }
+        }
+
+        for node in visited {
+            *convergence_count.entry(node).or_insert(0) += 1;
+        }
+    }
+
+    let mut bottlenecks: Vec<CapabilityId> = convergence_count
+        .into_iter()
+        .filter(|(node, count)| *count >= 2 && node != source)
+        .map(|(node, _)| node)
+        .collect();
+
+    bottlenecks.sort_by(|a, b| a.0.cmp(&b.0));
+    bottlenecks
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyPathId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
