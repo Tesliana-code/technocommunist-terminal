@@ -560,14 +560,15 @@ impl DependencyEdge {
 /// "downstream reachability" reading, not the "first convergence point"
 /// reading, and callers relying on the distinction should treat this as an
 /// open protocol question rather than settled semantics.
-pub fn shared_structural_bottlenecks(
-    source: &CapabilityId,
+/// Structural adjacency, deduped so a repeated edge cannot manufacture an
+/// additional branch or inflate a convergence count. Shared by every
+/// PATH-027/028/029/030 primitive below so their traversal logic does not
+/// drift out of sync with each other.
+fn build_structural_adjacency(
     edges: &[DependencyEdge],
-) -> Vec<CapabilityId> {
-    use std::collections::{HashMap, HashSet, VecDeque};
+) -> std::collections::HashMap<CapabilityId, Vec<CapabilityId>> {
+    use std::collections::{HashMap, HashSet};
 
-    // Structural adjacency, deduped so a repeated edge cannot manufacture
-    // an additional branch or inflate a convergence count.
     let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
     let mut seen_edges: HashSet<(CapabilityId, CapabilityId)> = HashSet::new();
 
@@ -581,8 +582,19 @@ pub fn shared_structural_bottlenecks(
         }
     }
 
-    // Distinct structural branches leaving the source. A self-loop back to
-    // the source is not a downstream branch.
+    adjacency
+}
+
+/// `source`'s distinct immediate structural branches (raw, unnormalized --
+/// see [`effective_structural_branches`] for the subsumption-aware
+/// alternative). A self-loop back to the source is not a downstream
+/// branch.
+fn immediate_branch_roots(
+    source: &CapabilityId,
+    adjacency: &std::collections::HashMap<CapabilityId, Vec<CapabilityId>>,
+) -> Vec<CapabilityId> {
+    use std::collections::HashSet;
+
     let mut branch_roots: Vec<CapabilityId> = Vec::new();
     let mut seen_roots: HashSet<CapabilityId> = HashSet::new();
     if let Some(children) = adjacency.get(source) {
@@ -592,6 +604,21 @@ pub fn shared_structural_bottlenecks(
             }
         }
     }
+    branch_roots
+}
+
+/// Core of `shared_structural_bottlenecks`, generalized (PATH-030) to
+/// accept an explicit branch-root set instead of always deriving it from
+/// `source`'s raw immediate edges. This is what lets
+/// `shared_structural_bottlenecks_from_effective_branches` reuse the exact
+/// same convergence-counting traversal over a subsumption-normalized
+/// branch set, instead of duplicating it.
+fn shared_bottlenecks_over_branches(
+    source: &CapabilityId,
+    adjacency: &std::collections::HashMap<CapabilityId, Vec<CapabilityId>>,
+    branch_roots: &[CapabilityId],
+) -> Vec<CapabilityId> {
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     // A single branch cannot converge with anything.
     if branch_roots.len() < 2 {
@@ -613,7 +640,7 @@ pub fn shared_structural_bottlenecks(
     // property this function is supposed to be measuring.
     let mut convergence_count: HashMap<CapabilityId, usize> = HashMap::new();
 
-    for root in &branch_roots {
+    for root in branch_roots {
         let mut visited: HashSet<CapabilityId> = HashSet::new();
         let mut queue: VecDeque<CapabilityId> = VecDeque::new();
         visited.insert(root.clone());
@@ -645,6 +672,334 @@ pub fn shared_structural_bottlenecks(
 
     bottlenecks.sort_by(|a, b| a.0.cmp(&b.0));
     bottlenecks
+}
+
+pub fn shared_structural_bottlenecks(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    let adjacency = build_structural_adjacency(edges);
+    let branch_roots = immediate_branch_roots(source, &adjacency);
+    shared_bottlenecks_over_branches(source, &adjacency, &branch_roots)
+}
+
+/// PATH-030: `shared_structural_bottlenecks` computed over
+/// `effective_structural_branches` instead of `source`'s raw immediate
+/// edges. See the PATH-030 research notes (module-level doc on
+/// `effective_structural_branches`, and FIND-008) for when this differs
+/// from the raw version and why.
+pub fn shared_structural_bottlenecks_from_effective_branches(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    let adjacency = build_structural_adjacency(edges);
+    let effective_branches = effective_structural_branches(source, edges);
+    shared_bottlenecks_over_branches(source, &adjacency, &effective_branches)
+}
+
+/// Candidate FIRST-CONVERGENCE semantics for structural independence loss
+/// (PATH-028).
+///
+/// `shared_structural_bottlenecks` reports every downstream node reachable
+/// from two or more of `source`'s branches. PATH-028 investigates whether
+/// that is the right economic signal, or whether only the *first* point
+/// where branches converge represents a genuine structural loss of
+/// independence -- with everything downstream of that point being one
+/// continuation of the same loss, not additional independent losses.
+///
+/// A node is a first structural convergence when:
+/// 1. it is a shared structural bottleneck (per
+///    [`shared_structural_bottlenecks`]), AND
+/// 2. no *other* shared structural bottleneck can reach it.
+///
+/// Condition 2 is what strips downstream continuation out of the result:
+/// for `A->B->X->D->E->F, A->C->X`, D/E/F are shared bottlenecks, but X can
+/// reach all three of them, so they are excluded -- only X remains.
+///
+/// KNOWN AMBIGUITY: if the shared bottlenecks themselves form a cycle
+/// (mutual reachability between two or more of them), condition 2 makes
+/// every member of that cycle disqualify every other member, and this
+/// function reports *none* of them as "first" even though a real
+/// structural convergence occurred just upstream of the cycle. See
+/// `path_028_f_cyclic_shared_nodes_make_first_convergence_ill_defined` for
+/// the smallest known counterexample. This is reported as an open
+/// semantic gap, not silently resolved.
+/// Core of `first_structural_convergences`: given an already-computed
+/// shared-bottleneck set (from either the raw or the effective-branch
+/// version of `shared_structural_bottlenecks`), strip out any node that
+/// another member of that same set can reach.
+fn first_convergences_over_shared(
+    adjacency: &std::collections::HashMap<CapabilityId, Vec<CapabilityId>>,
+    shared: std::collections::HashSet<CapabilityId>,
+) -> Vec<CapabilityId> {
+    use std::collections::{HashSet, VecDeque};
+
+    if shared.len() < 2 {
+        let mut trivial: Vec<CapabilityId> = shared.into_iter().collect();
+        trivial.sort_by(|a, b| a.0.cmp(&b.0));
+        return trivial;
+    }
+
+    let mut first: Vec<CapabilityId> = Vec::new();
+
+    for candidate in &shared {
+        let mut reached_by_other_shared = false;
+
+        for other in &shared {
+            if other == candidate {
+                continue;
+            }
+
+            // Bounded, cycle-safe reachability check: can `other` reach
+            // `candidate` at all?
+            let mut visited: HashSet<CapabilityId> = HashSet::new();
+            let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+            visited.insert(other.clone());
+            queue.push_back(other.clone());
+            let mut found = false;
+
+            while let Some(node) = queue.pop_front() {
+                if node == *candidate {
+                    found = true;
+                    break;
+                }
+                if let Some(children) = adjacency.get(&node) {
+                    for child in children {
+                        if visited.insert(child.clone()) {
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+            }
+
+            if found {
+                reached_by_other_shared = true;
+                break;
+            }
+        }
+
+        if !reached_by_other_shared {
+            first.push(candidate.clone());
+        }
+    }
+
+    first.sort_by(|a, b| a.0.cmp(&b.0));
+    first
+}
+
+pub fn first_structural_convergences(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    let adjacency = build_structural_adjacency(edges);
+    let shared = shared_structural_bottlenecks(source, edges)
+        .into_iter()
+        .collect();
+    first_convergences_over_shared(&adjacency, shared)
+}
+
+/// PATH-030: `first_structural_convergences` computed over
+/// `shared_structural_bottlenecks_from_effective_branches` instead of the
+/// raw shared-bottleneck set. See PATH-030 research notes / FIND-008.
+pub fn first_structural_convergences_from_effective_branches(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    let adjacency = build_structural_adjacency(edges);
+    let shared = shared_structural_bottlenecks_from_effective_branches(source, edges)
+        .into_iter()
+        .collect();
+    first_convergences_over_shared(&adjacency, shared)
+}
+
+/// Candidate SUBSUMED-BRANCH semantics for structural independence
+/// (PATH-029).
+///
+/// PATH-027/028 assumed that `source`'s distinct immediate out-edges are
+/// each an independent "branch". PATH-029 attacks that assumption with:
+///
+/// ```text
+/// A -> B -> C
+/// A -> C -> D
+/// ```
+///
+/// `B` and `C` are both immediate children of `A`, so the earlier
+/// primitives count two branches. But `B`'s only route to anything is
+/// through `C`: remove `C` and `B` reaches nothing beyond itself. `C`'s
+/// reach does not depend on `B` at all. So `B` contributes no structural
+/// independence beyond what `C` already provides -- `B` is *subsumed* by
+/// `C`.
+///
+/// ## Definition
+///
+/// For two distinct branch roots `r1`, `r2`, `r1` is subsumed by `r2`
+/// when:
+/// 1. `r2` is reachable from `r1`, AND
+/// 2. deleting `r2` from the graph (treating it as a dead end) leaves
+///    `r1` unable to reach anything other than itself and `r2`.
+///
+/// This is deliberately NOT plain reachable-set containment
+/// (`reachable(r1) ⊆ reachable(r2)`). On the example above, plain
+/// containment gets the direction backwards: `reachable(C) = {C, D}` is
+/// the *smaller* set and is a subset of `reachable(B) = {B, C, D}`, which
+/// would flag `C` -- the branch that needs nothing from `B` -- as the
+/// subsumed one. The counterfactual-removal definition above correctly
+/// identifies `B`, the branch whose entire value is gatekept by `C`, as
+/// the redundant one. See `path_029_counterexample_naive_containment_is_backwards`.
+///
+/// This definition also naturally preserves genuine partial independence:
+/// if `B` reaches `C`'s territory but *also* has unique reachable nodes
+/// that do not depend on `C` (e.g. `A->B->X, A->C->X, B->Y`), condition 2
+/// fails (`Y` survives `C`'s removal), so `B` is not subsumed.
+///
+/// ## Cyclic subsumption among branch roots
+///
+/// Two branch roots can subsume each other (a 2-cycle: `A->B, A->C, B->C,
+/// C->B`), and PATH-029 found that three or more branch roots can form a
+/// longer cycle of *one-directional* subsumption (`B` subsumed by `C`,
+/// `C` subsumed by `E`, `E` subsumed by `B`) that is not pairwise mutual
+/// at any single edge. Dropping every branch that is subsumed by *some*
+/// other branch, without accounting for such cycles, collapses the whole
+/// cycle to an empty result -- three genuine branches vanishing entirely
+/// (see `path_029_d2_three_way_subsumption_cycle_would_collapse_to_empty_without_scc_handling`).
+/// That is treated as a real defect, not an accepted ambiguity: the fix is
+/// a transitive closure over the (small, bounded-by-source-out-degree)
+/// subsumption relation among branch roots, grouping any set of mutually
+/// reaching branch roots into one equivalence class and keeping a single
+/// deterministic representative (the lexicographically smallest
+/// `CapabilityId`) per class. This is a narrowly scoped SCC condensation
+/// of the subsumption relation *among branch roots only* -- not a
+/// general-purpose graph SCC library over the whole capability graph.
+pub fn effective_structural_branches(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
+    let mut seen_edges: HashSet<(CapabilityId, CapabilityId)> = HashSet::new();
+    for edge in edges {
+        let key = (edge.source.clone(), edge.target.clone());
+        if seen_edges.insert(key) {
+            adjacency
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+        }
+    }
+
+    let mut branch_roots: Vec<CapabilityId> = Vec::new();
+    let mut seen_roots: HashSet<CapabilityId> = HashSet::new();
+    if let Some(children) = adjacency.get(source) {
+        for child in children {
+            if child != source && seen_roots.insert(child.clone()) {
+                branch_roots.push(child.clone());
+            }
+        }
+    }
+
+    if branch_roots.len() < 2 {
+        branch_roots.sort_by(|a, b| a.0.cmp(&b.0));
+        return branch_roots;
+    }
+
+    // subsumed[i][j]: is branch_roots[i] subsumed by branch_roots[j]?
+    // BFS from root_i with both `source` and `root_j` treated as dead
+    // ends (source, to keep branches isolated from each other as in
+    // shared_structural_bottlenecks; root_j, to simulate its removal).
+    let n = branch_roots.len();
+    let mut subsumed = vec![vec![false; n]; n];
+
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let root_i = &branch_roots[i];
+            let root_j = &branch_roots[j];
+
+            let mut visited: HashSet<CapabilityId> = HashSet::new();
+            let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+            visited.insert(root_i.clone());
+            queue.push_back(root_i.clone());
+
+            while let Some(node) = queue.pop_front() {
+                if node == *source || node == *root_j {
+                    continue;
+                }
+                if let Some(children) = adjacency.get(&node) {
+                    for child in children {
+                        if visited.insert(child.clone()) {
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+            }
+
+            let reaches_root_j = visited.contains(root_j);
+            let remainder = visited
+                .iter()
+                .filter(|n| *n != root_i && *n != root_j)
+                .count();
+
+            subsumed[i][j] = reaches_root_j && remainder == 0;
+        }
+    }
+
+    // Transitive closure of the subsumption relation, so cycles of
+    // one-directional subsumption among three or more branch roots are
+    // detected as a single equivalence class rather than each branch
+    // dropping the next until nothing is left.
+    let mut reach = subsumed.clone();
+    for k in 0..n {
+        for i in 0..n {
+            if !reach[i][k] {
+                continue;
+            }
+            for j in 0..n {
+                if reach[k][j] {
+                    reach[i][j] = true;
+                }
+            }
+        }
+    }
+
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        let mut group_min = branch_roots[i].0.clone();
+        for j in 0..n {
+            if i != j && reach[i][j] && reach[j][i] && branch_roots[j].0 < group_min {
+                group_min = branch_roots[j].0.clone();
+            }
+        }
+
+        if branch_roots[i].0 != group_min {
+            // Not the canonical representative of its equivalence class.
+            keep[i] = false;
+            continue;
+        }
+
+        // Canonical within its own class; drop if a genuinely different
+        // (non-mutual) class strictly dominates it.
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let mutual = reach[i][j] && reach[j][i];
+            if !mutual && reach[i][j] {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+
+    let mut effective: Vec<CapabilityId> = (0..n)
+        .filter(|&i| keep[i])
+        .map(|i| branch_roots[i].clone())
+        .collect();
+
+    effective.sort_by(|a, b| a.0.cmp(&b.0));
+    effective
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

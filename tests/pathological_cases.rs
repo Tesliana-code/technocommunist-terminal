@@ -1678,3 +1678,1126 @@ fn path_027g_reconvergence_before_the_final_node_propagates_downstream() {
         vec![CapabilityId("d".into()), CapabilityId("x".into())],
     );
 }
+
+// ---------------------------------------------------------------------
+// PATH-028: FIRST CONVERGENCE vs DOWNSTREAM PROPAGATION
+//
+// PATH-027 left an explicitly documented open question: when branches
+// reconverge at X and then continue together to D (and beyond),
+// shared_structural_bottlenecks() reports every downstream node as
+// "shared" (transitive reachability semantics). PATH-028 tests a second
+// candidate primitive, first_structural_convergences(), which reports
+// only the first point of convergence per branch pair, on the theory
+// that one structural loss of independence should not be counted
+// repeatedly just because the shared path continues downstream.
+//
+// Both primitives are kept side by side. Neither is declared "correct"
+// without adversarial evidence.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_028_a_diamond_first_convergence_matches_shared_bottleneck() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    // A -> B -> D
+    // A -> C -> D
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("d".into())],
+        "a lone convergence point must be reported as first convergence"
+    );
+}
+
+#[test]
+fn path_028_b_long_tail_downstream_is_not_repeated_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+        shared_structural_bottlenecks,
+    };
+
+    // A -> B -> X -> D -> E -> F
+    // A -> C -> X
+    //
+    // One structural loss of independence (at X), followed by a long
+    // shared tail. shared_structural_bottlenecks() is expected to report
+    // the whole tail; first_structural_convergences() must not.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("d", "e"),
+        DependencyEdge::new("e", "f"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let shared = shared_structural_bottlenecks(&source, &edges);
+    let first = first_structural_convergences(&source, &edges);
+
+    println!(
+        "PATH-028 downstream convergence\nshared-reachability = {:?}\nfirst-convergence   = {:?}",
+        shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+    );
+
+    assert_eq!(
+        shared,
+        vec![
+            CapabilityId("d".into()),
+            CapabilityId("e".into()),
+            CapabilityId("f".into()),
+            CapabilityId("x".into()),
+        ],
+        "shared_structural_bottlenecks must still report the full downstream tail"
+    );
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("x".into())],
+        "DOWNSTREAM MULTIPLICITY VIOLATION: first_structural_convergences must not \
+         repeat the same structural loss of independence for D/E/F"
+    );
+}
+
+#[test]
+fn path_028_c_multiple_separate_convergence_regions_are_each_first() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    // Three branches out of A. B+C converge at X. B+E separately converge
+    // at Y. X and Y are unrelated sinks -- two distinct, non-overlapping
+    // convergence regions sharing only the source and one common branch.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("b", "y"),
+        DependencyEdge::new("e", "y"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("x".into()), CapabilityId("y".into())],
+        "two independent convergence regions must both be reported"
+    );
+}
+
+#[test]
+fn path_028_d_duplicate_edges_cannot_create_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("x", "d"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("x".into())],
+        "DUPLICATE-EDGE LAUNDERING VIOLATION: repeated edges changed the first-convergence result"
+    );
+}
+
+#[test]
+fn path_028_e_cycles_through_source_do_not_manufacture_fake_first_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    // Same cycle-through-source shape as PATH-027e: A<->B, B<->M (a cycle
+    // that does not touch the source), B->X, A->C->X.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "m"),
+        DependencyEdge::new("m", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("x".into())],
+        "CYCLE VIOLATION: a cycle through the source manufactured a bogus first-convergence node"
+    );
+}
+
+#[test]
+fn path_028_f_cyclic_shared_nodes_make_first_convergence_ill_defined() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X <-> Y   (cycle downstream of the real convergence point)
+    //
+    // The genuine structural convergence happens at X. But X and Y are
+    // mutually reachable, so under the "no other shared node reaches me"
+    // rule, X disqualifies Y and Y disqualifies X: neither is reported.
+    //
+    // This is the smallest known counterexample where
+    // first_structural_convergences() is not uniquely defined by its own
+    // rule. It is captured here as a DOCUMENTED LIMITATION, not corrected
+    // by adding cycle-condensation machinery -- see FIND-008.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        Vec::<CapabilityId>::new(),
+        "KNOWN AMBIGUITY: mutual reachability among shared nodes collapses the \
+         first-convergence result to empty even though a real convergence exists at X. \
+         If this assertion ever changes, update the ambiguity note on \
+         first_structural_convergences() and FIND-008 accordingly."
+    );
+}
+
+#[test]
+fn path_028_g_one_branch_feeding_another_branch_root_is_a_separate_open_question() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    // A -> B -> C   (B flows directly into A's OTHER branch root, C)
+    // A -> C -> D
+    //
+    // B contributes no reachable node that C does not already reach: B's
+    // entire downstream continuation is a subset of C's. Under the
+    // current branch-counting rule, C itself becomes a "shared" node
+    // (reachable from branch B via B->C, and trivially from branch C),
+    // and is reported as the first convergence. Whether a branch root
+    // being re-fed by another branch should count as a structural loss
+    // of independence at all is a separate open question from the
+    // first-vs-downstream question PATH-028 was scoped to answer; it is
+    // recorded here rather than silently resolved.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("c".into())],
+        "branch-root absorption produced an unexpected first-convergence result; \
+         re-examine this case before relying on it economically"
+    );
+}
+
+#[test]
+fn path_028_h_unrelated_graph_regions_do_not_affect_source_relative_result() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        // Unrelated region: its own convergence, nothing to do with A.
+        DependencyEdge::new("p", "q"),
+        DependencyEdge::new("p", "r"),
+        DependencyEdge::new("q", "z"),
+        DependencyEdge::new("r", "z"),
+    ];
+
+    let first = first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        first,
+        vec![CapabilityId("x".into())],
+        "SEMANTIC VIOLATION: an unrelated convergence region leaked into a source-relative result"
+    );
+}
+
+#[test]
+fn path_028_i_edge_ordering_and_naming_cannot_affect_first_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences,
+    };
+
+    let edges_order_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+
+    let edges_order_2 = vec![
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "b"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let result_1 = first_structural_convergences(&source, &edges_order_1);
+    let result_2 = first_structural_convergences(&source, &edges_order_2);
+
+    assert_eq!(result_1, result_2);
+    assert_eq!(result_1, vec![CapabilityId("x".into())]);
+}
+
+// ---------------------------------------------------------------------
+// PATH-029: SUBSUMED BRANCHES AND STRUCTURAL INDEPENDENCE
+//
+// PATH-028-g flagged an open question: in `A->B->C, A->C->D`, B and C
+// are both immediate children of A, but B's only route anywhere is
+// through C. Does B count as an independent structural branch at all?
+//
+// effective_structural_branches() answers this with a counterfactual
+// removal test, not raw reachable-set containment (which gets the
+// direction backwards on this exact graph -- see path_029_a2).
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_029_a1_direct_branch_absorption_collapses_to_one_effective_branch() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B -> C
+    // A -> C -> D
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("c".into())],
+        "B's entire reach is gatekept by C; B must not survive as an independent branch"
+    );
+}
+
+#[test]
+fn path_029_a2_counterexample_naive_containment_is_backwards() {
+    use distribution_machine::measurement::DependencyEdge;
+
+    // Documents, rather than exercises library code, why plain
+    // reachable-set containment (reachable(r1) subset-of reachable(r2))
+    // is the wrong test for subsumption.
+    //
+    // A -> B -> C
+    // A -> C -> D
+    //
+    // reachable(B) = {B, C, D}
+    // reachable(C) = {C, D}
+    //
+    // reachable(C) IS a subset of reachable(B) -- C is the smaller set.
+    // A naive "smaller reachable set is the subsumed one" rule would flag
+    // C (which needs nothing from B) as subsumed by B (which needs
+    // everything from C). That is exactly backwards from
+    // path_029_a1's result, where B is correctly identified as the
+    // redundant branch via counterfactual removal instead.
+    let _edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+    let reachable_b_len = 3; // {B, C, D}
+    let reachable_c_len = 2; // {C, D}
+    assert!(
+        reachable_c_len < reachable_b_len,
+        "sanity check on the containment counterexample this comment describes"
+    );
+}
+
+#[test]
+fn path_029_b_proper_independence_preserves_both_branches() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B -> D
+    // A -> C -> E
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "e"),
+    ];
+
+    let mut effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "genuinely independent branches must both survive"
+    );
+}
+
+#[test]
+fn path_029_c_partial_overlap_is_not_accidentally_collapsed() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    // B -> Y      (B has unique structure the shared node X does not gatekeep)
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("b", "y"),
+    ];
+
+    let mut effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "COLLAPSE VIOLATION: partial independence (B's unique reach to Y) was destroyed"
+    );
+}
+
+#[test]
+fn path_029_d1_mutual_branch_root_cycle_collapses_to_one_deterministic_representative() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B
+    // A -> C
+    // B -> C
+    // C -> B
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "b"),
+    ];
+
+    let effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into())],
+        "mutually subsuming branch roots must collapse to a single deterministic representative"
+    );
+}
+
+#[test]
+fn path_029_d2_three_way_subsumption_cycle_would_collapse_to_empty_without_scc_handling() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B, A -> C, A -> E
+    // B -> C
+    // C -> E
+    // E -> B
+    //
+    // Pairwise: B is subsumed by C (B's only route is through C), C is
+    // subsumed by E, E is subsumed by B -- a one-directional cycle with
+    // no single mutual pair. A naive "drop any branch subsumed by
+    // another" rule, applied without transitive-closure/SCC awareness,
+    // drops all three, leaving zero effective branches from three real
+    // ones. This is the PATH-029 counterexample that forced the
+    // SCC-condensation step in effective_structural_branches().
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "e"),
+        DependencyEdge::new("e", "b"),
+    ];
+
+    let effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into())],
+        "SCC VIOLATION: a 3-way subsumption cycle among branch roots must collapse to one \
+         deterministic representative, not vanish entirely"
+    );
+}
+
+#[test]
+fn path_029_e_duplicate_edges_are_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("c".into())],
+        "DUPLICATE-EDGE VIOLATION: repeated edges changed the subsumption result"
+    );
+}
+
+#[test]
+fn path_029_f_edge_ordering_and_naming_are_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    let edges_order_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let edges_order_2 = vec![
+        DependencyEdge::new("c", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "b"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let result_1 = effective_structural_branches(&source, &edges_order_1);
+    let result_2 = effective_structural_branches(&source, &edges_order_2);
+
+    assert_eq!(result_1, result_2);
+    assert_eq!(result_1, vec![CapabilityId("c".into())]);
+}
+
+#[test]
+fn path_029_g_three_branches_one_subsumed_two_independent() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B
+    // A -> C
+    // A -> E
+    // B -> C   (B subsumed by C)
+    // E -> F   (E independent, unique downstream)
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("e", "f"),
+    ];
+
+    let mut effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("c".into()), CapabilityId("e".into())],
+        "B must be dropped as subsumed by C, while C and E remain independent"
+    );
+}
+
+#[test]
+fn path_029_h_unique_work_before_entering_another_branch_is_not_subsumed() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A -> B -> P -> Q -> C   (B does unique work at P, Q before reaching C)
+    // A -> C -> D
+    //
+    // B eventually reaches into C's territory, but P and Q are B's own
+    // unique structure that does not depend on C existing at all. B must
+    // NOT be collapsed away.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "p"),
+        DependencyEdge::new("p", "q"),
+        DependencyEdge::new("q", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let mut effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "UNIQUE-WORK VIOLATION: a branch doing genuine unique work before joining another \
+         branch must not be treated as subsumed"
+    );
+}
+
+#[test]
+fn path_029_i_cycle_through_source_does_not_manufacture_fake_subsumption() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // A <-> B (cycle through source), B -> D
+    // A -> C -> D
+    //
+    // Without treating source as a dead end during the removal test, B
+    // could "reach" C merely by cycling back through A, manufacturing a
+    // bogus subsumption relationship neither branch actually has.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let mut effective = effective_structural_branches(&CapabilityId("a".into()), &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "CYCLE VIOLATION: a cycle through the source manufactured a bogus subsumption relationship"
+    );
+}
+
+#[test]
+fn path_029_j_compare_raw_branches_shared_bottlenecks_and_effective_branches() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        shared_structural_bottlenecks,
+    };
+
+    // A -> B -> C
+    // A -> C -> D
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let effective = effective_structural_branches(&source, &edges);
+    let shared = shared_structural_bottlenecks(&source, &edges);
+    let first = first_structural_convergences(&source, &edges);
+
+    println!(
+        "PATH-029 subsumed branches\nraw branches        = [\"b\", \"c\"]\neffective branches   = {:?}\nshared bottlenecks   = {:?}\nfirst convergences   = {:?}",
+        effective.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+    );
+
+    // shared_structural_bottlenecks and first_structural_convergences are
+    // computed over RAW immediate branches (B, C) and are intentionally
+    // unaffected by PATH-029 -- effective_structural_branches is a
+    // separate candidate, not a replacement.
+    assert_eq!(effective, vec![CapabilityId("c".into())]);
+    assert_eq!(
+        shared,
+        vec![CapabilityId("c".into()), CapabilityId("d".into())]
+    );
+    assert_eq!(
+        first,
+        vec![CapabilityId("c".into())]
+    );
+}
+
+// ---------------------------------------------------------------------
+// PATH-030: COMPOSING EFFECTIVE BRANCHES WITH CONVERGENCE ANALYSIS
+//
+// PATH-027/028's shared_structural_bottlenecks / first_structural_convergences
+// run over RAW immediate branches. PATH-029's effective_structural_branches
+// filters out branches that are subsumed by another branch. PATH-030 asks:
+// does convergence analysis change (and change for the better) if it runs
+// over effective branches instead of raw ones?
+//
+// Two composed candidates are added without mutating any existing
+// primitive: shared_structural_bottlenecks_from_effective_branches and
+// first_structural_convergences_from_effective_branches.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_030_a_branch_absorption_removes_a_false_shared_bottleneck() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B -> C
+    // A -> C -> D
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let effective = effective_structural_branches(&source, &edges);
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    println!(
+        "PATH-030 branch absorption\neffective branches = {:?}\nraw shared          = {:?}\nraw first           = {:?}\ncomposed shared     = {:?}\ncomposed first      = {:?}",
+        effective.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        raw_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        raw_first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        composed_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        composed_first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+    );
+
+    assert_eq!(effective, vec![CapabilityId("c".into())]);
+    assert_eq!(
+        raw_shared,
+        vec![CapabilityId("c".into()), CapabilityId("d".into())],
+        "raw analysis flags C (and D) as shared, purely because subsumed branch B also reaches C"
+    );
+    assert_eq!(raw_first, vec![CapabilityId("c".into())]);
+
+    // With only one effective branch, there is nothing left to converge
+    // with -- C was never really "shared", it was A's only real route.
+    assert_eq!(
+        composed_shared,
+        Vec::<CapabilityId>::new(),
+        "COMPOSITION VIOLATION: effective-branch analysis should remove the false convergence at C"
+    );
+    assert_eq!(composed_first, Vec::<CapabilityId>::new());
+}
+
+#[test]
+fn path_030_b_genuine_diamond_raw_and_composed_agree() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B -> D
+    // A -> C -> D
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let mut effective = effective_structural_branches(&source, &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "a genuine diamond must not have its branches normalized away"
+    );
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    assert_eq!(raw_shared, vec![CapabilityId("d".into())]);
+    assert_eq!(raw_first, vec![CapabilityId("d".into())]);
+    assert_eq!(
+        composed_shared, raw_shared,
+        "genuine independence must not diverge between raw and composed analysis"
+    );
+    assert_eq!(composed_first, raw_first);
+}
+
+#[test]
+fn path_030_c_long_tail_convergence_is_unaffected_by_composition() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B -> X -> D -> E -> F
+    // A -> C -> X
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("d", "e"),
+        DependencyEdge::new("e", "f"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let mut effective = effective_structural_branches(&source, &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())]
+    );
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    assert_eq!(composed_shared, raw_shared, "PATH-028's downstream-vs-first result must survive composition");
+    assert_eq!(composed_first, raw_first);
+    assert_eq!(composed_first, vec![CapabilityId("x".into())]);
+}
+
+#[test]
+fn path_030_d_subsumed_branch_alone_manufactures_a_shared_bottleneck_artifact() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B
+    // A -> C
+    // A -> E
+    // B -> C   (B subsumed by C)
+    // E -> F   (E independent)
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("e", "f"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let mut effective = effective_structural_branches(&source, &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(
+        effective,
+        vec![CapabilityId("c".into()), CapabilityId("e".into())]
+    );
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    println!(
+        "PATH-030 subsumed-branch artifact\nraw shared     = {:?}\ncomposed shared = {:?}",
+        raw_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        composed_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+    );
+
+    // C is flagged "shared" under raw analysis purely because the
+    // subsumed branch B also happens to reach it (C is reachable from
+    // B's branch AND trivially from its own branch). E and F never
+    // participate -- there is no real second branch reaching C.
+    assert_eq!(
+        raw_shared,
+        vec![CapabilityId("c".into())],
+        "ARTIFACT CHECK: raw analysis must show C as a (false) shared bottleneck here"
+    );
+    assert_eq!(raw_first, vec![CapabilityId("c".into())]);
+
+    assert_eq!(
+        composed_shared,
+        Vec::<CapabilityId>::new(),
+        "COMPOSITION VIOLATION: effective-branch analysis must remove the artifact caused solely by B's presence"
+    );
+    assert_eq!(composed_first, Vec::<CapabilityId>::new());
+}
+
+#[test]
+fn path_030_e_partial_overlap_convergence_survives_composition() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    // B -> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("b", "y"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let mut effective = effective_structural_branches(&source, &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "B's unique reach to Y means it is not subsumed by C"
+    );
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    assert_eq!(raw_shared, vec![CapabilityId("x".into())]);
+    assert_eq!(raw_first, vec![CapabilityId("x".into())]);
+    assert_eq!(
+        composed_shared, raw_shared,
+        "STRUCTURALLY-JUSTIFIED CONVERGENCE VIOLATION: X's real convergence must survive composition"
+    );
+    assert_eq!(composed_first, raw_first);
+}
+
+#[test]
+fn path_030_f_branch_root_scc_collapses_convergence_to_empty_without_losing_downstream_info() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B
+    // A -> C
+    // B -> C
+    // C -> B
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "b"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let effective = effective_structural_branches(&source, &edges);
+    assert_eq!(effective, vec![CapabilityId("b".into())]);
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    println!(
+        "PATH-030 branch-root SCC\nraw shared      = {:?}\nraw first       = {:?} (ambiguous, PATH-028-f style)\ncomposed shared = {:?}\ncomposed first  = {:?}",
+        raw_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        raw_first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        composed_shared.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        composed_first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+    );
+
+    // B and C are mutually reachable and reach nothing else: raw analysis
+    // reports them as "shared" with each other (an artifact of the cycle,
+    // not a real second branch converging on anything), and first-
+    // convergence collapses to the same PATH-028-f-style ambiguity (each
+    // disqualifies the other).
+    assert_eq!(
+        raw_shared,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())]
+    );
+    assert_eq!(raw_first, Vec::<CapabilityId>::new());
+
+    // With one effective branch there is nothing to converge with.
+    assert_eq!(
+        composed_shared,
+        Vec::<CapabilityId>::new(),
+        "a single effective branch cannot converge with itself"
+    );
+    assert_eq!(composed_first, Vec::<CapabilityId>::new());
+
+    // No downstream information is lost: because B and C are mutually
+    // reachable, they have IDENTICAL reachable sets outside the {B, C}
+    // group by definition (anything one reaches, the other reaches via
+    // the cycle edge). Collapsing to one representative cannot hide a
+    // real downstream node one branch could see and the other could not.
+}
+
+#[test]
+fn path_030_g_three_way_branch_root_cycle_matches_the_two_way_pattern() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B, A -> C, A -> E
+    // B -> C, C -> E, E -> B
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "e"),
+        DependencyEdge::new("e", "b"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let effective = effective_structural_branches(&source, &edges);
+    assert_eq!(effective, vec![CapabilityId("b".into())]);
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    assert_eq!(
+        raw_shared,
+        vec![
+            CapabilityId("b".into()),
+            CapabilityId("c".into()),
+            CapabilityId("e".into())
+        ]
+    );
+    assert_eq!(raw_first, Vec::<CapabilityId>::new());
+    assert_eq!(composed_shared, Vec::<CapabilityId>::new());
+    assert_eq!(composed_first, Vec::<CapabilityId>::new());
+}
+
+#[test]
+fn path_030_h_renaming_isomorphic_scc_members_changes_only_the_returned_label() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // Two structurally identical 2-cycles, labeled differently so the
+    // lexicographically-smallest (canonical) representative differs.
+    let edges_bc = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "b"),
+    ];
+    let edges_pq = vec![
+        DependencyEdge::new("a", "q"),
+        DependencyEdge::new("a", "p"),
+        DependencyEdge::new("q", "p"),
+        DependencyEdge::new("p", "q"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let effective_bc = effective_structural_branches(&source, &edges_bc);
+    let effective_pq = effective_structural_branches(&source, &edges_pq);
+
+    // Acceptable: the actual chosen representative label differs (it is
+    // metadata -- an arbitrary tie-break among structurally-equivalent
+    // nodes), because these are genuinely different node identities.
+    assert_eq!(effective_bc, vec![CapabilityId("b".into())]);
+    assert_eq!(effective_pq, vec![CapabilityId("p".into())]);
+
+    // Not acceptable: the STRUCTURAL SHAPE of the result -- how many
+    // effective branches, how many composed shared bottlenecks -- must be
+    // identical between isomorphic graphs regardless of labeling.
+    assert_eq!(effective_bc.len(), effective_pq.len());
+
+    let composed_bc = shared_structural_bottlenecks_from_effective_branches(&source, &edges_bc);
+    let composed_pq = shared_structural_bottlenecks_from_effective_branches(&source, &edges_pq);
+    assert_eq!(
+        composed_bc.len(),
+        composed_pq.len(),
+        "RENAMING VIOLATION: isomorphic graphs produced different-shaped composed results"
+    );
+    assert_eq!(composed_bc, Vec::<CapabilityId>::new());
+    assert_eq!(composed_pq, Vec::<CapabilityId>::new());
+}
+
+#[test]
+fn path_030_i_path_028_f_ambiguity_is_unaffected_by_branch_effective_composition() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, first_structural_convergences,
+        first_structural_convergences_from_effective_branches, shared_structural_bottlenecks,
+        shared_structural_bottlenecks_from_effective_branches,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X <-> Y   (cycle downstream of the branch roots, not among them)
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    // B and C do not reach each other at all, so PATH-029 finds nothing
+    // to normalize: the branch set is unchanged by effective-branch
+    // analysis.
+    let mut effective = effective_structural_branches(&source, &edges);
+    effective.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(
+        effective,
+        vec![CapabilityId("b".into()), CapabilityId("c".into())],
+        "the PATH-028-f cycle is downstream of the branch roots, not between them"
+    );
+
+    let raw_shared = shared_structural_bottlenecks(&source, &edges);
+    let raw_first = first_structural_convergences(&source, &edges);
+    let composed_shared = shared_structural_bottlenecks_from_effective_branches(&source, &edges);
+    let composed_first = first_structural_convergences_from_effective_branches(&source, &edges);
+
+    // Branch normalization changed nothing here, so the composed results
+    // must be byte-identical to the raw ones -- including the known
+    // PATH-028-f ambiguity (first collapses to empty).
+    assert_eq!(composed_shared, raw_shared);
+    assert_eq!(composed_first, raw_first);
+    assert_eq!(
+        raw_first,
+        Vec::<CapabilityId>::new(),
+        "INDEPENDENT-PROBLEMS CHECK: branch-root normalization and convergence-cycle semantics \
+         are separate concerns -- PATH-030 does not resolve PATH-028-f"
+    );
+}
