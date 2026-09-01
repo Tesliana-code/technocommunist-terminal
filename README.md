@@ -73,6 +73,7 @@ Graph-derived dependency independence → shared bottleneck detection → counte
 ---
 
 *Technocommunistic COBOL Terminal → adversarially auditable economic attribution engine
+
 Distribution Machine → deterministic distribution protocol*
 
 ## Context
