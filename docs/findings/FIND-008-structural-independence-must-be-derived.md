@@ -2,7 +2,7 @@
 
 Status: OBSERVED (partial — see Unresolved Semantics)
 Protocol: PP-0.1-draft
-Evidence: PATH-027, PATH-028, PATH-029, PATH-030
+Evidence: PATH-027, PATH-028, PATH-029, PATH-030, PATH-031, PATH-032
 
 ## Observation
 
@@ -86,13 +86,32 @@ i).
 Two adversarial cases attacked `first_structural_convergences` itself and
 found real gaps, not implementation bugs:
 
-1. **Cyclic shared nodes (PATH-028-f).** If the shared bottlenecks
-   themselves form a cycle downstream of the real convergence point —
-   `A->B->X, A->C->X, X<->Y` — the "no other shared node reaches me" rule
-   makes X and Y disqualify each other. `first_structural_convergences`
-   returns `[]` on a graph where a genuine convergence at X plainly
-   occurred. The rule is not uniquely defined when the shared set contains
-   a cycle.
+1. **Cyclic shared nodes (PATH-028-f) — RESOLVED by PATH-031 + PATH-032.**
+   If the shared bottlenecks themselves form a cycle downstream of the
+   real convergence point — `A->B->X, A->C->X, X<->Y` — the "no other
+   shared node reaches me" rule makes X and Y disqualify each other.
+   `first_structural_convergences` still returns `[]` on this graph (that
+   primitive is unchanged). PATH-031 added
+   `cycle_aware_first_structural_convergences`, which condenses the
+   shared set's induced subgraph into SCCs and reports each
+   no-incoming-edge SCC as a `StructuralConvergenceRegion` — on this
+   graph, one region `{X, Y}`, not `[]`. SCC condensation of any directed
+   graph is always a DAG, so the region-level "does another region reach
+   this one" check cannot itself re-encounter the mutual-disqualification
+   bug.
+
+   PATH-031 additionally raised, but PATH-032 corrected, a claim that a
+   *further* piece of information (which specific member each branch
+   entered the cycle through — `A->B->X, A->C->X` vs. `A->B->X, A->C->Y`,
+   both against `X<->Y`) was lost and unrecoverable without adding
+   timestamps or causal metadata. That claim was wrong: the two graphs
+   differ in ordinary topology (`C->X` vs. `C->Y`), and PATH-032 recovered
+   the distinction by adding `entries: Vec<StructuralConvergenceEntry>`
+   to `StructuralConvergenceRegion` — `(branch, region member)` pairs
+   computed from the same input edges, no new data added. See
+   **FIND-009** (revised) for the corrected account; the finding's
+   original "no topology-only algorithm could answer it" language has
+   been retracted there, not merely softened.
 
 2. **Branch-root absorption (PATH-028-g) — RESOLVED by PATH-029.** If one
    branch flows directly into another branch's root — `A->B->C, A->C->D`
@@ -126,12 +145,14 @@ found real gaps, not implementation bugs:
    This is a narrowly scoped SCC condensation of a small derived relation,
    not a general graph-SCC library over the whole capability graph.
 
-Item 1 (cyclic shared *bottleneck* nodes, downstream of a real
-convergence) is not corrected by this — it is a different relation
-(reachability among shared bottlenecks, not among branch roots) and
-remains an open question. Per the research program's own instruction, the
-smallest counterexample is recorded instead of hidden behind added
-complexity.
+Item 1's cyclic shared-*bottleneck* problem is a different relation from
+item 2's branch-root subsumption cycles (reachability among shared
+bottlenecks, not among branch roots), so PATH-029's SCC handling above
+does not, by itself, correct it — that took PATH-031's separate SCC
+condensation over the shared-bottleneck set (see item 1). Per the
+research program's own instruction, the smallest counterexample was
+recorded instead of hidden behind added complexity, until PATH-031/032
+resolved it directly.
 
 ## PATH-030: composing effective branches with convergence analysis
 
@@ -201,16 +222,21 @@ relations; fixing one does not touch the other.
 ## Principle
 
 STRUCTURAL CONVERGENCE IS A PROPERTY OF WHERE BRANCHES FIRST MEET, NOT OF
-HOW LONG THE SHARED PATH CONTINUES AFTERWARD — on acyclic shared regions.
-Cyclic shared regions are not yet covered by either candidate primitive.
+HOW LONG THE SHARED PATH CONTINUES AFTERWARD. Cyclic shared regions are
+now covered too: PATH-031's `cycle_aware_first_structural_convergences`
+reports a cyclic first-convergence as one `StructuralConvergenceRegion`
+rather than dropping it, and PATH-032 preserves which branch enters
+through which region member. See FIND-009 for the cyclic-region account.
 
 ## Protocol consequence
 
 No composition of these primitives is adopted as *the* PP-0.1
-economic-importance signal by this finding — that step still requires
-PATH-028-f to be resolved first (see below). But PATH-030 does narrow the
-architecture down from "two independent axes with four unclear
-combinations" to a specific recommended pipeline:
+economic-importance signal by this finding — that still requires an
+explicit economic-reduction decision (see "Next architectural
+experiment" below), not further structural resolution: PATH-028-f itself
+is now resolved (PATH-031/032). But PATH-030 does narrow the architecture
+down from "two independent axes with four unclear combinations" to a
+specific recommended pipeline:
 
 **AXIS 1 (which branches are genuinely independent) should run first, and
 its output should feed AXIS 2 (where independent branches first lose
@@ -233,16 +259,21 @@ primitives, and it explicitly does not yet wire any of them into
 
 ## Next architectural experiment
 
-- Resolve PATH-028-f: does the protocol need cycle-aware "convergence
-  frontier" semantics for shared *bottleneck* nodes (as distinct from the
-  branch-root SCC handling PATH-029 already added), or is a cyclic shared
-  region itself evidence the topology model is missing information
-  (time-ordering, causality) that a pure reachability graph cannot
-  express? PATH-030 confirmed this is not incidentally solved by branch
-  composition — it needs its own resolution.
-- Once PATH-028-f is resolved, re-run the PATH-030 adversarial suite
-  against whatever fix is chosen, since a cycle-aware convergence rule
-  changes `first_structural_convergences_from_effective_branches` too.
+- PATH-028-f's collapse is resolved (PATH-031,
+  `cycle_aware_first_structural_convergences`), and its entry-point
+  provenance is preserved (PATH-032, `entries` on
+  `StructuralConvergenceRegion`) — see FIND-009 (revised). A
+  temporal/causal signal is **not** the immediate next decision: PATH-032
+  showed the previously-claimed missing information was recoverable from
+  existing topology, so no such signal is currently blocking anything.
+- The next decision is a design choice, not a research gap: how should a
+  future aggregation model reduce a `StructuralConvergenceRegion` (with
+  its `members` and `entries`) to a single economic-importance
+  contribution — count of members? count of distinct entering branches?
+  something else? This is deliberately left open here rather than decided
+  by default.
 - Only after that should a graph-derived structural-independence primitive
-  (the composed pipeline recommended above) be wired into
-  `aggregate_*_with_model` as an economic-importance input.
+  (the composed pipeline: `effective_structural_branches` →
+  `shared_structural_bottlenecks_from_effective_branches` →
+  `cycle_aware_first_structural_convergences_from_effective_branches`) be
+  wired into `aggregate_*_with_model` as an economic-importance input.

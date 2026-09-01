@@ -812,6 +812,301 @@ pub fn first_structural_convergences_from_effective_branches(
     first_convergences_over_shared(&adjacency, shared)
 }
 
+/// One branch's structural entry point into a convergence region: `branch`
+/// reaches the region, and the first region member it reaches from outside
+/// the region is `member`.
+///
+/// PATH-032 correction: PATH-031's original `FIND-009` claimed that
+/// `A->B->X, A->C->X, X<->Y` (both branches enter the cycle at X) and
+/// `A->B->X, A->C->Y, X<->Y` (branches enter at *different* cycle members)
+/// were "topologically indistinguishable". That was wrong -- the two
+/// graphs have different edges (`C->X` vs `C->Y`) and were never the same
+/// graph. What was actually true is narrower: `StructuralConvergenceRegion`
+/// as PATH-031 first defined it (bare `members`) collapsed both graphs to
+/// the identical region `{X, Y}`, because SCC *membership* does not care
+/// which member a branch entered through. `entries` restores exactly that
+/// distinction: `{B,X},{C,X}` vs `{B,X},{C,Y}` -- self-attesting through
+/// ordinary topology, no timestamps or causal metadata required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralConvergenceEntry {
+    pub branch: CapabilityId,
+    pub member: CapabilityId,
+}
+
+/// A group of shared structural bottlenecks that are mutually reachable
+/// (a strongly connected component of the induced subgraph over the
+/// shared-bottleneck set). PATH-031 introduces this instead of forcing a
+/// cyclic convergence back into a single `CapabilityId`: on
+/// `A->B->X, A->C->X, X<->Y`, both X and Y are equally part of the same
+/// structural loss of independence, and reporting only a canonically
+/// chosen one (e.g. the lexicographically smallest) would silently drop
+/// real provenance -- which capability actually participates in the
+/// convergence -- for no reason other than making the return type match
+/// `Vec<CapabilityId>`. `members` is sorted for determinism and always has
+/// at least one element.
+///
+/// PATH-032 adds `entries`: which branch (from whichever branch set the
+/// caller composed with -- raw or effective) enters this region, and
+/// through which specific member. See `StructuralConvergenceEntry` and
+/// `compute_region_entries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralConvergenceRegion {
+    pub members: Vec<CapabilityId>,
+    pub entries: Vec<StructuralConvergenceEntry>,
+}
+
+/// PATH-032: for one already-selected first-convergence region, determine
+/// which branch roots enter it and through which member.
+///
+/// "Branch" here is deliberately whatever `branch_roots` the caller
+/// passes in -- raw immediate branches, or (preferred when composing with
+/// PATH-030) `effective_structural_branches`. A raw, subsumed branch root
+/// can manufacture a spurious entry that disappears once the redundant
+/// branch is excluded; see `path_032_g_redundant_branch_entry_disappears_
+/// under_effective_composition`.
+///
+/// A branch's entry member is deliberately recorded as (branch root,
+/// region member) and nothing finer-grained (no intermediate relay nodes
+/// the branch's private path happens to pass through on the way in). That
+/// is a chosen level of abstraction for this summary type, not a loss:
+/// the raw `edges` a caller passed in are always still available if a
+/// finer-grained path needs to be recovered later.
+fn compute_region_entries(
+    source: &CapabilityId,
+    adjacency: &std::collections::HashMap<CapabilityId, Vec<CapabilityId>>,
+    region_members: &std::collections::HashSet<CapabilityId>,
+    branch_roots: &[CapabilityId],
+) -> Vec<StructuralConvergenceEntry> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut seen: HashSet<(CapabilityId, CapabilityId)> = HashSet::new();
+
+    for root in branch_roots {
+        // A branch root that is itself a member of the region (e.g. a raw
+        // branch root absorbed into a shared SCC) enters it trivially, at
+        // itself, and does not get traversed outward for entry discovery
+        // -- there is no "outside" territory to search from a starting
+        // point that is already inside the region.
+        if region_members.contains(root) {
+            seen.insert((root.clone(), root.clone()));
+            continue;
+        }
+
+        // Walk only this branch's territory OUTSIDE the region. Source is
+        // a dead end (as elsewhere, so one branch's traversal cannot leak
+        // into another's); a region member is ALSO a dead end here -- the
+        // moment an edge lands on a region member, that member is
+        // recorded as an entry and the walk does not continue past it.
+        // Without this boundary, traversal could pass through one member
+        // into private downstream territory and later rediscover a
+        // *different* region member from there, manufacturing a second
+        // "entry" that was never actually reached from outside the
+        // region.
+        let mut visited: HashSet<CapabilityId> = HashSet::new();
+        let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+        visited.insert(root.clone());
+        queue.push_back(root.clone());
+
+        while let Some(node) = queue.pop_front() {
+            if node == *source {
+                continue;
+            }
+            if let Some(children) = adjacency.get(&node) {
+                for child in children {
+                    if region_members.contains(child) {
+                        seen.insert((root.clone(), child.clone()));
+                        continue;
+                    }
+                    if visited.insert(child.clone()) {
+                        queue.push_back(child.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<StructuralConvergenceEntry> = seen
+        .into_iter()
+        .map(|(branch, member)| StructuralConvergenceEntry { branch, member })
+        .collect();
+
+    entries.sort_by(|a, b| a.branch.0.cmp(&b.branch.0).then(a.member.0.cmp(&b.member.0)));
+    entries
+}
+
+/// Core of the PATH-031 cycle-aware frontier: given an already-computed
+/// shared-bottleneck set, group it into strongly connected components of
+/// its *induced subgraph* (only direct edges between two shared nodes),
+/// condense those components into a DAG, and return the components with
+/// no incoming edge from another component.
+///
+/// ## Why the induced subgraph, and why that is not an approximation here
+///
+/// "Induced subgraph over S" (direct S-to-S edges only) could, in
+/// general, disagree with "full-graph reachability restricted to pairs in
+/// S" -- a path from `u` to `v` that detours through some node `p` not in
+/// S would count for the latter but not the former. For an *arbitrary*
+/// node set this would be a real modeling choice with a real trade-off.
+///
+/// It is not a choice here, because `S` (the shared-bottleneck set) is
+/// provably **downward-closed under reachability**: `shared_bottlenecks_
+/// over_branches` computes each branch's reachable set with a BFS that,
+/// once it visits a non-source node, always expands all of that node's
+/// children into the same set. So if `u` is in branch `i`'s reachable set
+/// and there is an edge `u -> v` (with `v != source`), `v` is
+/// automatically in branch `i`'s reachable set too. Consequently, if
+/// `u ∈ S` (reachable from >= 2 branches) and `v` is reachable from `u` at
+/// all, `v` is reachable from those same >= 2 branches, so `v ∈ S` as
+/// well. Every node on *any* path between two members of `S` is therefore
+/// itself a member of `S` -- there is no detour through a non-shared node
+/// to miss. Induced-subgraph SCCs and full-graph-reachability SCCs
+/// restricted to `S` are the same partition for this specific `S`. (This
+/// would not hold for an arbitrary caller-supplied node set; it holds
+/// here because of how `S` is constructed.)
+///
+/// Because condensing the SCCs of *any* directed graph always yields a
+/// DAG, "does another component reach this one" can never itself loop
+/// back into the PATH-028-f-style mutual-disqualification bug -- the
+/// componenet-level ordering is well-defined by construction, not merely
+/// tested-and-found-to-work.
+fn cycle_aware_first_convergences_over_shared(
+    source: &CapabilityId,
+    adjacency: &std::collections::HashMap<CapabilityId, Vec<CapabilityId>>,
+    shared: std::collections::HashSet<CapabilityId>,
+    branch_roots: &[CapabilityId],
+) -> Vec<StructuralConvergenceRegion> {
+    use std::collections::{HashMap, HashSet};
+
+    if shared.is_empty() {
+        return Vec::new();
+    }
+
+    let mut s_list: Vec<CapabilityId> = shared.into_iter().collect();
+    s_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if s_list.len() == 1 {
+        let member_set: HashSet<CapabilityId> = s_list.iter().cloned().collect();
+        let entries = compute_region_entries(source, adjacency, &member_set, branch_roots);
+        return vec![StructuralConvergenceRegion {
+            members: s_list,
+            entries,
+        }];
+    }
+
+    let n = s_list.len();
+    let mut index: HashMap<CapabilityId, usize> = HashMap::new();
+    for (i, node) in s_list.iter().enumerate() {
+        index.insert(node.clone(), i);
+    }
+
+    let mut induced = vec![vec![false; n]; n];
+    for i in 0..n {
+        if let Some(children) = adjacency.get(&s_list[i]) {
+            for child in children {
+                if let Some(&j) = index.get(child) {
+                    induced[i][j] = true;
+                }
+            }
+        }
+    }
+
+    let mut reach = induced.clone();
+    for k in 0..n {
+        for i in 0..n {
+            if !reach[i][k] {
+                continue;
+            }
+            for j in 0..n {
+                if reach[k][j] {
+                    reach[i][j] = true;
+                }
+            }
+        }
+    }
+
+    // Group into SCCs. Class id = index of the first (alphabetically
+    // smallest, since s_list is pre-sorted) member encountered.
+    let mut class_of: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        if class_of[i].is_some() {
+            continue;
+        }
+        class_of[i] = Some(i);
+        for j in 0..n {
+            if j != i && reach[i][j] && reach[j][i] {
+                class_of[j] = Some(i);
+            }
+        }
+    }
+
+    let mut members_by_class: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, class) in class_of.iter().enumerate() {
+        members_by_class.entry(class.unwrap()).or_default().push(idx);
+    }
+
+    let class_ids: Vec<usize> = members_by_class.keys().copied().collect();
+    let mut regions: Vec<StructuralConvergenceRegion> = Vec::new();
+
+    for &c in &class_ids {
+        let dominated = class_ids.iter().any(|&d| d != c && reach[d][c]);
+
+        if !dominated {
+            let mut members: Vec<CapabilityId> = members_by_class[&c]
+                .iter()
+                .map(|&idx| s_list[idx].clone())
+                .collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            let member_set: HashSet<CapabilityId> = members.iter().cloned().collect();
+            let entries = compute_region_entries(source, adjacency, &member_set, branch_roots);
+            regions.push(StructuralConvergenceRegion { members, entries });
+        }
+    }
+
+    regions.sort_by(|a, b| a.members[0].0.cmp(&b.members[0].0));
+    regions
+}
+
+/// PATH-031: cycle-aware replacement candidate for
+/// `first_structural_convergences`, over the RAW shared-bottleneck set.
+/// Where `first_structural_convergences` collapses to `[]` when the
+/// shared set contains a cycle (PATH-028-f), this reports the cycle as one
+/// `StructuralConvergenceRegion` instead of erasing it. On acyclic shared
+/// sets the two agree in shape (one region per first-convergence node).
+/// `first_structural_convergences` itself is unchanged and remains
+/// available -- this is an additional candidate, not a replacement.
+pub fn cycle_aware_first_structural_convergences(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<StructuralConvergenceRegion> {
+    let adjacency = build_structural_adjacency(edges);
+    let branch_roots = immediate_branch_roots(source, &adjacency);
+    let shared: std::collections::HashSet<CapabilityId> = shared_structural_bottlenecks(source, edges)
+        .into_iter()
+        .collect();
+    cycle_aware_first_convergences_over_shared(source, &adjacency, shared, &branch_roots)
+}
+
+/// PATH-031 composed with PATH-030: cycle-aware first-convergence regions
+/// computed over `shared_structural_bottlenecks_from_effective_branches`
+/// instead of the raw shared-bottleneck set.
+///
+/// PATH-032: entries are attributed to EFFECTIVE branches
+/// (`effective_structural_branches`), not raw immediate ones -- a raw
+/// branch root that PATH-029 would drop as redundant must not manufacture
+/// entry evidence here either.
+pub fn cycle_aware_first_structural_convergences_from_effective_branches(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<StructuralConvergenceRegion> {
+    let adjacency = build_structural_adjacency(edges);
+    let branch_roots = effective_structural_branches(source, edges);
+    let shared: std::collections::HashSet<CapabilityId> =
+        shared_structural_bottlenecks_from_effective_branches(source, edges)
+            .into_iter()
+            .collect();
+    cycle_aware_first_convergences_over_shared(source, &adjacency, shared, &branch_roots)
+}
+
 /// Candidate SUBSUMED-BRANCH semantics for structural independence
 /// (PATH-029).
 ///

@@ -2801,3 +2801,1162 @@ fn path_030_i_path_028_f_ambiguity_is_unaffected_by_branch_effective_composition
          are separate concerns -- PATH-030 does not resolve PATH-028-f"
     );
 }
+
+// ---------------------------------------------------------------------
+// PATH-031: CYCLE-AWARE CONVERGENCE FRONTIER
+//
+// PATH-028-f found that when the shared-bottleneck set contains a cycle,
+// first_structural_convergences collapses to [] -- every cyclic member
+// disqualifies every other. PATH-030 confirmed effective-branch
+// composition does not touch this; the ambiguity lives inside the
+// shared-bottleneck relation itself.
+//
+// PATH-031 adds cycle_aware_first_structural_convergences (and its
+// effective-branch-composed counterpart), returning
+// Vec<StructuralConvergenceRegion> instead of Vec<CapabilityId>: an SCC
+// of the induced subgraph over the shared set becomes one region, and a
+// region is "first" iff no other region reaches it. Neither existing
+// primitive is modified.
+// ---------------------------------------------------------------------
+
+fn region_shapes(regions: &[distribution_machine::measurement::StructuralConvergenceRegion]) -> Vec<Vec<String>> {
+    regions
+        .iter()
+        .map(|r| r.members.iter().map(|c| c.0.clone()).collect())
+        .collect()
+}
+
+#[test]
+fn path_031_a_minimal_cycle_is_reported_as_one_region_not_empty() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let raw_first = first_structural_convergences(&source, &edges);
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+
+    println!(
+        "PATH-031 minimal cycle\nraw first (ambiguous) = {:?}\ncycle-aware regions   = {:?}",
+        raw_first.iter().map(|c| &c.0).collect::<Vec<_>>(),
+        region_shapes(&regions),
+    );
+
+    assert_eq!(
+        raw_first,
+        Vec::<CapabilityId>::new(),
+        "PATH-028-f baseline must still reproduce the ambiguity in the unmodified primitive"
+    );
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["x".to_string(), "y".to_string()]],
+        "CYCLE-AWARE VIOLATION: {{X,Y}} must be reported as one first-convergence region"
+    );
+}
+
+#[test]
+fn path_031_b_acyclic_diamond_preserves_d() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "d"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(region_shapes(&regions), vec![vec!["d".to_string()]]);
+}
+
+#[test]
+fn path_031_c_long_tail_still_isolates_first_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X -> D -> E
+    // A -> C -> X
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("d", "e"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["x".to_string()]],
+        "DOWNSTREAM MULTIPLICITY VIOLATION: D/E must not appear as additional regions"
+    );
+}
+
+#[test]
+fn path_031_d_cycle_downstream_of_an_acyclic_first_convergence_stays_upstream() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X -> Y -> Z
+    // A -> C -> X
+    //           Y <-> Z
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "z"),
+        DependencyEdge::new("z", "y"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["x".to_string()]],
+        "the frontier must stay at X; the downstream {{Y,Z}} cycle is a continuation, not a second event"
+    );
+}
+
+#[test]
+fn path_031_e_cycle_entered_at_two_different_nodes_is_still_one_region() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> Y
+    //      X -> Y
+    //      Y -> X
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(region_shapes(&regions), vec![vec!["x".to_string(), "y".to_string()]]);
+}
+
+#[test]
+fn path_031_f_two_separate_first_regions_one_cyclic_both_survive() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B1 -> X, A -> B2 -> X            (acyclic convergence at X)
+    // A -> B3 -> Y, A -> B4 -> Z, Y <-> Z    (cyclic convergence at {Y,Z})
+    let edges = vec![
+        DependencyEdge::new("a", "b1"),
+        DependencyEdge::new("b1", "x"),
+        DependencyEdge::new("a", "b2"),
+        DependencyEdge::new("b2", "x"),
+        DependencyEdge::new("a", "b3"),
+        DependencyEdge::new("b3", "y"),
+        DependencyEdge::new("a", "b4"),
+        DependencyEdge::new("b4", "z"),
+        DependencyEdge::new("y", "z"),
+        DependencyEdge::new("z", "y"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![
+            vec!["x".to_string()],
+            vec!["y".to_string(), "z".to_string()]
+        ],
+        "both independent convergence regions must survive, one acyclic and one cyclic"
+    );
+}
+
+#[test]
+fn path_031_g_shared_scc_with_downstream_tail_is_one_region_not_four() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X, A -> C -> X, X <-> Y, X -> D -> E
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("x", "d"),
+        DependencyEdge::new("d", "e"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["x".to_string(), "y".to_string()]],
+        "MULTIPLICITY VIOLATION: one structural loss of independence must not become {{X,Y}} plus D plus E"
+    );
+}
+
+#[test]
+fn path_031_h_nested_shared_sccs_only_the_upstream_one_is_first() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> P, A -> C -> P, P <-> Q, P -> R, A -> D -> R, R <-> S
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "p"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "p"),
+        DependencyEdge::new("p", "q"),
+        DependencyEdge::new("q", "p"),
+        DependencyEdge::new("p", "r"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "r"),
+        DependencyEdge::new("r", "s"),
+        DependencyEdge::new("s", "r"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["p".to_string(), "q".to_string()]],
+        "NESTED-SCC VIOLATION: only the upstream SCC {{P,Q}} may be first; {{R,S}} is downstream"
+    );
+}
+
+#[test]
+fn path_031_i_duplicate_edges_are_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(region_shapes(&regions), vec![vec!["x".to_string(), "y".to_string()]]);
+}
+
+#[test]
+fn path_031_j_edge_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let edges_2 = vec![
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "b"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions_1 = cycle_aware_first_structural_convergences(&source, &edges_1);
+    let regions_2 = cycle_aware_first_structural_convergences(&source, &edges_2);
+    assert_eq!(region_shapes(&regions_1), region_shapes(&regions_2));
+}
+
+#[test]
+fn path_031_k_renaming_isomorphic_cycles_preserves_shape_not_labels() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges_xy = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let edges_pq = vec![
+        DependencyEdge::new("a", "m"),
+        DependencyEdge::new("a", "n"),
+        DependencyEdge::new("m", "q"),
+        DependencyEdge::new("n", "q"),
+        DependencyEdge::new("q", "p"),
+        DependencyEdge::new("p", "q"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions_xy = cycle_aware_first_structural_convergences(&source, &edges_xy);
+    let regions_pq = cycle_aware_first_structural_convergences(&source, &edges_pq);
+
+    // Same shape: one region, two members.
+    assert_eq!(regions_xy.len(), regions_pq.len());
+    assert_eq!(regions_xy[0].members.len(), regions_pq[0].members.len());
+
+    // Different labels are expected and fine -- these are genuinely
+    // different node identities, not the same graph reordered.
+    assert_eq!(
+        regions_xy[0].members,
+        vec![CapabilityId("x".into()), CapabilityId("y".into())]
+    );
+    assert_eq!(
+        regions_pq[0].members,
+        vec![CapabilityId("p".into()), CapabilityId("q".into())]
+    );
+}
+
+#[test]
+fn path_031_l_cycle_through_source_does_not_fabricate_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A <-> B, B -> X ; A -> C -> X
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        region_shapes(&regions),
+        vec![vec!["x".to_string()]],
+        "CYCLE-THROUGH-SOURCE VIOLATION: a cycle back to A must not fabricate extra convergence"
+    );
+}
+
+#[test]
+fn path_031_m_composition_removes_a_branch_root_from_inside_a_shared_scc() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        cycle_aware_first_structural_convergences_from_effective_branches,
+    };
+
+    // A -> B -> C, A -> C -> D, C <-> D
+    //
+    // B is subsumed by C (PATH-029). Under RAW analysis, C -- itself one
+    // of A's own branch roots -- ends up inside the same SCC as D,
+    // because B's redundant presence makes C look "shared". Composing
+    // with effective branches drops B first, leaving only one effective
+    // branch (C), so there is nothing left to converge with at all.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+        DependencyEdge::new("d", "c"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let raw_regions = cycle_aware_first_structural_convergences(&source, &edges);
+    let composed_regions =
+        cycle_aware_first_structural_convergences_from_effective_branches(&source, &edges);
+
+    println!(
+        "PATH-031 branch-root-in-SCC\nraw regions      = {:?}\ncomposed regions = {:?}",
+        region_shapes(&raw_regions),
+        region_shapes(&composed_regions),
+    );
+
+    assert_eq!(
+        region_shapes(&raw_regions),
+        vec![vec!["c".to_string(), "d".to_string()]],
+        "raw analysis puts branch root C inside the shared SCC due to B's redundant presence"
+    );
+    assert_eq!(
+        region_shapes(&composed_regions),
+        Vec::<Vec<String>>::new(),
+        "COMPOSITION VIOLATION: with B correctly excluded, there is only one effective branch \
+         and nothing left to converge with"
+    );
+}
+
+#[test]
+fn path_031_n_region_membership_alone_does_not_capture_entry_point_structure() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // PATH-032 CORRECTION: this test originally claimed single-entry and
+    // dual-entry cycles were "topologically indistinguishable" and cited
+    // it as evidence the graph model lacks causal/temporal information.
+    // That claim was wrong -- the two graphs below have different edges
+    // (`c->x` vs `c->y`) and were never the same graph. What is true, and
+    // is all this test now asserts, is narrower: `members` alone (SCC
+    // membership) is the same for both, because SCC membership does not
+    // record which node a branch entered through. See
+    // path_032_a/path_032_b, which show `entries` DOES distinguish them
+    // using ordinary topology -- no timestamps or causal metadata needed.
+    // FIND-009 has been corrected accordingly.
+    let single_entry = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let dual_entry = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let single_entry_regions = cycle_aware_first_structural_convergences(&source, &single_entry);
+    let dual_entry_regions = cycle_aware_first_structural_convergences(&source, &dual_entry);
+
+    assert_eq!(
+        region_shapes(&single_entry_regions),
+        region_shapes(&dual_entry_regions),
+        "member-set shape is identical between these two different graphs -- \
+         members alone under-represents them, which is exactly why PATH-032 adds entries"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PATH-032: PRESERVE ENTRY-POINT TOPOLOGY INSIDE CYCLIC CONVERGENCE REGIONS
+//
+// StructuralConvergenceRegion now carries `entries: Vec<StructuralConvergenceEntry>`
+// alongside `members`: for each branch (raw, or effective when composed
+// with PATH-030), which specific region member it enters through. This
+// tests H3: original topology + branch-specific entry edges is enough to
+// distinguish single-entry from dual-entry cyclic convergence, without
+// any timestamp or causal metadata.
+// ---------------------------------------------------------------------
+
+fn entry_pairs(
+    region: &distribution_machine::measurement::StructuralConvergenceRegion,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = region
+        .entries
+        .iter()
+        .map(|e| (e.branch.0.clone(), e.member.0.clone()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+#[test]
+fn path_032_a_single_entry_shows_both_branches_entering_the_same_member() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        regions[0].members,
+        vec![CapabilityId("x".into()), CapabilityId("y".into())]
+    );
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())],
+        "H3 VIOLATION: single-entry pattern must show both branches entering via X"
+    );
+}
+
+#[test]
+fn path_032_b_dual_entry_shows_branches_entering_different_members() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> Y
+    //      X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        regions[0].members,
+        vec![CapabilityId("x".into()), CapabilityId("y".into())]
+    );
+    let entries = entry_pairs(&regions[0]);
+    assert_eq!(
+        entries,
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "y".to_string())],
+        "H3 VIOLATION: dual-entry pattern must show branches entering via different members"
+    );
+
+    // The critical corrected claim: A and B (single vs. dual entry) no
+    // longer collapse to identical enriched output, even though their
+    // `members` sets are identical.
+    let single_edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let single_regions = cycle_aware_first_structural_convergences(&source, &single_edges);
+    assert_ne!(
+        entry_pairs(&single_regions[0]),
+        entries,
+        "H3 VIOLATION: single-entry and dual-entry graphs must no longer be indistinguishable"
+    );
+}
+
+#[test]
+fn path_032_c_longer_paths_to_the_same_member_still_read_as_single_entry() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> P -> X
+    // A -> C -> Q -> X
+    //                X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "p"),
+        DependencyEdge::new("p", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "q"),
+        DependencyEdge::new("q", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())],
+        "entry provenance must attribute to the branch ROOT and the region member, \
+         not to the intermediate relay nodes P/Q"
+    );
+}
+
+#[test]
+fn path_032_d_longer_paths_to_different_members_remain_distinguishable() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> P -> X
+    // A -> C -> Q -> Y
+    //                X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "p"),
+        DependencyEdge::new("p", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "q"),
+        DependencyEdge::new("q", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "y".to_string())],
+        "dual-entry pattern must survive even through longer relay paths"
+    );
+}
+
+#[test]
+fn path_032_e_one_branch_entering_a_region_twice_is_two_entries_same_branch() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B, B -> X, B -> Y  (B enters at both X and Y directly)
+    // A -> C -> X
+    //           X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "y"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![
+            ("b".to_string(), "x".to_string()),
+            ("b".to_string(), "y".to_string()),
+            ("c".to_string(), "x".to_string()),
+        ],
+        "one branch (B) touching the region at two distinct members must appear as two \
+         entries sharing the same branch, not merged into one and not treated as two branches"
+    );
+}
+
+#[test]
+fn path_032_f_duplicate_entry_edges_are_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())],
+        "DUPLICATE-EDGE VIOLATION: repeated edges must not multiply entries"
+    );
+}
+
+#[test]
+fn path_032_g_redundant_branch_entry_disappears_under_effective_composition() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        cycle_aware_first_structural_convergences_from_effective_branches,
+    };
+
+    // A -> B -> C, A -> C -> D, C <-> D  (B subsumed by C, per PATH-029)
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+        DependencyEdge::new("d", "c"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let raw_regions = cycle_aware_first_structural_convergences(&source, &edges);
+    let composed_regions =
+        cycle_aware_first_structural_convergences_from_effective_branches(&source, &edges);
+
+    println!(
+        "PATH-032 redundant-branch entry\nraw entries      = {:?}\ncomposed regions = {:?}",
+        entry_pairs(&raw_regions[0]),
+        composed_regions.len(),
+    );
+
+    assert_eq!(raw_regions[0].members, vec![CapabilityId("c".into()), CapabilityId("d".into())]);
+    assert_eq!(
+        entry_pairs(&raw_regions[0]),
+        vec![("b".to_string(), "c".to_string()), ("c".to_string(), "c".to_string())],
+        "raw analysis must show the redundant branch B entering at C, plus C's trivial self-entry"
+    );
+
+    assert_eq!(
+        composed_regions.len(),
+        0,
+        "COMPOSITION VIOLATION: with B correctly excluded there is only one effective branch \
+         (C) and no region at all -- no entries to manufacture"
+    );
+}
+
+#[test]
+fn path_032_h_three_branches_two_entry_members_preserves_2_vs_1_structure() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X, A -> C -> X, A -> D -> Y, X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![
+            ("b".to_string(), "x".to_string()),
+            ("c".to_string(), "x".to_string()),
+            ("d".to_string(), "y".to_string()),
+        ],
+        "2-vs-1 entry structure (two branches via X, one via Y) must be preserved"
+    );
+}
+
+#[test]
+fn path_032_i_three_member_scc_entry_patterns_distinguish_identical_membership() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let member_set = vec![CapabilityId("x".into()), CapabilityId("y".into()), CapabilityId("z".into())];
+    let ring = |extra: Vec<DependencyEdge>| {
+        let mut edges = vec![
+            DependencyEdge::new("x", "y"),
+            DependencyEdge::new("y", "z"),
+            DependencyEdge::new("z", "x"),
+        ];
+        edges.extend(extra);
+        edges
+    };
+    let source = CapabilityId("a".into());
+
+    // All branches enter at X.
+    let all_at_x = {
+        let mut e = ring(vec![
+            DependencyEdge::new("a", "b"),
+            DependencyEdge::new("b", "x"),
+            DependencyEdge::new("a", "c"),
+            DependencyEdge::new("c", "x"),
+        ]);
+        e.push(DependencyEdge::new("a", "b"));
+        e
+    };
+    let regions_all_x = cycle_aware_first_structural_convergences(&source, &all_at_x);
+    assert_eq!(regions_all_x[0].members, member_set);
+    assert_eq!(
+        entry_pairs(&regions_all_x[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())]
+    );
+
+    // Branches enter at X and Y.
+    let x_and_y = ring(vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "y"),
+    ]);
+    let regions_x_y = cycle_aware_first_structural_convergences(&source, &x_and_y);
+    assert_eq!(regions_x_y[0].members, member_set);
+    assert_eq!(
+        entry_pairs(&regions_x_y[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "y".to_string())]
+    );
+
+    // Branches enter at X, Y, and Z.
+    let x_y_z = ring(vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "z"),
+    ]);
+    let regions_x_y_z = cycle_aware_first_structural_convergences(&source, &x_y_z);
+    assert_eq!(regions_x_y_z[0].members, member_set);
+    assert_eq!(
+        entry_pairs(&regions_x_y_z[0]),
+        vec![
+            ("b".to_string(), "x".to_string()),
+            ("c".to_string(), "y".to_string()),
+            ("d".to_string(), "z".to_string()),
+        ]
+    );
+
+    // Region membership is identical (the whole 3-cycle) in all three
+    // cases; entry topology is what tells them apart.
+    assert_eq!(regions_all_x[0].members, regions_x_y[0].members);
+    assert_eq!(regions_x_y[0].members, regions_x_y_z[0].members);
+    assert_ne!(entry_pairs(&regions_all_x[0]), entry_pairs(&regions_x_y[0]));
+    assert_ne!(entry_pairs(&regions_x_y[0]), entry_pairs(&regions_x_y_z[0]));
+}
+
+#[test]
+fn path_032_j_upstream_acyclic_first_convergence_has_simple_entries_no_scc_leakage() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> P, A -> C -> P, P -> X, X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "p"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "p"),
+        DependencyEdge::new("p", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(
+        regions.len(),
+        1,
+        "the downstream {{X,Y}} SCC must not appear as a second first-convergence region"
+    );
+    assert_eq!(regions[0].members, vec![CapabilityId("p".into())]);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "p".to_string()), ("c".to_string(), "p".to_string())],
+        "SCC-LEAKAGE VIOLATION: entries for the upstream acyclic region must not reference X/Y"
+    );
+}
+
+#[test]
+fn path_032_k_entries_for_separate_first_regions_do_not_contaminate_each_other() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // Acyclic region {X} fed by B1, B2. Cyclic region {Y,Z} fed by B3, B4.
+    let edges = vec![
+        DependencyEdge::new("a", "b1"),
+        DependencyEdge::new("b1", "x"),
+        DependencyEdge::new("a", "b2"),
+        DependencyEdge::new("b2", "x"),
+        DependencyEdge::new("a", "b3"),
+        DependencyEdge::new("b3", "y"),
+        DependencyEdge::new("a", "b4"),
+        DependencyEdge::new("b4", "z"),
+        DependencyEdge::new("y", "z"),
+        DependencyEdge::new("z", "y"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 2);
+
+    let x_region = regions.iter().find(|r| r.members == vec![CapabilityId("x".into())]).unwrap();
+    let yz_region = regions
+        .iter()
+        .find(|r| r.members == vec![CapabilityId("y".into()), CapabilityId("z".into())])
+        .unwrap();
+
+    assert_eq!(
+        entry_pairs(x_region),
+        vec![("b1".to_string(), "x".to_string()), ("b2".to_string(), "x".to_string())],
+        "CONTAMINATION VIOLATION: X's entries must not include B3/B4"
+    );
+    assert_eq!(
+        entry_pairs(yz_region),
+        vec![("b3".to_string(), "y".to_string()), ("b4".to_string(), "z".to_string())],
+        "CONTAMINATION VIOLATION: {{Y,Z}}'s entries must not include B1/B2"
+    );
+}
+
+#[test]
+fn path_032_l_edge_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let edges_2 = vec![
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "b"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions_1 = cycle_aware_first_structural_convergences(&source, &edges_1);
+    let regions_2 = cycle_aware_first_structural_convergences(&source, &edges_2);
+    assert_eq!(entry_pairs(&regions_1[0]), entry_pairs(&regions_2[0]));
+}
+
+#[test]
+fn path_032_m_renaming_preserves_entry_shape_not_labels() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    let edges_bc_xy = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let edges_mn_pq = vec![
+        DependencyEdge::new("a", "m"),
+        DependencyEdge::new("a", "n"),
+        DependencyEdge::new("m", "p"),
+        DependencyEdge::new("n", "q"),
+        DependencyEdge::new("p", "q"),
+        DependencyEdge::new("q", "p"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions_1 = cycle_aware_first_structural_convergences(&source, &edges_bc_xy);
+    let regions_2 = cycle_aware_first_structural_convergences(&source, &edges_mn_pq);
+
+    // Same shape: one region, two members, two entries, one entry per member.
+    assert_eq!(regions_1[0].members.len(), regions_2[0].members.len());
+    assert_eq!(regions_1[0].entries.len(), regions_2[0].entries.len());
+
+    // Different labels are expected metadata, not a structural violation.
+    assert_eq!(
+        entry_pairs(&regions_1[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "y".to_string())]
+    );
+    assert_eq!(
+        entry_pairs(&regions_2[0]),
+        vec![("m".to_string(), "p".to_string()), ("n".to_string(), "q".to_string())]
+    );
+}
+
+#[test]
+fn path_032_n_cycle_through_source_does_not_fabricate_entry_evidence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A <-> B, B -> X ; A -> C -> X ; X <-> Y
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())],
+        "CYCLE-THROUGH-SOURCE VIOLATION: the a<->b cycle must not fabricate a spurious entry"
+    );
+}
+
+#[test]
+fn path_032_o_opposite_incidence_patterns_with_identical_coarse_shape_stay_distinguishable() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // Adversarial search (item O), reframed: not "same input twice" (that
+    // was only a determinism check, not a semantic-sufficiency proof),
+    // but two DIFFERENT graphs, using the SAME branch names and the SAME
+    // region members, that share every coarse statistic:
+    //   - one region, two members {x, y}
+    //   - three branches (b, c, d), three entries
+    //   - two occupied entry members
+    //   - the SAME multiset of per-member entry counts: {2, 1}
+    //
+    // Graph 1: b and c enter at X, d enters at Y  (X:2, Y:1)
+    // Graph 2: b enters at X, c and d enter at Y  (X:1, Y:2)
+    //
+    // A summary that only recorded "how many branches enter each member"
+    // (without recording WHICH branch) would see the same {2,1}
+    // multiset for both and could not tell them apart. `entries` records
+    // the full (branch, member) incidence, not just per-member counts, so
+    // it must distinguish them -- specifically, c's entry member differs
+    // between the two graphs.
+    let source = CapabilityId("a".into());
+
+    let graph_1 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let graph_2 = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "y"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let regions_1 = cycle_aware_first_structural_convergences(&source, &graph_1);
+    let regions_2 = cycle_aware_first_structural_convergences(&source, &graph_2);
+
+    // Coarse shape really is identical: same member count, same entry
+    // count, same occupied-member count, same per-member count multiset.
+    assert_eq!(regions_1[0].members.len(), regions_2[0].members.len());
+    assert_eq!(regions_1[0].entries.len(), regions_2[0].entries.len());
+    let coarse_counts = |region: &distribution_machine::measurement::StructuralConvergenceRegion| {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in &region.entries {
+            *counts.entry(e.member.0.clone()).or_insert(0) += 1;
+        }
+        let mut values: Vec<usize> = counts.into_values().collect();
+        values.sort();
+        values
+    };
+    assert_eq!(
+        coarse_counts(&regions_1[0]),
+        coarse_counts(&regions_2[0]),
+        "sanity check: the two graphs must genuinely share the same coarse {{2,1}} shape"
+    );
+
+    // The full incidence pattern must still differ.
+    assert_ne!(
+        entry_pairs(&regions_1[0]),
+        entry_pairs(&regions_2[0]),
+        "H3 VIOLATION: opposite 2:1 incidence patterns with identical coarse shape \
+         collapsed to the same entries -- (branch, member) incidence is not being preserved"
+    );
+    assert_eq!(
+        entry_pairs(&regions_1[0]),
+        vec![
+            ("b".to_string(), "x".to_string()),
+            ("c".to_string(), "x".to_string()),
+            ("d".to_string(), "y".to_string()),
+        ]
+    );
+    assert_eq!(
+        entry_pairs(&regions_2[0]),
+        vec![
+            ("b".to_string(), "x".to_string()),
+            ("c".to_string(), "y".to_string()),
+            ("d".to_string(), "y".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn path_032_p_region_boundary_is_respected_downstream_relay_does_not_manufacture_a_second_entry() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+    };
+
+    // A -> B -> X
+    // A -> C -> X
+    //           X <-> Y
+    //           X -> P -> Y
+    //
+    // compute_region_entries must never traverse THROUGH a region member
+    // to discover a "second" entry into another member from private
+    // downstream territory. B and C each enter the region only at X;
+    // the relay through P must not manufacture (B, Y) / (C, Y).
+    //
+    // Note: because X<->Y and X->P->Y together mean P is reachable FROM
+    // the region (X->P) and reaches BACK into the region (P->Y->X), P is
+    // itself mutually reachable with X and Y, so the real region for this
+    // graph is {P, X, Y}, not {X, Y}. That SCC closure is what already
+    // keeps this specific graph safe even before this fix (P was already
+    // excluded from being treated as "outside" territory by the region
+    // membership check). This test locks in the correct result directly,
+    // as a boundary-respecting property of the traversal itself, not as
+    // an accident of the region computation elsewhere.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("x", "p"),
+        DependencyEdge::new("p", "y"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(
+        regions[0].members,
+        vec![CapabilityId("p".into()), CapabilityId("x".into()), CapabilityId("y".into())],
+        "sanity check: P is genuinely absorbed into the region for this exact graph shape"
+    );
+    assert_eq!(
+        entry_pairs(&regions[0]),
+        vec![("b".to_string(), "x".to_string()), ("c".to_string(), "x".to_string())],
+        "REGION-BOUNDARY VIOLATION: entries must be exactly (B,X) and (C,X), not (B,Y)/(C,Y)"
+    );
+}
