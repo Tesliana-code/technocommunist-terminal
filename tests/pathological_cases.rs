@@ -3960,3 +3960,433 @@ fn path_032_p_region_boundary_is_respected_downstream_relay_does_not_manufacture
         "REGION-BOUNDARY VIOLATION: entries must be exactly (B,X) and (C,X), not (B,Y)/(C,Y)"
     );
 }
+
+// ---------------------------------------------------------------------
+// PATH-033: ADVERSARIAL EXPERIMENT ON ECONOMIC REDUCTION OF
+// StructuralConvergenceRegion
+//
+// H4 under attack: economic structural importance depends primarily on
+// the number of DISTINCT branches entering a first-convergence region
+// (`distinct_entering_branch_count`), while SCC member count and repeated
+// entries from the same branch are provenance, not automatic extra
+// economic weight. This is a hypothesis, not an established result --
+// this group is designed to try to break it, not to confirm it.
+//
+// `distinct_entering_branch_count` is NOT wired into any `aggregate_*`
+// function or money allocation. `members` and `entries` remain fully
+// inspectable on every region produced below -- the candidate function is
+// an additional lens, not a replacement for the raw structural evidence.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_033_a_scc_member_count_inflation_does_not_change_distinct_branch_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    // Small region: A->B->X, A->C->X, X<->Y (2 members).
+    let small = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    // Same two branches, same single entry member (X), but the SCC
+    // downstream of X is inflated to 5 members via a longer cycle:
+    // X->P1->P2->P3->Y->X.
+    let large = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "p1"),
+        DependencyEdge::new("p1", "p2"),
+        DependencyEdge::new("p2", "p3"),
+        DependencyEdge::new("p3", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let small_regions = cycle_aware_first_structural_convergences(&source, &small);
+    let large_regions = cycle_aware_first_structural_convergences(&source, &large);
+
+    assert_eq!(small_regions.len(), 1);
+    assert_eq!(large_regions.len(), 1);
+    assert_eq!(small_regions[0].members.len(), 2);
+    assert_eq!(
+        large_regions[0].members.len(),
+        5,
+        "sanity check: the longer cycle must actually inflate SCC membership"
+    );
+
+    assert_eq!(
+        distinct_entering_branch_count(&small_regions[0]),
+        distinct_entering_branch_count(&large_regions[0]),
+        "H4 VIOLATION: same two entering branches produced different distinct-branch counts \
+         purely because the downstream SCC grew from 2 to 5 members"
+    );
+    assert_eq!(distinct_entering_branch_count(&small_regions[0]), 2);
+}
+
+#[test]
+fn path_033_b_multiple_entries_from_one_branch_does_not_inflate_distinct_branch_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    // Baseline: B and C each enter once, at X.
+    let single_entry_each = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    // B alone touches the region at both X and Y directly; C still enters
+    // once at X. Same two branches, one extra entry.
+    let one_branch_double_entry = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "y"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let baseline = cycle_aware_first_structural_convergences(&source, &single_entry_each);
+    let doubled = cycle_aware_first_structural_convergences(&source, &one_branch_double_entry);
+
+    assert_eq!(baseline[0].entries.len(), 2);
+    assert_eq!(
+        doubled[0].entries.len(),
+        3,
+        "sanity check: B's second direct entry must actually add a third entry record"
+    );
+
+    assert_eq!(
+        distinct_entering_branch_count(&baseline[0]),
+        distinct_entering_branch_count(&doubled[0]),
+        "H4 VIOLATION: one branch touching the region at an extra member changed the \
+         distinct-branch count even though no new branch was introduced"
+    );
+    assert_eq!(distinct_entering_branch_count(&baseline[0]), 2);
+}
+
+#[test]
+fn path_033_c_two_vs_three_effective_branches_are_distinguished() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    let two_branches = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let three_branches = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("d", "y"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    let source = CapabilityId("a".into());
+    let two = cycle_aware_first_structural_convergences(&source, &two_branches);
+    let three = cycle_aware_first_structural_convergences(&source, &three_branches);
+
+    assert_eq!(distinct_entering_branch_count(&two[0]), 2);
+    assert_eq!(
+        distinct_entering_branch_count(&three[0]),
+        3,
+        "the metric must actually respond to a genuine third independent branch"
+    );
+}
+
+#[test]
+fn path_033_d_redundant_raw_branch_inflates_raw_count_but_not_effective_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        cycle_aware_first_structural_convergences_from_effective_branches,
+        distinct_entering_branch_count,
+    };
+
+    // A->B->C, A->C->D, C<->D (B subsumed by C, per PATH-029), plus a
+    // genuine third raw branch A->E->D that is NOT subsumed (E relays
+    // through D before it would ever reach C, so E keeps independent
+    // reach and survives PATH-029 subsumption).
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "d"),
+        DependencyEdge::new("d", "c"),
+        DependencyEdge::new("a", "e"),
+        DependencyEdge::new("e", "d"),
+    ];
+    let source = CapabilityId("a".into());
+
+    let raw_regions = cycle_aware_first_structural_convergences(&source, &edges);
+    let composed_regions =
+        cycle_aware_first_structural_convergences_from_effective_branches(&source, &edges);
+
+    assert_eq!(raw_regions.len(), 1);
+    assert_eq!(composed_regions.len(), 1);
+    assert_eq!(raw_regions[0].members, composed_regions[0].members, "same region either way");
+
+    let raw_count = distinct_entering_branch_count(&raw_regions[0]);
+    let composed_count = distinct_entering_branch_count(&composed_regions[0]);
+
+    println!(
+        "PATH-033 redundant branch | raw distinct = {} | effective distinct = {}",
+        raw_count, composed_count
+    );
+
+    assert_eq!(
+        raw_count, 3,
+        "raw analysis counts B as a third branch even though it contributes nothing C doesn't"
+    );
+    assert_eq!(
+        composed_count, 2,
+        "COMPOSITION VIOLATION: effective-branch composition must drop the redundant raw \
+         branch (B) from the count, per the PATH-030 composition recommendation"
+    );
+}
+
+#[test]
+fn path_033_e_duplicate_edges_are_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let source = CapabilityId("a".into());
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+
+    assert_eq!(
+        distinct_entering_branch_count(&regions[0]),
+        2,
+        "DUPLICATE-EDGE VIOLATION: repeated edges must not change the distinct-branch count"
+    );
+}
+
+#[test]
+fn path_033_f_edge_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    let forward = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+
+    let source = CapabilityId("a".into());
+    let forward_regions = cycle_aware_first_structural_convergences(&source, &forward);
+    let shuffled_regions = cycle_aware_first_structural_convergences(&source, &shuffled);
+
+    assert_eq!(
+        distinct_entering_branch_count(&forward_regions[0]),
+        distinct_entering_branch_count(&shuffled_regions[0]),
+        "ORDERING VIOLATION: edge order must not change the distinct-branch count"
+    );
+}
+
+#[test]
+fn path_033_g_renaming_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    let original = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+    let renamed = vec![
+        DependencyEdge::new("root", "branch-one"),
+        DependencyEdge::new("branch-one", "hub-1"),
+        DependencyEdge::new("root", "branch-two"),
+        DependencyEdge::new("branch-two", "hub-1"),
+        DependencyEdge::new("hub-1", "hub-2"),
+        DependencyEdge::new("hub-2", "hub-1"),
+    ];
+
+    let original_regions =
+        cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &original);
+    let renamed_regions =
+        cycle_aware_first_structural_convergences(&CapabilityId("root".into()), &renamed);
+
+    assert_eq!(
+        distinct_entering_branch_count(&original_regions[0]),
+        distinct_entering_branch_count(&renamed_regions[0]),
+        "RENAMING VIOLATION: relabeling capabilities must not change the distinct-branch count"
+    );
+    assert_eq!(distinct_entering_branch_count(&renamed_regions[0]), 2);
+}
+
+#[test]
+fn path_033_h_separate_first_regions_are_counted_independently() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    // Acyclic region {X} fed by 2 branches. Cyclic region {Y,Z} fed by 3.
+    let edges = vec![
+        DependencyEdge::new("a", "b1"),
+        DependencyEdge::new("b1", "x"),
+        DependencyEdge::new("a", "b2"),
+        DependencyEdge::new("b2", "x"),
+        DependencyEdge::new("a", "b3"),
+        DependencyEdge::new("b3", "y"),
+        DependencyEdge::new("a", "b4"),
+        DependencyEdge::new("b4", "z"),
+        DependencyEdge::new("a", "b5"),
+        DependencyEdge::new("b5", "z"),
+        DependencyEdge::new("y", "z"),
+        DependencyEdge::new("z", "y"),
+    ];
+    let source = CapabilityId("a".into());
+    let regions = cycle_aware_first_structural_convergences(&source, &edges);
+
+    assert_eq!(regions.len(), 2);
+    let x_region = regions.iter().find(|r| r.members == vec![CapabilityId("x".into())]).unwrap();
+    let yz_region = regions
+        .iter()
+        .find(|r| r.members == vec![CapabilityId("y".into()), CapabilityId("z".into())])
+        .unwrap();
+
+    assert_eq!(
+        distinct_entering_branch_count(x_region),
+        2,
+        "CONTAMINATION VIOLATION: X's count must reflect only its own 2 branches"
+    );
+    assert_eq!(
+        distinct_entering_branch_count(yz_region),
+        3,
+        "CONTAMINATION VIOLATION: {{Y,Z}}'s count must reflect only its own 3 branches"
+    );
+}
+
+#[test]
+fn path_033_i_counterexample_search_member_count_and_entry_multiplicity_are_discarded() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, cycle_aware_first_structural_convergences,
+        distinct_entering_branch_count,
+    };
+
+    // Region A: 2 branches, each entering once, 2-member region.
+    let region_a_edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("x", "y"),
+        DependencyEdge::new("y", "x"),
+    ];
+
+    // Region B: the SAME 2 branches, but P enters once and Q enters at 4
+    // different members of an 8-member cycle. Same distinct-branch count
+    // (2), radically larger blast radius (8 members instead of 2) AND
+    // radically more entry incidence (5 entries instead of 2).
+    let region_b_edges = vec![
+        DependencyEdge::new("a", "p"),
+        DependencyEdge::new("p", "m1"),
+        DependencyEdge::new("a", "q"),
+        DependencyEdge::new("q", "m1"),
+        DependencyEdge::new("q", "m3"),
+        DependencyEdge::new("q", "m5"),
+        DependencyEdge::new("q", "m7"),
+        DependencyEdge::new("m1", "m2"),
+        DependencyEdge::new("m2", "m3"),
+        DependencyEdge::new("m3", "m4"),
+        DependencyEdge::new("m4", "m5"),
+        DependencyEdge::new("m5", "m6"),
+        DependencyEdge::new("m6", "m7"),
+        DependencyEdge::new("m7", "m8"),
+        DependencyEdge::new("m8", "m1"),
+    ];
+
+    let region_a = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &region_a_edges);
+    let region_b = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &region_b_edges);
+
+    assert_eq!(region_a.len(), 1);
+    assert_eq!(region_b.len(), 1);
+
+    println!(
+        "PATH-033 counterexample search | region A members={} entries={} distinct={} | \
+         region B members={} entries={} distinct={}",
+        region_a[0].members.len(),
+        region_a[0].entries.len(),
+        distinct_entering_branch_count(&region_a[0]),
+        region_b[0].members.len(),
+        region_b[0].entries.len(),
+        distinct_entering_branch_count(&region_b[0]),
+    );
+
+    assert_eq!(region_a[0].members.len(), 2);
+    assert_eq!(region_b[0].members.len(), 8, "sanity check: region B's SCC is genuinely 8-wide");
+    assert_eq!(region_a[0].entries.len(), 2);
+    assert_eq!(region_b[0].entries.len(), 5, "sanity check: Q genuinely enters at 4 members");
+
+    // This is the actual, current, GREEN behavior -- not forced. It is
+    // recorded here as the PATH-033 counterexample: distinct_entering_
+    // branch_count treats a clean 2-member/2-entry region and an 8-member/
+    // 5-entry region entered by the same two branches as economically
+    // IDENTICAL (2 == 2). Whether that is correct is NOT a topological
+    // question this test (or this codebase) can answer -- it depends on
+    // whether "how many capabilities fail together" (blast radius) is a
+    // separate economic dimension from "how many independent branches
+    // were lost" (redundancy loss), a question H4 does not address and
+    // this suite does not resolve. See FIND-010: this is preserved as
+    // open evidence AGAINST treating H4 as economically sufficient by
+    // itself, not as a disproof of the narrower claim that distinct
+    // branch count is what drives REDUNDANCY-LOSS weight specifically.
+    assert_eq!(
+        distinct_entering_branch_count(&region_a[0]),
+        distinct_entering_branch_count(&region_b[0]),
+        "if this ever fails, the candidate metric has started looking at member/entry \
+         shape and FIND-010's open question has been answered one way or another -- update it"
+    );
+}

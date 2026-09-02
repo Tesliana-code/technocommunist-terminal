@@ -1107,6 +1107,39 @@ pub fn cycle_aware_first_structural_convergences_from_effective_branches(
     cycle_aware_first_convergences_over_shared(source, &adjacency, shared, &branch_roots)
 }
 
+/// Candidate ECONOMIC REDUCTION of a `StructuralConvergenceRegion` down to
+/// a single scalar (PATH-033).
+///
+/// H4 under test: economic structural importance depends primarily on the
+/// number of DISTINCT branches (`entries[i].branch`, deduplicated) that
+/// enter a first-convergence region -- not on `members.len()` (how big the
+/// converged SCC is) and not on how many separate entries a single branch
+/// contributes (`path_032_e`-style repeated entries from one branch). This
+/// function computes exactly that count and nothing else.
+///
+/// It is deliberately the smallest possible reduction: it does not look at
+/// `members` at all, and it counts each distinct `branch` once regardless
+/// of how many entries that branch has. Whether `branch` here is a raw
+/// immediate branch or a PATH-030 effective branch is entirely determined
+/// by which region-producing function the caller used upstream -- this
+/// function has no opinion and does no subsumption analysis of its own;
+/// composing with `cycle_aware_first_structural_convergences_from_effective_
+/// branches` is the PATH-030-recommended choice when redundant raw
+/// branches must not inflate the count (see `path_033_d`).
+///
+/// This is a CANDIDATE under adversarial test, not an established result:
+/// see the PATH-033 test group for cases attacking whether member count
+/// and entry multiplicity are truly economically inert, and FIND-010 for
+/// the outcome. It is NOT wired into any `aggregate_*` function or money
+/// allocation -- `members` and `entries` remain the raw, inspectable
+/// structural evidence; this is one candidate lens on top of them, not a
+/// replacement for them.
+pub fn distinct_entering_branch_count(region: &StructuralConvergenceRegion) -> usize {
+    let branches: std::collections::HashSet<&CapabilityId> =
+        region.entries.iter().map(|entry| &entry.branch).collect();
+    branches.len()
+}
+
 /// Candidate SUBSUMED-BRANCH semantics for structural independence
 /// (PATH-029).
 ///
