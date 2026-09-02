@@ -14,6 +14,85 @@ pub enum Substitutability {
     None,
 }
 
+/// PATH-034: candidate representation of explicit OPERATIONAL substitution
+/// latency -- how long removal of a capability takes to reach an effective
+/// substitute -- investigated as a possible additional dimension alongside
+/// `Substitutability`. See the `path_034_*` test group in
+/// `tests/pathological_cases.rs` and `docs/findings/FIND-011-*.md` for what
+/// this experiment established and did not establish.
+///
+/// INSPECTION RESULT (PATH-034 first task, before this type was added):
+/// `Substitutability` is NOT a binary has-substitute predicate -- it is an
+/// existing four-level categorical input (`Easy | Moderate | Difficult |
+/// None`) with a deterministic numeric normalization
+/// (`substitutability_score`: 0.00 / 0.33 / 0.67 / 1.00). What inspection
+/// actually found is narrower than "the old representation forces a
+/// collapse":
+///
+/// - there is no documented or code-derived mapping from evidence to one
+///   of these four categories (no `Evidence -> Substitutability`
+///   constructor exists anywhere in this module, matching FIND-003: manual
+///   scores are not economic evidence);
+/// - because that mapping is unspecified, it is likewise unspecified
+///   whether Easy/Moderate/Difficult are intended to track replacement
+///   time, replacement effort, functional completeness, cost, some
+///   combination, or something else entirely;
+/// - consequently a human assigning these categories manually COULD assign
+///   different categories to a 30ms-failover case and a 3-week-rebuild
+///   case -- nothing here proves the old representation necessarily forces
+///   them equal, only that its derivation is unspecified either way;
+/// - what PATH-034 DOES establish is that the representation does not
+///   EXPLICITLY encode or derive restoration time in any form: no field,
+///   no derivation function, and no PATH-027..033 graph primitive
+///   (`StructuralConvergenceRegion`, `distinct_entering_branch_count`, ...)
+///   reads or produces a temporal quantity, and graph topology alone
+///   cannot supply one either, since real-world restoration latency is not
+///   a topological property of a dependency graph.
+///
+/// This type also does NOT establish any graph-structural meaning for
+/// `Substitutability::None` (e.g. "no structural substitute path exists in
+/// the dependency graph") -- no such constructor or derivation exists in
+/// this codebase. `None` remains only an existing categorical value with
+/// unspecified evidence derivation, exactly like `Easy`/`Moderate`/
+/// `Difficult`.
+///
+/// `TimeToEffectiveSubstitution` is offered as ONE candidate representation
+/// of explicit temporal evidence, not as the uniquely necessary one -- a
+/// richer future representation (e.g. a restoration trajectory over time)
+/// could encode the same distinction and derive a scalar like this one
+/// from it instead of storing it directly.
+///
+/// This type is NOT wired into `CriticalityObservables`, `measure_criticality`,
+/// any `aggregate_*` function, or `Contribution`. It exists only to test
+/// whether explicit temporal distinctions are representable at all.
+///
+/// `std::time::Duration` is used for the bounded case because this is a
+/// deterministic protocol-level input value, not a wall-clock reading --
+/// no `Instant`/`SystemTime` is involved, so no runtime-clock or timezone
+/// semantics leak in, and it stores an exact seconds+nanoseconds count
+/// (no floating point), so unit conversions like `from_millis`/`from_secs`
+/// are exact and comparable (see `path_034_d_unit_invariance`). A bespoke
+/// integer-duration newtype was considered and rejected as unnecessary
+/// duplication of what `Duration` already provides deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeToEffectiveSubstitution {
+    /// An effective substitute is reached after this exact duration.
+    /// `Duration::ZERO` is a valid, meaningful value: instantaneous /
+    /// already-effective failover (PATH-034-E). It is NOT used to mean
+    /// "no substitution needed" or "no substitute exists" -- those are
+    /// separate concepts this type does not model.
+    Bounded(std::time::Duration),
+    /// On the TEMPORAL axis only: no effective substitution is ever
+    /// reached, on any horizon considered. This says nothing about, and
+    /// does not derive from, `Substitutability::None` or any other
+    /// existing categorical value -- their evidence derivation is
+    /// unspecified (see above), so no claim is made about what they mean
+    /// or how they relate to this variant. `Never` simply makes
+    /// "never effective" representable on this axis instead of silently
+    /// folding it into `Bounded` with some arbitrarily large duration.
+    Never,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CriticalityMeasurementWeights {
     pub qualified_dependency_weight: f64,

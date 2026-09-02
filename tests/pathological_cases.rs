@@ -4390,3 +4390,315 @@ fn path_033_i_counterexample_search_member_count_and_entry_multiplicity_are_disc
          shape and FIND-010's open question has been answered one way or another -- update it"
     );
 }
+
+// ---------------------------------------------------------------------
+// PATH-034: substitutability temporal semantics (H5, narrowed).
+//
+// H5 (as actually tested, corrected from an earlier overstated version):
+// the existing `Substitutability` representation does not explicitly
+// encode or derive temporal restoration semantics -- no
+// `Evidence -> Substitutability` derivation exists, so it is UNSPECIFIED
+// whether Easy/Moderate/Difficult are meant to track replacement time,
+// effort, functional completeness, cost, or something else. If
+// counterfactual criticality must distinguish otherwise-equivalent
+// substitution scenarios whose restoration latency differs, additional
+// EXPLICIT temporal evidence is required, because nothing currently
+// derives or stores that latency. `has_substitute: bool` was only the
+// motivating thought experiment in the mission brief, never an accurate
+// description of `Substitutability` (which is an existing four-level
+// categorical value with a deterministic 0.00/0.33/0.67/1.00 numeric
+// normalization, not a boolean).
+//
+// These tests do NOT claim the existing protocol necessarily assigns
+// equal categories to cases with different real-world restoration
+// latency -- a human could assign different categories, which would
+// remain epistemically insufficient under FIND-003 (unspecified
+// derivation) without being a forced categorical collapse. Where a test
+// constructs equal categorical values for two cases, that equality is
+// test setup, not derived evidence, and is labelled as such below.
+//
+// See the module doc comment on `TimeToEffectiveSubstitution` in
+// `src/measurement.rs` for the full inspection result, and
+// `docs/findings/FIND-011-*.md` for the final verdict.
+//
+// `TimeToEffectiveSubstitution` is NOT wired into `measure_criticality`,
+// any `aggregate_*` function, or `Contribution`. These tests only attack
+// the raw observable/type, per the PATH-034 mission constraints.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_034_a_isomorphic_structure_different_substitution_latency_is_distinguishable() {
+    use distribution_machine::measurement::{Substitutability, TimeToEffectiveSubstitution};
+    use std::time::Duration;
+
+    // Test setup, not derived evidence: both cases are GIVEN the same
+    // existing categorical value here. This does not claim the existing
+    // protocol would necessarily assign both real-world cases the same
+    // category -- `Substitutability`'s evidence-to-category derivation is
+    // unspecified (no `Evidence -> Substitutability` constructor exists
+    // anywhere in this module), so a human could in principle assign
+    // different categories to a 30ms case and a 3-week case.
+    let same_category_a = Substitutability::Easy;
+    let same_category_b = Substitutability::Easy;
+    assert_eq!(
+        same_category_a, same_category_b,
+        "test setup: equal categorical input by construction, not a claim about how the \
+         protocol would derive these categories from real evidence"
+    );
+
+    // Candidate temporal evidence differs.
+    let tau_a = TimeToEffectiveSubstitution::Bounded(Duration::from_millis(30));
+    let tau_b = TimeToEffectiveSubstitution::Bounded(Duration::from_secs(3 * 7 * 24 * 60 * 60));
+
+    // Given equal categorical input, the temporal observable still
+    // distinguishes the two cases: categorical equality does not imply
+    // temporal equality, and the category alone carries no information
+    // capable of expressing this difference once it is fixed equal.
+    assert_ne!(
+        tau_a, tau_b,
+        "the temporal observable distinguishes 30ms failover from a 3-week rebuild even when \
+         the (unspecified-derivation) categorical input given to this test is equal"
+    );
+}
+
+#[test]
+fn path_034_b_fast_substitute_vs_no_substitute_remain_distinct() {
+    use distribution_machine::measurement::{Substitutability, TimeToEffectiveSubstitution};
+    use std::time::Duration;
+
+    // Fast substitute: an existing non-`None` category, paired with an
+    // almost-immediate temporal value.
+    let fast_exists = Substitutability::Easy;
+    let fast_tau = TimeToEffectiveSubstitution::Bounded(Duration::from_millis(30));
+
+    // The existing "no substitute" category. No claim is made here about
+    // what `Substitutability::None` means beyond being the existing
+    // distinct categorical value -- its evidence derivation is
+    // unspecified, same as every other category (FIND-003).
+    let none_exists = Substitutability::None;
+    let none_tau = TimeToEffectiveSubstitution::Never;
+
+    assert_ne!(
+        fast_exists, none_exists,
+        "the existing non-None and None categories must remain distinguishable from each other"
+    );
+    assert_ne!(
+        fast_tau, none_tau,
+        "a fast bounded substitution must not collapse onto the same representation \
+         as never reaching one"
+    );
+
+    // A small bounded duration must never equal `Never` -- adding the
+    // temporal axis must not accidentally erase this distinction.
+    assert_ne!(TimeToEffectiveSubstitution::Bounded(Duration::from_millis(1)), TimeToEffectiveSubstitution::Never);
+}
+
+#[test]
+fn path_034_c_temporal_ordering_is_preserved_at_the_observable_level() {
+    use std::time::Duration;
+
+    let tau1 = Duration::from_millis(30);
+    let tau2 = Duration::from_secs(30);
+    let tau3 = Duration::from_secs(4 * 60 * 60);
+
+    // The raw `Duration` observable preserves ordering. This test makes
+    // no claim that any economic scoring function derived from it must be
+    // monotonic or linear -- only that the observable itself does not
+    // lose the ordering.
+    assert!(tau1 < tau2, "30ms must be strictly less than 30s");
+    assert!(tau2 < tau3, "30s must be strictly less than 4h");
+    assert!(tau1 < tau3, "30ms must be strictly less than 4h");
+}
+
+#[test]
+fn path_034_d_unit_invariance_across_equivalent_durations() {
+    use distribution_machine::measurement::TimeToEffectiveSubstitution;
+    use std::time::Duration;
+
+    // 30 seconds expressed in different units must be the same quantity.
+    let via_secs = Duration::from_secs(30);
+    let via_millis = Duration::from_millis(30_000);
+    let via_micros = Duration::from_micros(30_000_000);
+
+    assert_eq!(via_secs, via_millis);
+    assert_eq!(via_secs, via_micros);
+    assert_eq!(
+        TimeToEffectiveSubstitution::Bounded(via_secs),
+        TimeToEffectiveSubstitution::Bounded(via_millis),
+        "the same duration expressed through different units must not be treated as \
+         two different temporal observables"
+    );
+}
+
+#[test]
+fn path_034_e_zero_duration_means_instantaneous_failover_not_no_substitution() {
+    use distribution_machine::measurement::TimeToEffectiveSubstitution;
+    use std::time::Duration;
+
+    let immediate = TimeToEffectiveSubstitution::Bounded(Duration::ZERO);
+
+    // `Bounded(ZERO)` is a meaningful, effective-substitution state (an
+    // already-active hot standby / instantaneous failover). It must be
+    // representable and must NOT be the same value as `Never` (no
+    // substitution is ever effective) -- those are semantic opposites.
+    assert_ne!(immediate, TimeToEffectiveSubstitution::Never);
+
+    // It is also distinct from a merely small-but-nonzero duration --
+    // zero is not silently rounded into "approximately fast".
+    assert_ne!(
+        immediate,
+        TimeToEffectiveSubstitution::Bounded(Duration::from_nanos(1))
+    );
+}
+
+#[test]
+fn path_034_f_non_none_category_paired_with_never_effective_is_a_distinct_representable_state() {
+    use distribution_machine::measurement::{Substitutability, TimeToEffectiveSubstitution};
+
+    // Attack an edge-case combination: the existing categorical value is a
+    // non-`None` category (a substitute-exists category, whatever its
+    // unspecified evidence derivation actually tracks), while the
+    // temporal axis independently reports the substitute never becomes
+    // effective (e.g. a documented replacement procedure that has never
+    // actually completed in practice). The model must represent this
+    // combination WITHOUT collapsing it into an error state.
+    //
+    // This test makes NO claim about what `Substitutability::None` means,
+    // whether it has graph-structural semantics, or how it relates to
+    // `Never` -- `Substitutability`'s evidence derivation is unspecified
+    // (FIND-003), and `Never` is defined purely on the temporal axis (see
+    // its doc comment in `src/measurement.rs`).
+    let existing_category = Substitutability::Difficult;
+    let temporal_value = TimeToEffectiveSubstitution::Never;
+
+    assert_ne!(
+        existing_category, Substitutability::None,
+        "test setup: a non-None categorical value is used for this case"
+    );
+    assert_eq!(
+        temporal_value,
+        TimeToEffectiveSubstitution::Never,
+        "on the temporal axis alone, a non-None category paired with 'never effective' is a \
+         representable, non-error combination"
+    );
+}
+
+#[test]
+fn path_034_g_graph_invariance_temporal_semantics_are_orthogonal_to_structural_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, TimeToEffectiveSubstitution,
+        cycle_aware_first_structural_convergences, distinct_entering_branch_count,
+    };
+    use std::time::Duration;
+
+    // Identical graph topology (a plain two-branch diamond) used for both
+    // capabilities -- only the temporal observable differs.
+    let edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+    ];
+
+    let regions_a = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &edges);
+    let regions_b = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &edges);
+
+    assert_eq!(regions_a, regions_b, "identical topology must produce identical structural regions");
+    assert_eq!(
+        distinct_entering_branch_count(&regions_a[0]),
+        distinct_entering_branch_count(&regions_b[0]),
+        "structural measurement is unaffected by any temporal evidence -- it never receives it"
+    );
+
+    // Attach different temporal evidence to each "capability" that shares
+    // this exact topology. Nothing in the structural computation above
+    // took (or could take) either value as input -- it is a separate,
+    // orthogonal axis by construction, not by coincidence.
+    let tau_fast = TimeToEffectiveSubstitution::Bounded(Duration::from_millis(30));
+    let tau_slow = TimeToEffectiveSubstitution::Bounded(Duration::from_secs(3 * 7 * 24 * 60 * 60));
+    assert_ne!(tau_fast, tau_slow);
+}
+
+#[test]
+fn path_034_h_graph_difference_with_equal_temporal_value_are_still_distinguished_structurally() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, TimeToEffectiveSubstitution,
+        cycle_aware_first_structural_convergences, distinct_entering_branch_count,
+    };
+    use std::time::Duration;
+
+    // Two structurally DIFFERENT convergence situations (2 branches vs 3
+    // branches entering), with the SAME temporal value attached to both.
+    let two_branch_edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+    ];
+    let three_branch_edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("a", "c"),
+        DependencyEdge::new("a", "d"),
+        DependencyEdge::new("b", "x"),
+        DependencyEdge::new("c", "x"),
+        DependencyEdge::new("d", "x"),
+    ];
+
+    let two = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &two_branch_edges);
+    let three = cycle_aware_first_structural_convergences(&CapabilityId("a".into()), &three_branch_edges);
+
+    assert_eq!(distinct_entering_branch_count(&two[0]), 2);
+    assert_eq!(distinct_entering_branch_count(&three[0]), 3);
+
+    let shared_tau = TimeToEffectiveSubstitution::Bounded(Duration::from_secs(30));
+    assert_eq!(shared_tau, shared_tau);
+
+    // Equal temporal value must not imply equal structural measurement --
+    // temporal equality and structural equality are independent axes.
+    assert_ne!(
+        distinct_entering_branch_count(&two[0]),
+        distinct_entering_branch_count(&three[0]),
+        "identical tau must not mask a genuine structural difference"
+    );
+}
+
+#[test]
+fn path_034_i_counterexample_search_tau_alone_does_not_capture_partial_restoration() {
+    use distribution_machine::measurement::TimeToEffectiveSubstitution;
+    use std::time::Duration;
+
+    // Counterexample: two situations with IDENTICAL time-to-effective-
+    // substitution can still differ in whether the restored capability is
+    // a full or merely partial substitute for the original. `tau` alone
+    // cannot express this -- it only answers "when", not "how completely".
+    //
+    // Case 1: substitute restores full original functionality in 1 hour.
+    let tau_full_restoration = TimeToEffectiveSubstitution::Bounded(Duration::from_secs(60 * 60));
+    // Case 2: a DIFFERENT substitute also becomes available in 1 hour, but
+    // only restores partial functionality (e.g. a read-only fallback for a
+    // read-write capability). This is the ONE counterexample dimension
+    // this test actually constructs and checks. The mission's broader
+    // attack-surface list (manual intervention burden, capacity
+    // degradation, switching cost, technical-vs-business-outcome
+    // mismatch) is plausible by the same shape of argument but is NOT
+    // implemented or tested here -- it is not claimed as an established
+    // finding, only noted as an untested, similarly-shaped hypothesis.
+    let tau_partial_restoration = TimeToEffectiveSubstitution::Bounded(Duration::from_secs(60 * 60));
+
+    assert_eq!(
+        tau_full_restoration, tau_partial_restoration,
+        "tau is identical for both -- this equality is the counterexample: a scalar \
+         time-to-effective-substitution cannot distinguish full restoration from partial \
+         restoration reached in the same amount of time"
+    );
+
+    // This is preserved as evidence, not fixed here: PATH-034 is scoped to
+    // representation/observability, not to designing a sufficient
+    // multi-dimensional substitution model. See FIND-011: both "the
+    // existing categorical value does not explicitly encode temporal
+    // restoration semantics" and "a scalar tau also loses information (at
+    // least restoration completeness)" are preserved as open findings,
+    // without prematurely solving the second one with a new observable (a
+    // restoration-degree function `S_X(t)`, per the mission's
+    // formal-model notes, is explicitly NOT implemented here).
+}
