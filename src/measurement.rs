@@ -1409,6 +1409,160 @@ pub fn effective_structural_branches(
     effective
 }
 
+/// Explicit counterfactual removal (PATH-036): `edges` with every edge
+/// incident to `removed` (as either source or target) dropped.
+///
+/// This is deliberately "delete the node and all its incident edges" --
+/// there is no separate "delete only outgoing" or "delete only incoming"
+/// variant, because a `CapabilityId` with dangling half-edges is not a
+/// meaningful graph state to reason about here. This is the ONE removal
+/// semantics PATH-036 uses everywhere; no second, inconsistent notion of
+/// "remove X" is introduced elsewhere in this module.
+///
+/// Deterministic, cycle-safe (it is a pure filter, not a traversal),
+/// label-independent, and free of any economic/substitutability/capacity
+/// inference: it only ever compares `CapabilityId` equality.
+pub fn remove_capability(edges: &[DependencyEdge], removed: &CapabilityId) -> Vec<DependencyEdge> {
+    edges
+        .iter()
+        .filter(|edge| edge.source != *removed && edge.target != *removed)
+        .cloned()
+        .collect()
+}
+
+/// Plain topological reachability (PATH-036): is `target` reachable from
+/// `source` by following `edges` forward? Cycle-safe via a visited set;
+/// carries no operational meaning beyond "a directed path exists."
+pub fn is_reachable(source: &CapabilityId, target: &CapabilityId, edges: &[DependencyEdge]) -> bool {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    if source == target {
+        return true;
+    }
+
+    let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_default()
+            .push(edge.target.clone());
+    }
+
+    let mut visited: HashSet<CapabilityId> = HashSet::new();
+    let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+    visited.insert(source.clone());
+    queue.push_back(source.clone());
+
+    while let Some(node) = queue.pop_front() {
+        if let Some(children) = adjacency.get(&node) {
+            for child in children {
+                if child == target {
+                    return true;
+                }
+                if visited.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// PATH-036 CORRECTION (target-scope leak): `effective_structural_
+/// branches(source, edges)` is NOT scoped to any particular `target` --
+/// it reports every one of `source`'s distinct (subsumption-deduped)
+/// branches, regardless of where each one leads. An earlier version of
+/// `StructuralCounterfactual` used that source-global count directly
+/// alongside a `source -> target`-specific reachability question. That
+/// let a branch entirely unrelated to `target` inflate or deflate the
+/// apparent before/after delta reported *for that target*: e.g.
+/// `SOURCE->X->ANALYTICS, SOURCE->Y->PAYMENT`, querying
+/// `target = PAYMENT`, `removed = X` -- the source-global count drops
+/// 2 -> 1 (X's branch to ANALYTICS is gone), even though X never lay on
+/// any `SOURCE -> PAYMENT` path and PAYMENT's own redundancy is
+/// completely unaffected. See `path_036_m_*` for the confirmed attack
+/// and FIND-013 for the full correction.
+///
+/// This function fixes that by filtering `effective_structural_branches`
+/// down to only the branches that can actually reach `target` at all
+/// ([`is_reachable`]) -- relevance comes from graph reachability, never
+/// from labels. It is NOT a complete redundancy-quality measure even
+/// after scoping: two branches can both reach `target` and still
+/// reconverge at a shared downstream bottleneck before getting there
+/// (PATH-036-D/L already demonstrate this, via
+/// `first_structural_convergences`), and this function has no opinion
+/// about that -- it only counts distinct branch roots that reach
+/// `target`, nothing about what they share once there.
+pub fn target_scoped_effective_branches(
+    source: &CapabilityId,
+    target: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
+    effective_structural_branches(source, edges)
+        .into_iter()
+        .filter(|branch| is_reachable(branch, target, edges))
+        .collect()
+}
+
+/// Minimal deterministic STRUCTURAL counterfactual (PATH-036): what
+/// changes, in purely topological/structural terms, about `source`'s
+/// relationship to `target` when `removed` is deleted from the graph
+/// (via [`remove_capability`]).
+///
+/// All four fields describe `source`'s relationship to `target`
+/// specifically -- none is a source-global quantity:
+/// - `before_reachable`/`after_reachable`: whether `target` is reachable
+///   from `source` at all ([`is_reachable`]).
+/// - `before_effective_branches_to_target`/
+///   `after_effective_branches_to_target`: how many of `source`'s
+///   distinct effective branches can reach `target`
+///   ([`target_scoped_effective_branches`] -- PATH-029/030's
+///   subsumption-aware branch count, filtered by reachability to
+///   `target`). See the PATH-036 correction note on
+///   `target_scoped_effective_branches` for why this filtering is
+///   required and what it still does not establish (it is not a
+///   complete redundancy-quality measure -- PATH-036-D/L).
+///
+/// It does NOT report, compute, or infer: capacity, latency, redundancy
+/// reserve, substitution delay, partial/degraded functionality, business
+/// value, or any economic score. `bool`/`usize` fields only -- no floats,
+/// no weights. See PATH-036 research notes (`tests/pathological_cases.rs`,
+/// `path_036_*`) and FIND-013 for what this type does and does not
+/// establish. It is NOT wired into `CriticalityObservables`,
+/// `measure_criticality`, `Contribution`, or any `aggregate_*` function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuralCounterfactual {
+    pub before_reachable: bool,
+    pub after_reachable: bool,
+    pub before_effective_branches_to_target: usize,
+    pub after_effective_branches_to_target: usize,
+}
+
+pub fn structural_counterfactual(
+    source: &CapabilityId,
+    target: &CapabilityId,
+    edges: &[DependencyEdge],
+    removed: &CapabilityId,
+) -> StructuralCounterfactual {
+    let after_edges = remove_capability(edges, removed);
+
+    StructuralCounterfactual {
+        before_reachable: is_reachable(source, target, edges),
+        after_reachable: is_reachable(source, target, &after_edges),
+        before_effective_branches_to_target: target_scoped_effective_branches(
+            source, target, edges,
+        )
+        .len(),
+        after_effective_branches_to_target: target_scoped_effective_branches(
+            source,
+            target,
+            &after_edges,
+        )
+        .len(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyPathId(pub String);
 

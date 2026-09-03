@@ -5058,3 +5058,582 @@ fn path_035_i_equal_extent_cannot_distinguish_degradation_degree_or_duration() {
          not represented in DependencyEdge/CapabilityId topology at all"
     );
 }
+
+// =======================================================================
+// PATH-036: FAILURE PROPAGATION / COUNTERFACTUAL DEGRADATION SEMANTICS
+//
+// INSPECTION RESULT (before any test below): no generic "remove
+// capability X and recompute" helper existed anywhere in
+// `src/measurement.rs` prior to this mission. `effective_structural_
+// branches`'s subsumption check (PATH-029) does perform a narrow,
+// internal counterfactual removal -- for a candidate branch-root pair
+// (root_i, root_j) it BFS-explores from root_i while treating `source`
+// AND root_j as dead ends, to ask "does root_i reach anything beyond
+// itself and root_j once root_j is gone?" -- but that is scoped
+// entirely to pairs of `source`'s own immediate branch roots, deciding
+// subsumption between them. It is not a general "remove arbitrary node
+// X, ask whether arbitrary target Y stays reachable" utility, and no
+// such utility existed to reuse. Every prior PATH-027..035 test that
+// needed a "before/after" comparison did so by hand-authoring two
+// separate edge lists, never by computing one graph from another via an
+// explicit removal function.
+//
+// PATH-036 adds four minimal, deterministic, topology-only primitives to
+// close that gap (all in `src/measurement.rs`, none wired into
+// `CriticalityObservables`, `measure_criticality`, `Contribution`, or any
+// `aggregate_*` function):
+//
+// - `remove_capability(edges, removed)`: the ONE removal semantics used
+//   throughout -- delete every edge incident to `removed` (as source or
+//   target). No second, inconsistent notion of "remove X" is
+//   introduced anywhere in this test group.
+// - `is_reachable(source, target, edges)`: plain cycle-safe BFS
+//   reachability.
+// - `target_scoped_effective_branches(source, target, edges)`: EXISTING
+//   `effective_structural_branches` (PATH-029/030), filtered down to
+//   only the branches that can reach `target` at all. Added by the
+//   PATH-036 EPISTEMIC CORRECTION below -- see that note for why the
+//   unfiltered, source-global count is not safe to use here.
+// - `structural_counterfactual(source, target, edges, removed)`: the
+//   before/after tuple (`before_reachable`, `after_reachable`,
+//   `before_effective_branches_to_target`,
+//   `after_effective_branches_to_target`). All four fields describe
+//   `source`'s relationship to `target` specifically -- none is a
+//   source-global quantity.
+//
+// PATH-036 EPISTEMIC CORRECTION (target-scope leak, `path_036_m`): the
+// first version of `StructuralCounterfactual` used
+// `effective_structural_branches(source, edges).len()` directly --
+// a SOURCE-GLOBAL count, not scoped to `target` at all -- alongside the
+// `source -> target`-specific reachability fields. `path_036_m` confirms
+// this let a branch entirely unrelated to `target` inflate or deflate
+// the reported delta: `SOURCE->X->ANALYTICS, SOURCE->Y->PAYMENT`,
+// querying `target = PAYMENT`, `removed = X`, reported a branch-count
+// drop (2 -> 1) even though X never lay on any `SOURCE -> PAYMENT` path
+// and PAYMENT's own redundancy was completely unaffected. This was fixed
+// by scoping the branch fields through `target_scoped_effective_branches`
+// (filtering by `is_reachable`, never by label) and renaming them to
+// `..._to_target` to make the scope explicit. See FIND-013 for the full
+// correction and what remains unestablished even after it.
+//
+// H7 (corrected, narrowed): BINARY TARGET REACHABILITY can fail to
+// preserve structural changes visible elsewhere in the graph --
+// confirmed below (PATH-036-B/C/I): reachability to `target` can stay
+// `true` while `target_scoped_effective_branches` (target-scoped) drops.
+// This is deliberately narrower than an earlier, overclaimed phrasing
+// ("effective_structural_branches drops" without target-scoping, which
+// PATH-036-M shows is not by itself evidence of a target-relevant
+// change). H7 is NOT tested, and no claim is made, about operational
+// degradation degree (capacity/latency/duration) -- PATH-036-J/K record
+// that boundary explicitly instead of crossing it.
+//
+// No test below claims "reachable means healthy," "unreachable means
+// economically catastrophic," "two branches means redundancy" (without
+// having actually established target-scoped structural independence),
+// or "effective branch delta is criticality." See FIND-013 for the
+// final verdict.
+// =======================================================================
+
+#[test]
+fn path_036_a_single_point_of_failure_reachability_is_lost() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+
+    let result = structural_counterfactual(&source, &target, &edges, &removed);
+
+    assert!(result.before_reachable, "PAYMENT must be reachable before removal");
+    assert!(
+        !result.after_reachable,
+        "single point of failure: PAYMENT must become unreachable once X is removed"
+    );
+    assert_eq!(result.before_effective_branches_to_target, 1);
+    assert_eq!(result.after_effective_branches_to_target, 0);
+}
+
+#[test]
+fn path_036_b_full_redundancy_preserves_reachability() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let result = structural_counterfactual(&source, &target, &edges, &removed);
+
+    assert!(result.before_reachable);
+    assert!(
+        result.after_reachable,
+        "PAYMENT remains reachable through Y after X is removed"
+    );
+
+    // Reachability alone is reported here -- this test does NOT conclude
+    // "zero degradation" from it. See path_036_c for the structural
+    // signal reachability misses.
+}
+
+#[test]
+fn path_036_c_redundancy_loss_is_observable_without_reachability_loss() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let result = structural_counterfactual(&source, &target, &edges, &removed);
+
+    assert_eq!(result.before_reachable, result.after_reachable);
+    assert!(
+        result.before_reachable,
+        "reachability is unchanged (still true) -- the structural signal below is what changes"
+    );
+    assert!(
+        result.after_effective_branches_to_target < result.before_effective_branches_to_target,
+        "target_scoped_effective_branches (built on PATH-029/030's effective_structural_branches, \
+         filtered to branches that reach PAYMENT) observes the loss of a redundant PAYMENT-\
+         reaching branch even though reachability alone reports no change. This is established \
+         here because X's removed branch itself led to PAYMENT -- path_036_m tests the case \
+         where the removed branch does NOT lead to target, and confirms the target-scoped count \
+         correctly reports no change there."
+    );
+    assert_eq!(result.before_effective_branches_to_target, 2);
+    assert_eq!(result.after_effective_branches_to_target, 1);
+}
+
+#[test]
+fn path_036_d_shared_bottleneck_is_not_distinguished_by_branch_count_alone() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    // Test premise: M is stipulated as a shared bottleneck both branches
+    // pass through on the way to PAYMENT.
+    let shared_bottleneck_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    let truly_independent_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    // NOTE: `shared_structural_bottlenecks` alone does NOT distinguish
+    // these two shapes -- PAYMENT itself is reachable from both branches
+    // in EITHER shape, so it is reported as "shared" in both (that is
+    // simply "both branches deliver to the same declared target", not
+    // evidence of an upstream single point of failure). The primitive
+    // that actually distinguishes them is `first_structural_
+    // convergences` (PATH-028): it strips out convergence nodes that
+    // are themselves downstream of another shared node, so in the
+    // shared-bottleneck shape it reports M (strictly upstream of
+    // PAYMENT), while in the independent shape the only convergence
+    // left is PAYMENT itself.
+    let bottleneck_convergences = first_structural_convergences(&source, &shared_bottleneck_shape);
+    let independent_convergences =
+        first_structural_convergences(&source, &truly_independent_shape);
+
+    assert!(
+        bottleneck_convergences.iter().any(|node| *node != target),
+        "the shared-bottleneck shape must have a first structural convergence strictly \
+         upstream of PAYMENT (at M): {:?}",
+        bottleneck_convergences
+    );
+    assert!(
+        independent_convergences.iter().all(|node| *node == target),
+        "truly independent paths must converge only at PAYMENT itself, never at an upstream \
+         shared node: {:?}",
+        independent_convergences
+    );
+
+    // What the removal-based candidate (structural_counterfactual on X)
+    // reports for each shape.
+    let bottleneck_result =
+        structural_counterfactual(&source, &target, &shared_bottleneck_shape, &removed);
+    let independent_result =
+        structural_counterfactual(&source, &target, &truly_independent_shape, &removed);
+
+    assert_eq!(
+        bottleneck_result, independent_result,
+        "RAW BRANCH-COUNT OVERSTATEMENT: structural_counterfactual(remove X) reports an \
+         identical result for the shared-bottleneck shape and the truly independent shape, even \
+         though only the independent shape has no remaining single point of failure at M -- \
+         removing X does not remove M, and the branch-count delta alone cannot see that M is \
+         still a shared exposure in the surviving branch"
+    );
+}
+
+#[test]
+fn path_036_e_relay_insertion_on_the_surviving_branch_does_not_change_the_result() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    // Test premise: RELAY is stipulated as a pure pass-through node with
+    // no independent economic capability (PATH-035 lesson reused).
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let direct = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let via_relay = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "relay"),
+        DependencyEdge::new("relay", "payment"),
+    ];
+
+    let direct_result = structural_counterfactual(&source, &target, &direct, &removed);
+    let relay_result = structural_counterfactual(&source, &target, &via_relay, &removed);
+
+    assert_eq!(
+        direct_result, relay_result,
+        "inserting a stipulated pass-through relay into the surviving branch must not change \
+         the structural counterfactual result"
+    );
+}
+
+#[test]
+fn path_036_f_duplicate_edges_do_not_manufacture_apparent_resilience() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let single = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let mut duplicated = single.clone();
+    for _ in 0..10 {
+        duplicated.push(DependencyEdge::new("source", "y"));
+        duplicated.push(DependencyEdge::new("y", "payment"));
+    }
+
+    let single_result = structural_counterfactual(&source, &target, &single, &removed);
+    let duplicated_result = structural_counterfactual(&source, &target, &duplicated, &removed);
+
+    assert_eq!(
+        single_result, duplicated_result,
+        "DUPLICATE-EDGE VIOLATION: repeated observation of the same edge must not manufacture \
+         apparent additional resilience"
+    );
+}
+
+#[test]
+fn path_036_g_renaming_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let original = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+    let renamed = vec![
+        DependencyEdge::new("root", "branch-one"),
+        DependencyEdge::new("branch-one", "leaf"),
+        DependencyEdge::new("root", "branch-two"),
+        DependencyEdge::new("branch-two", "leaf"),
+    ];
+
+    let original_result = structural_counterfactual(
+        &CapabilityId("source".into()),
+        &CapabilityId("payment".into()),
+        &original,
+        &CapabilityId("x".into()),
+    );
+    let renamed_result = structural_counterfactual(
+        &CapabilityId("root".into()),
+        &CapabilityId("leaf".into()),
+        &renamed,
+        &CapabilityId("branch-one".into()),
+    );
+
+    assert_eq!(
+        original_result, renamed_result,
+        "RENAMING VIOLATION: relabeling capabilities must not change the structural \
+         counterfactual result"
+    );
+}
+
+#[test]
+fn path_036_h_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let forward = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let forward_result = structural_counterfactual(&source, &target, &forward, &removed);
+    let shuffled_result = structural_counterfactual(&source, &target, &shuffled, &removed);
+
+    assert_eq!(
+        forward_result, shuffled_result,
+        "ORDERING VIOLATION: edge order must not change the structural counterfactual result"
+    );
+}
+
+#[test]
+fn path_036_i_binary_reachability_is_insufficient_to_preserve_the_structural_change() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let result = structural_counterfactual(&source, &target, &edges, &removed);
+
+    // A hypothetical observable that reported ONLY before/after
+    // reachability would show no change at all here.
+    assert_eq!(
+        result.before_reachable, result.after_reachable,
+        "a reachability-only observable reports identical before/after states"
+    );
+    // Yet a real, meaningful structural change occurred.
+    assert_ne!(
+        result.before_effective_branches_to_target, result.after_effective_branches_to_target,
+        "binary reachable/unreachable is insufficient: it would silently drop this real \
+         target-scoped structural-independence loss that target_scoped_effective_branches \
+         still records"
+    );
+}
+
+#[test]
+fn path_036_j_identical_structural_result_leaves_operational_degradation_undetermined() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_counterfactual,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    // Scenario 1 (stipulated, NOT represented anywhere in the graph):
+    // Y has no spare capacity, so losing X halves served capacity.
+    let scenario_no_spare_capacity = structural_counterfactual(&source, &target, &edges, &removed);
+
+    // Scenario 2 (stipulated, NOT represented anywhere in the graph):
+    // Y has full spare capacity, so losing X has no user-visible effect.
+    let scenario_full_spare_capacity =
+        structural_counterfactual(&source, &target, &edges, &removed);
+
+    assert_eq!(
+        scenario_no_spare_capacity, scenario_full_spare_capacity,
+        "REPRESENTATIONAL BOUNDARY: the identical graph produces the identical structural \
+         counterfactual result under both stipulated capacity scenarios -- topology alone \
+         cannot determine operational degradation degree without additional evidence that \
+         DependencyEdge/CapabilityId do not carry"
+    );
+}
+
+// PATH-036-K — PARTIAL SERVICE COUNTEREXAMPLE (recorded, not executable):
+//
+// `StructuralCounterfactual` and every existing graph primitive
+// (`is_reachable`, `effective_structural_branches`, `shared_structural_
+// bottlenecks`, `first_structural_convergences*`) express only boolean
+// reachability and integer branch/convergence counts. There is no
+// "reachable but degraded-mode" state anywhere in this module -- no
+// field, no enum variant, no third value between reachable and
+// unreachable. This absence is recorded directly rather than manufactured
+// as a test, per the mission's instruction not to add a large state
+// machine for it. See FIND-013.
+
+#[test]
+fn path_036_l_counterexample_shared_bottleneck_vs_independent_paths_defeats_the_candidate() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, shared_structural_bottlenecks, structural_counterfactual,
+    };
+
+    // This restates path_036_d as a direct attack on
+    // `structural_counterfactual` specifically: two graphs that are
+    // meaningfully different in a way an EXISTING primitive
+    // (`shared_structural_bottlenecks`) can already see, yet the
+    // candidate removal-based reduction cannot.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let shared_bottleneck_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let truly_independent_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    assert_ne!(
+        shared_structural_bottlenecks(&source, &shared_bottleneck_shape).len(),
+        shared_structural_bottlenecks(&source, &truly_independent_shape).len(),
+        "these two graphs are structurally different by an existing, already-trusted measure"
+    );
+
+    let bottleneck_result =
+        structural_counterfactual(&source, &target, &shared_bottleneck_shape, &removed);
+    let independent_result =
+        structural_counterfactual(&source, &target, &truly_independent_shape, &removed);
+
+    assert_eq!(
+        bottleneck_result, independent_result,
+        "COUNTEREXAMPLE AGAINST THE CANDIDATE: structural_counterfactual collapses two \
+         structurally distinguishable graphs to the same result -- even after target-scoping \
+         (path_036_m), it is not a sufficient summary of structural degradation on its own, \
+         only of target reachability and target-scoped branch count specifically"
+    );
+}
+
+#[test]
+fn path_036_m_target_scope_leak_unrelated_branch_removal_is_correctly_ignored() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches, remove_capability,
+        structural_counterfactual, target_scoped_effective_branches,
+    };
+
+    // Test premise: ANALYTICS and PAYMENT are stipulated as unrelated
+    // capabilities. Relevance to `target` is established purely by graph
+    // reachability below (via `is_reachable`/`target_scoped_effective_
+    // branches`), never inferred from these labels -- X's branch simply
+    // never has an edge path reaching PAYMENT.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("payment".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "analytics"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    // CONFIRM THE LEAK CLASS: the SOURCE-GLOBAL primitive
+    // (effective_structural_branches) genuinely does change when X is
+    // removed -- it drops from 2 (X, Y) to 1 (Y) -- regardless of
+    // PAYMENT. A `StructuralCounterfactual` built directly on this
+    // global count (the pre-correction shape) would have reported that
+    // drop as if it were evidence about PAYMENT's redundancy.
+    let after_edges = remove_capability(&edges, &removed);
+    let global_before = effective_structural_branches(&source, &edges).len();
+    let global_after = effective_structural_branches(&source, &after_edges).len();
+
+    assert_eq!(global_before, 2);
+    assert_eq!(global_after, 1);
+    assert_ne!(
+        global_before, global_after,
+        "TARGET-SCOPE LEAK CONFIRMED (pre-correction class): the source-global branch count \
+         changes solely because X's own branch (to ANALYTICS) disappeared -- this says nothing \
+         about PAYMENT"
+    );
+
+    // CONFIRM THE CORRECTION: target_scoped_effective_branches, and the
+    // corrected structural_counterfactual built on it, must NOT report
+    // any PAYMENT-relevant change, because X never lay on any
+    // SOURCE -> PAYMENT path.
+    let target_scoped_before = target_scoped_effective_branches(&source, &target, &edges).len();
+    let target_scoped_after =
+        target_scoped_effective_branches(&source, &target, &after_edges).len();
+
+    assert_eq!(
+        target_scoped_before, target_scoped_after,
+        "target_scoped_effective_branches must report no change for PAYMENT when the removed \
+         branch never reached PAYMENT"
+    );
+    assert_eq!(target_scoped_before, 1);
+    assert_eq!(target_scoped_after, 1);
+
+    let result = structural_counterfactual(&source, &target, &edges, &removed);
+
+    assert!(result.before_reachable);
+    assert!(result.after_reachable);
+    assert_eq!(
+        result.before_effective_branches_to_target, result.after_effective_branches_to_target,
+        "CORRECTED: structural_counterfactual's target-scoped fields must not exhibit the \
+         target-scope leak -- removing a branch unrelated to PAYMENT must not change PAYMENT's \
+         reported redundancy"
+    );
+    assert_eq!(result.before_effective_branches_to_target, 1);
+    assert_eq!(result.after_effective_branches_to_target, 1);
+}
