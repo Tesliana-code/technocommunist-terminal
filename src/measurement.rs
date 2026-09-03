@@ -1790,9 +1790,30 @@ pub fn canonicalize_pure_relays(
     protected: &[CapabilityId],
     edges: &[DependencyEdge],
 ) -> (Vec<DependencyEdge>, Vec<RelayCollapseProvenance>) {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     let protected_set: HashSet<CapabilityId> = protected.iter().cloned().collect();
+
+    collapse_relays_where(source, edges, |node| !protected_set.contains(node))
+}
+
+/// Shared fixed-point collapse core for [`canonicalize_pure_relays`]
+/// (PATH-038) and [`canonicalize_declared_representation_nodes`]
+/// (PATH-039). `policy_allows(node)` decides whether `node` is even a
+/// CANDIDATE for collapse, given whatever caller-specific policy applies
+/// (a plain protected-set membership test for PATH-038; that same test
+/// AND an explicit semantic authorization for PATH-039) -- `source`
+/// itself is excluded unconditionally regardless of policy, matching
+/// PATH-038-F. Every other guard (exactly one predecessor, exactly one
+/// successor, not on a cycle) is universal topology and lives here,
+/// identically, for both callers -- this refactor changes neither
+/// function's observable behavior, only where the shared loop lives.
+fn collapse_relays_where(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+    policy_allows: impl Fn(&CapabilityId) -> bool,
+) -> (Vec<DependencyEdge>, Vec<RelayCollapseProvenance>) {
+    use std::collections::{HashMap, HashSet};
 
     let mut current: HashSet<(CapabilityId, CapabilityId)> = edges
         .iter()
@@ -1830,7 +1851,7 @@ pub fn canonicalize_pure_relays(
         let mut candidates: Vec<CapabilityId> = Vec::new();
 
         for node in &nodes {
-            if node == source || protected_set.contains(node) {
+            if node == source || !policy_allows(node) {
                 continue;
             }
 
@@ -1888,6 +1909,191 @@ pub fn canonicalize_pure_relays(
     canonical_edges.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
 
     (canonical_edges, provenance)
+}
+
+/// PATH-039: an explicit, topology-independent claim about one
+/// `CapabilityId`'s representational role.
+///
+/// Deliberately two variants only, NOT three: `Unclassified` is not a
+/// value anyone can meaningfully assert ("I explicitly claim this node
+/// is unclassified" says nothing), so it is represented by the ABSENCE
+/// of any `RepresentationClaim` for a given capability in the evidence
+/// set passed to [`evaluate_representation_claims`], not by a third enum
+/// variant. This keeps "no one has said anything about this node" and
+/// "someone explicitly said X" structurally distinguishable, which a
+/// bare `HashSet<CapabilityId>` membership test cannot do -- see
+/// `path_039_candidate_a_*` for why that bare-boolean strawman
+/// (Candidate A, PATH-039 STEP 6) was rejected in favor of this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepresentationRole {
+    SemanticCapability,
+    RepresentationOnly,
+}
+
+/// Identity of one representation claim's supporting evidence (PATH-039
+/// Candidate B, STEP 6). This repository has no organizational-authority
+/// or issuer-identity type to reuse (inspected: `DependencyId`,
+/// `DependencyPathId`, `FailureDomainId` are all bare string identifiers
+/// with no issuer/authority semantics either), so none is invented here
+/// -- this is exactly as much identity as every other `XxxId(String)`
+/// type in this module carries, no more. An empty string is treated as
+/// MISSING/INVALID evidence by [`evaluate_representation_claims`]
+/// (PATH-039-Q), not as a valid claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepresentationClaimId(pub String);
+
+/// One explicit representation-role claim (PATH-039). `role` must be
+/// asserted by SOME evidence identity (`claim_id`) -- this is Candidate
+/// B from STEP 6 (declaration + evidence id), not Candidate A (a bare
+/// boolean). Nothing about this type verifies the claim is TRUE; see
+/// `path_039_d`/`path_039_l` for why topology-only canonicalization
+/// cannot detect a false claim, and FIND-016 for the full verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepresentationClaim {
+    pub capability: CapabilityId,
+    pub role: RepresentationRole,
+    pub claim_id: RepresentationClaimId,
+}
+
+/// Deterministic outcome of evaluating every claim about one capability
+/// (PATH-039 STEP 7). No arbitrary tie-breaking, no "last writer wins,"
+/// no timestamp-based resolution: `Conflicted` is returned, visibly,
+/// whenever both roles are asserted for the same capability by any
+/// claims, rather than silently picking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepresentationDecision {
+    /// At least one valid `RepresentationOnly` claim exists, no
+    /// `SemanticCapability` claim exists, and no claim for this
+    /// capability has invalid evidence.
+    Authorized,
+    /// Covers three distinct underlying situations, deliberately
+    /// collapsed into one outcome because all three have the identical
+    /// practical effect (never authorize collapse): no claim exists at
+    /// all (Unclassified, conservative default); an explicit
+    /// `SemanticCapability` claim exists; or a `RepresentationOnly`
+    /// claim exists but its evidence is missing/invalid (empty
+    /// `claim_id`).
+    Refused,
+    /// Both `SemanticCapability` and `RepresentationOnly` are asserted
+    /// for the same capability (by any claims, regardless of how many).
+    /// Never authorizes collapse; always reported back to the caller via
+    /// [`representation_claim_conflicts`] rather than resolved silently.
+    Conflicted,
+}
+
+/// Evaluate every claim in `claims` about `capability` and return the
+/// single deterministic [`RepresentationDecision`]. See that type's
+/// variants for the exact rules. Duplicate claims (same or different
+/// `claim_id`, same role) do not change the outcome -- authority does
+/// not accumulate with repetition (PATH-039-J/M).
+pub fn evaluate_representation_claims(
+    capability: &CapabilityId,
+    claims: &[RepresentationClaim],
+) -> RepresentationDecision {
+    let relevant: Vec<&RepresentationClaim> = claims
+        .iter()
+        .filter(|claim| &claim.capability == capability)
+        .collect();
+
+    if relevant.is_empty() {
+        return RepresentationDecision::Refused;
+    }
+
+    let has_semantic = relevant
+        .iter()
+        .any(|claim| claim.role == RepresentationRole::SemanticCapability);
+    let has_representation_only = relevant
+        .iter()
+        .any(|claim| claim.role == RepresentationRole::RepresentationOnly);
+
+    if has_semantic && has_representation_only {
+        return RepresentationDecision::Conflicted;
+    }
+
+    if has_semantic {
+        return RepresentationDecision::Refused;
+    }
+
+    let all_representation_only_claims_valid = relevant
+        .iter()
+        .filter(|claim| claim.role == RepresentationRole::RepresentationOnly)
+        .all(|claim| !claim.claim_id.0.is_empty());
+
+    if !all_representation_only_claims_valid {
+        return RepresentationDecision::Refused;
+    }
+
+    RepresentationDecision::Authorized
+}
+
+/// Every distinct capability among `claims` whose
+/// [`evaluate_representation_claims`] result is `Conflicted`, sorted for
+/// determinism. Exists so a caller can always inspect conflicts
+/// independent of whether any conflicted node ever became a topology-
+/// eligible collapse candidate.
+pub fn representation_claim_conflicts(claims: &[RepresentationClaim]) -> Vec<CapabilityId> {
+    use std::collections::HashSet;
+
+    let distinct_capabilities: HashSet<CapabilityId> =
+        claims.iter().map(|claim| claim.capability.clone()).collect();
+
+    let mut conflicted: Vec<CapabilityId> = distinct_capabilities
+        .into_iter()
+        .filter(|capability| {
+            evaluate_representation_claims(capability, claims) == RepresentationDecision::Conflicted
+        })
+        .collect();
+
+    conflicted.sort_by(|a, b| a.0.cmp(&b.0));
+    conflicted
+}
+
+/// PATH-039: semantics-gated variant of [`canonicalize_pure_relays`]. A
+/// node is eligible for collapse only if it clears EVERY guard
+/// `canonicalize_pure_relays` requires (not `source`, not in
+/// `protected`, exactly one predecessor, exactly one successor, not on a
+/// cycle) AND `evaluate_representation_claims` returns `Authorized` for
+/// it. Semantic authorization alone is never sufficient on its own --
+/// PATH-039-E/F confirm a branch or convergence point marked
+/// `RepresentationOnly` still never collapses, because it can never
+/// satisfy the one-predecessor/one-successor shape regardless of policy.
+///
+/// Returns the canonical edges, full collapse provenance (identical
+/// shape to PATH-038's), and every conflicted capability found in
+/// `claims` (via [`representation_claim_conflicts`]) -- conflicts are
+/// always reported, never used to silently block or permit unrelated
+/// collapses elsewhere in the graph.
+///
+/// This function does NOT verify that any `RepresentationOnly` claim is
+/// TRUE. PATH-039-D/L demonstrate that a structurally valid, correctly-
+/// evidenced claim about a capability that is actually semantically
+/// meaningful is indistinguishable, from this function's perspective,
+/// from a claim about a genuine relay -- verifying truth requires
+/// evidence this repository does not have and this experiment does not
+/// invent. PATH-039-O further demonstrates that even fully TRUTHFUL,
+/// individually-correct claims can still reproduce PATH-038-K/P's
+/// cascading branch-multiplicity erasure at an unrelated, unclaimed
+/// convergence node -- explicit semantics fix the "topology alone can't
+/// tell relay from capability" problem (PATH-038-N), not the separate
+/// "independent bypass edges can deduplicate onto a shared ancestor"
+/// problem. See FIND-016 for the full verdict.
+pub fn canonicalize_declared_representation_nodes(
+    source: &CapabilityId,
+    protected: &[CapabilityId],
+    claims: &[RepresentationClaim],
+    edges: &[DependencyEdge],
+) -> (Vec<DependencyEdge>, Vec<RelayCollapseProvenance>, Vec<CapabilityId>) {
+    use std::collections::HashSet;
+
+    let protected_set: HashSet<CapabilityId> = protected.iter().cloned().collect();
+    let conflicts = representation_claim_conflicts(claims);
+
+    let (canonical_edges, provenance) = collapse_relays_where(source, edges, |node| {
+        !protected_set.contains(node)
+            && evaluate_representation_claims(node, claims) == RepresentationDecision::Authorized
+    });
+
+    (canonical_edges, provenance, conflicts)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

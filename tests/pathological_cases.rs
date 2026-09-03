@@ -7042,3 +7042,893 @@ fn path_038_p_canonical_edges_alone_lose_convergence_information_that_provenance
     );
     assert_ne!(entries_feeding_m[0], entries_feeding_m[1]);
 }
+
+// =======================================================================
+// PATH-039: EXPLICIT REPRESENTATION SEMANTICS / ANTI-LAUNDERING RESURRECTION QUEST
+//
+// INSPECTION RESULT: no existing type in this module carries
+// representation-role semantics, and no existing type carries
+// issuer/authority identity of any kind -- `DependencyId`,
+// `DependencyPathId`, and `FailureDomainId` are all bare
+// `String`-wrapped identifiers with no such concept. `RelayCollapseProvenance`
+// (PATH-038) records WHAT was collapsed, never WHY it was eligible.
+// Nothing here is reused wholesale, because nothing here fits; the new
+// types below (`RepresentationRole`, `RepresentationClaimId`,
+// `RepresentationClaim`, `RepresentationDecision`) follow the exact same
+// minimal `XxxId(String)` + plain-struct convention already used
+// throughout this module, adding no organizational-authority or manager
+// hierarchy concept that was not already absent.
+//
+// THE CONTRACT TESTED: `canonicalize_declared_representation_nodes`
+// requires a node to satisfy EVERY existing PATH-038 topology guard
+// (not source, not protected, exactly one predecessor, exactly one
+// successor, not cyclic) AND `evaluate_representation_claims` to return
+// `Authorized` (a valid `RepresentationOnly` claim exists, no conflicting
+// `SemanticCapability` claim exists). `Unclassified` is the ABSENCE of
+// any claim, not a third enum variant -- see the doc comment on
+// `RepresentationRole` for why. Conflicting claims for the same
+// capability produce `RepresentationDecision::Conflicted`, always
+// reported via `representation_claim_conflicts`, never silently resolved.
+//
+// H10 (as actually tested): explicit representation semantics DO close
+// PATH-038-N's specific gap (topology alone cannot distinguish a relay
+// from a meaningful degree-(1,1) capability) -- given a TRUTHFUL
+// declaration, canonicalization now behaves differently and correctly
+// for the two cases (`path_039_n`). But H10's stronger claim --
+// "safely authorizes canonicalization... while resisting trivial
+// declaration laundering" -- does NOT survive: nothing in this
+// evidence model can distinguish a truthful `RepresentationOnly` claim
+// from a false one (`path_039_d`/`path_039_l`), and even fully TRUTHFUL,
+// correctly-evidenced claims about genuinely-representational nodes
+// can still reproduce PATH-038-K/P's cascading erasure of an unrelated,
+// entirely unclaimed convergence node's branch-multiplicity fact
+// (`path_039_o`) -- a failure mode explicit semantics do not touch at
+// all, because it never depended on any node's semantic status in the
+// first place. See FIND-016 for the full verdict.
+//
+// No claim below says explicit semantics solve canonicalization
+// generally, that metadata makes declarations truthful, that provenance
+// proves semantics, that collapse is economically correct, that graph
+// identity is solved, or that representation laundering is impossible.
+// No money, no Contribution, no CriticalityObservables wiring anywhere
+// in this test group.
+// =======================================================================
+
+#[test]
+fn path_039_a_declared_true_relay_collapses() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims = vec![RepresentationClaim {
+        capability: r.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-1".into()),
+    }];
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &claims, &edges);
+
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "target")]);
+    assert_eq!(provenance.len(), 1);
+    assert_eq!(provenance[0].collapsed, r);
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn path_039_b_unclassified_relay_shaped_node_survives() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims: Vec<RepresentationClaim> = vec![]; // no declaration at all
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    let mut expected = edges.clone();
+    expected.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    assert_eq!(
+        canonical, expected,
+        "CONSERVATIVE DEFAULT: an unclassified node must not automatically become \
+         representation-only"
+    );
+    assert!(provenance.is_empty());
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn path_039_c_explicit_semantic_capability_survives() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationDecision, RepresentationRole, canonicalize_declared_representation_nodes,
+        evaluate_representation_claims,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims = vec![RepresentationClaim {
+        capability: r.clone(),
+        role: RepresentationRole::SemanticCapability,
+        claim_id: RepresentationClaimId("claim-2".into()),
+    }];
+
+    assert_eq!(
+        evaluate_representation_claims(&r, &claims),
+        RepresentationDecision::Refused
+    );
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    let mut expected = edges.clone();
+    expected.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    assert_eq!(canonical, expected, "an explicitly declared SemanticCapability must survive");
+    assert!(provenance.is_empty());
+}
+
+#[test]
+fn path_039_d_false_representation_declaration_is_not_detectable_from_topology() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    // Test premise: X is stipulated to be genuinely meaningful, but is
+    // FALSELY declared RepresentationOnly with otherwise valid evidence.
+    // Nothing in the graph or the claim structure marks this as a lie.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let x = CapabilityId("x".into());
+    let edges = vec![DependencyEdge::new("source", "x"), DependencyEdge::new("x", "target")];
+    let claims = vec![RepresentationClaim {
+        capability: x.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-lie".into()),
+    }];
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    assert_eq!(
+        canonical,
+        vec![DependencyEdge::new("source", "target")],
+        "UNDETECTABLE FALSE CLAIM: a structurally well-formed but false RepresentationOnly \
+         claim collapses X exactly as a true one would -- this function cannot verify claim \
+         truth, only claim well-formedness"
+    );
+    assert_eq!(provenance[0].collapsed, x);
+}
+
+#[test]
+fn path_039_e_branch_point_marked_representation_only_still_never_collapses() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("x", "b"),
+    ];
+    let claims = vec![RepresentationClaim {
+        capability: x.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-3".into()),
+    }];
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+
+    assert!(
+        provenance.is_empty(),
+        "semantic authorization is not sufficient on its own -- X has two successors and can \
+         never satisfy the one-predecessor/one-successor shape"
+    );
+    let mut expected = edges.clone();
+    expected.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    assert_eq!(canonical, expected);
+}
+
+#[test]
+fn path_039_f_convergence_point_marked_representation_only_still_never_collapses() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let a = CapabilityId("a".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("a", "m"),
+        DependencyEdge::new("b", "m"),
+        DependencyEdge::new("m", "target"),
+    ];
+    let claims = vec![RepresentationClaim {
+        capability: m.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-4".into()),
+    }];
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&a, &[], &claims, &edges);
+
+    assert!(
+        provenance.is_empty(),
+        "M has two predecessors and can never satisfy the collapse shape, regardless of \
+         semantic authorization"
+    );
+    let mut expected = edges.clone();
+    expected.sort_by(|e1, e2| e1.source.0.cmp(&e2.source.0).then(e1.target.0.cmp(&e2.target.0)));
+    assert_eq!(canonical, expected);
+}
+
+#[test]
+fn path_039_g_cycle_member_marked_representation_only_still_never_collapses() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("a".into());
+    let mut edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "a"),
+    ];
+    edges.sort_by(|e1, e2| e1.source.0.cmp(&e2.source.0).then(e1.target.0.cmp(&e2.target.0)));
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("b".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-5".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("c".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-6".into()),
+        },
+    ];
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+
+    assert!(
+        provenance.is_empty(),
+        "cycle membership refuses collapse regardless of semantic marking"
+    );
+    assert_eq!(canonical, edges);
+}
+
+#[test]
+fn path_039_h_declaration_order_invariance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "target"),
+    ];
+    let forward_claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("a".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-a".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("b".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-b".into()),
+        },
+    ];
+    let mut reversed_claims = forward_claims.clone();
+    reversed_claims.reverse();
+
+    let forward_result =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &forward_claims, &edges);
+    let reversed_result =
+        canonicalize_declared_representation_nodes(&source, &[target], &reversed_claims, &edges);
+
+    assert_eq!(forward_result, reversed_result);
+}
+
+#[test]
+fn path_039_i_edge_order_invariance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let forward = vec![
+        DependencyEdge::new("source", "r"),
+        DependencyEdge::new("r", "target"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+    let claims = vec![RepresentationClaim {
+        capability: CapabilityId("r".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-1".into()),
+    }];
+
+    let forward_result =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &claims, &forward);
+    let shuffled_result =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &shuffled);
+
+    assert_eq!(forward_result, shuffled_result);
+}
+
+#[test]
+fn path_039_j_duplicate_declaration_does_not_multiply_authority() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+
+    let single = vec![RepresentationClaim {
+        capability: r.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-1".into()),
+    }];
+    let identical_duplicate = vec![single[0].clone(), single[0].clone(), single[0].clone()];
+    let independently_corroborating = vec![
+        single[0].clone(),
+        RepresentationClaim {
+            capability: r.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-2".into()),
+        },
+    ];
+
+    let single_result =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &single, &edges);
+    let duplicate_result = canonicalize_declared_representation_nodes(
+        &source,
+        &[target.clone()],
+        &identical_duplicate,
+        &edges,
+    );
+    let corroborating_result = canonicalize_declared_representation_nodes(
+        &source,
+        &[target],
+        &independently_corroborating,
+        &edges,
+    );
+
+    assert_eq!(
+        single_result, duplicate_result,
+        "repeating the identical claim must not change the outcome"
+    );
+    assert_eq!(
+        single_result, corroborating_result,
+        "a second, independently-identified claim asserting the SAME role must not authorize \
+         anything MORE than a single claim already did -- authority does not accumulate"
+    );
+}
+
+#[test]
+fn path_039_k_conflicting_declarations_are_never_resolved_by_a_default_winner() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationDecision, RepresentationRole, canonicalize_declared_representation_nodes,
+        evaluate_representation_claims,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims = vec![
+        RepresentationClaim {
+            capability: r.clone(),
+            role: RepresentationRole::SemanticCapability,
+            claim_id: RepresentationClaimId("claim-says-real".into()),
+        },
+        RepresentationClaim {
+            capability: r.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-says-relay".into()),
+        },
+    ];
+
+    assert_eq!(
+        evaluate_representation_claims(&r, &claims),
+        RepresentationDecision::Conflicted,
+        "NO LAST-WRITER-WINS: contradictory claims for the same capability must be reported as \
+         Conflicted, not silently resolved to either role"
+    );
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    let mut expected = edges.clone();
+    expected.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    assert_eq!(canonical, expected, "a conflicted node is never authorized to collapse");
+    assert!(provenance.is_empty());
+    assert_eq!(conflicts, vec![r]);
+}
+
+#[test]
+fn path_039_l_representation_identity_laundering_can_erase_a_real_boundary() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    // Test premise: X1->X2 is stipulated to be ONE real capability that
+    // someone has split into two nodes and declared BOTH halves
+    // RepresentationOnly. Nothing here verifies that claim.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x1"),
+        DependencyEdge::new("x1", "x2"),
+        DependencyEdge::new("x2", "target"),
+    ];
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("x1".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-x1".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("x2".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-x2".into()),
+        },
+    ];
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    assert_eq!(
+        canonical,
+        vec![DependencyEdge::new("source", "target")],
+        "LAUNDERING SURFACE CONFIRMED: declaring both halves of a stipulated real capability \
+         RepresentationOnly erases the entire boundary with no topological trace distinguishing \
+         this from genuine chain decomposition -- the declarations themselves are the only \
+         evidence, and nothing here verifies they are true"
+    );
+    assert_eq!(provenance.len(), 2);
+    assert!(conflicts.is_empty(), "each declaration is internally consistent; the danger is in \
+        their content being unverifiable, not in any detectable conflict");
+}
+
+#[test]
+fn path_039_m_declaration_swarm_does_not_gain_structural_effect() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+
+    let minimal_claims = vec![RepresentationClaim {
+        capability: r.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-1".into()),
+    }];
+
+    // A swarm of additional declarations about capabilities that do not
+    // even appear in this graph's edges.
+    let mut swarm_claims = minimal_claims.clone();
+    for i in 0..25 {
+        swarm_claims.push(RepresentationClaim {
+            capability: CapabilityId(format!("unrelated-{i}")),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("swarm-claim-{i}")),
+        });
+    }
+
+    let minimal_result =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &minimal_claims, &edges);
+    let swarm_result =
+        canonicalize_declared_representation_nodes(&source, &[target], &swarm_claims, &edges);
+
+    assert_eq!(
+        minimal_result, swarm_result,
+        "25 additional, irrelevant declarations must not change the canonical graph, \
+         provenance, or conflict set for a graph they do not even mention"
+    );
+}
+
+#[test]
+fn path_039_n_replay_explicit_semantics_now_distinguish_the_path_038_n_case() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let x = CapabilityId("x".into());
+    let edges = vec![DependencyEdge::new("source", "x"), DependencyEdge::new("x", "target")];
+
+    let representation_only_case = canonicalize_declared_representation_nodes(
+        &source,
+        &[target.clone()],
+        &[RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-1".into()),
+        }],
+        &edges,
+    );
+    let semantic_capability_case = canonicalize_declared_representation_nodes(
+        &source,
+        &[target],
+        &[RepresentationClaim {
+            capability: x,
+            role: RepresentationRole::SemanticCapability,
+            claim_id: RepresentationClaimId("claim-2".into()),
+        }],
+        &edges,
+    );
+
+    assert_ne!(
+        representation_only_case.0, semantic_capability_case.0,
+        "PATH-038-N showed topology alone gives the IDENTICAL (collapsing) answer for these two \
+         topologically indistinguishable cases; given a TRUTHFUL explicit declaration, the two \
+         canonical outputs now deterministically differ"
+    );
+}
+
+#[test]
+fn path_039_o_replay_truthful_individual_claims_still_erase_an_unclaimed_convergence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes, shared_structural_bottlenecks,
+    };
+
+    let source = CapabilityId("source".into());
+    let payment = CapabilityId("payment".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    assert!(!shared_structural_bottlenecks(&source, &edges).is_empty());
+
+    // X and Y are TRUTHFULLY, correctly declared RepresentationOnly --
+    // nothing false or gamed about either claim. M is deliberately left
+    // unclaimed (Unclassified, conservative default -- exactly the
+    // correct choice for a genuine convergence point).
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("x".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-x-truthful".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("y".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-y-truthful".into()),
+        },
+    ];
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[payment.clone()], &claims, &edges);
+
+    assert!(conflicts.is_empty());
+    assert_eq!(provenance.len(), 2, "only X and Y (the truthfully claimed nodes) ever collapse");
+
+    assert_eq!(
+        canonical,
+        vec![
+            DependencyEdge::new("m", "payment"),
+            DependencyEdge::new("source", "m"),
+        ],
+        "M survives as a node (correctly -- it was never claimed), but its predecessor count \
+         has still silently dropped from 2 to 1"
+    );
+    assert!(
+        shared_structural_bottlenecks(&source, &canonical).is_empty(),
+        "CRITICAL RESULT: even fully TRUTHFUL, individually-correct RepresentationOnly claims \
+         for X and Y -- with M correctly left unclaimed -- still reproduce PATH-038-K/P's \
+         erasure of M's shared-bottleneck status. Explicit semantics fix PATH-038-N's problem \
+         (topology alone can't tell relay from capability) but do NOT fix this separate \
+         problem: independent bypass edges deduplicating onto a shared ancestor is a \
+         consequence of edge representation, not of any node's semantic status"
+    );
+}
+
+#[test]
+fn path_039_p_conflict_is_exposed_in_the_returned_conflict_set_not_silently_decided() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims = vec![
+        RepresentationClaim {
+            capability: r.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("evidence-item-1".into()),
+        },
+        RepresentationClaim {
+            capability: r.clone(),
+            role: RepresentationRole::SemanticCapability,
+            claim_id: RepresentationClaimId("evidence-item-2".into()),
+        },
+    ];
+
+    let (_, _, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    assert_eq!(
+        conflicts,
+        vec![r],
+        "the conflict between two evidence items about the same capability is surfaced to the \
+         caller explicitly, not silently decided one way or the other"
+    );
+}
+
+#[test]
+fn path_039_q_missing_evidence_identity_is_refused_not_authorized() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationDecision, RepresentationRole, canonicalize_declared_representation_nodes,
+        evaluate_representation_claims,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let r = CapabilityId("r".into());
+    let edges = vec![DependencyEdge::new("source", "r"), DependencyEdge::new("r", "target")];
+    let claims = vec![RepresentationClaim {
+        capability: r.clone(),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("".into()), // missing/invalid evidence identity
+    }];
+
+    assert_eq!(evaluate_representation_claims(&r, &claims), RepresentationDecision::Refused);
+
+    let (canonical, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    let mut expected = edges.clone();
+    expected.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    assert_eq!(canonical, expected);
+    assert!(provenance.is_empty());
+}
+
+#[test]
+fn path_039_r_relabeling_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let original_edges = vec![
+        DependencyEdge::new("source", "r"),
+        DependencyEdge::new("r", "target"),
+    ];
+    let original_claims = vec![RepresentationClaim {
+        capability: CapabilityId("r".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-1".into()),
+    }];
+
+    let renamed_edges = vec![
+        DependencyEdge::new("root", "relay-node"),
+        DependencyEdge::new("relay-node", "goal"),
+    ];
+    let renamed_claims = vec![RepresentationClaim {
+        capability: CapabilityId("relay-node".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("different-claim-label".into()),
+    }];
+
+    let (original_canonical, original_provenance, _) = canonicalize_declared_representation_nodes(
+        &CapabilityId("source".into()),
+        &[CapabilityId("target".into())],
+        &original_claims,
+        &original_edges,
+    );
+    let (renamed_canonical, renamed_provenance, _) = canonicalize_declared_representation_nodes(
+        &CapabilityId("root".into()),
+        &[CapabilityId("goal".into())],
+        &renamed_claims,
+        &renamed_edges,
+    );
+
+    assert_eq!(original_canonical.len(), renamed_canonical.len());
+    assert_eq!(original_provenance.len(), renamed_provenance.len());
+}
+
+#[test]
+fn path_039_s_idempotence() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "r1"),
+        DependencyEdge::new("r1", "r2"),
+        DependencyEdge::new("r2", "target"),
+    ];
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("r1".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-r1".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("r2".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-r2".into()),
+        },
+    ];
+
+    let (once, _, _) =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &claims, &edges);
+    assert_eq!(once, vec![DependencyEdge::new("source", "target")]);
+
+    let (twice, provenance_second_pass, _) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &once);
+
+    assert_eq!(once, twice, "IDEMPOTENCE: a second pass over an already-canonical graph is a no-op");
+    assert!(provenance_second_pass.is_empty());
+}
+
+#[test]
+fn path_039_t_every_collapsed_node_remains_traceable_but_full_losslessness_is_not_claimed() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "r1"),
+        DependencyEdge::new("r1", "r2"),
+        DependencyEdge::new("r2", "target"),
+    ];
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("r1".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-r1".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("r2".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-r2".into()),
+        },
+    ];
+
+    let (_, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[target], &claims, &edges);
+
+    let collapsed: std::collections::HashSet<CapabilityId> =
+        provenance.iter().map(|entry| entry.collapsed.clone()).collect();
+    assert_eq!(
+        collapsed,
+        [CapabilityId("r1".into()), CapabilityId("r2".into())].into_iter().collect(),
+        "every collapsed node is individually traceable"
+    );
+
+    // NOT CLAIMED: this only shows NODE traceability. PATH-039-O already
+    // demonstrates that branch-multiplicity/convergence facts are NOT
+    // always preserved even when every collapsed node is fully traced --
+    // node-level traceability is not the same as full graph losslessness.
+}
+
+// ---- STEP 6: DECLARATION AUTHORITY ATTACK (Candidates A/B/C/D) ----
+
+#[test]
+fn path_039_candidate_a_bare_boolean_cannot_represent_conflict_or_explicit_semantic() {
+    use std::collections::HashSet;
+    use distribution_machine::measurement::CapabilityId;
+
+    // Candidate A strawman: a bare `is_representation_only` set, with no
+    // evidence identity and no way to assert SemanticCapability at all.
+    let mut is_representation_only: HashSet<CapabilityId> = HashSet::new();
+    let r = CapabilityId("r".into());
+
+    // Declaring it once vs. "declaring" it via two identical inserts is
+    // structurally IDENTICAL -- a set cannot even represent "how many
+    // times" or "by whom," so it cannot distinguish one witness from
+    // many, nor a duplicate from independent corroboration.
+    is_representation_only.insert(r.clone());
+    is_representation_only.insert(r.clone());
+    assert_eq!(is_representation_only.len(), 1);
+
+    // Worse: there is no way to represent "explicitly declared
+    // SemanticCapability" in this model at all. The only two observable
+    // states are "in the set" and "not in the set" -- an UNCLASSIFIED
+    // node and an EXPLICITLY-PROTECTED-BECAUSE-MEANINGFUL node are both
+    // just "not in the set," indistinguishable from each other. This is
+    // exactly the ambiguity PATH-039-C needs to rule out, and Candidate
+    // A structurally cannot.
+    let unclassified = CapabilityId("never-considered".into());
+    let explicitly_semantic = CapabilityId("explicitly-declared-meaningful".into());
+    assert!(!is_representation_only.contains(&unclassified));
+    assert!(!is_representation_only.contains(&explicitly_semantic));
+    // Both absent, for entirely different reasons Candidate A cannot
+    // distinguish -- this is why RepresentationClaim (Candidate B) uses
+    // an explicit two-role claim structure instead of a bare set.
+}
+
+#[test]
+fn path_039_candidate_c_corroboration_without_identity_does_not_prevent_laundering() {
+    use distribution_machine::measurement::{
+        CapabilityId, RepresentationClaim, RepresentationClaimId, RepresentationRole,
+    };
+
+    // Candidate C: require >= 2 distinct claim_ids asserting
+    // RepresentationOnly before authorizing collapse ("corroboration").
+    // Attack: nothing prevents the SAME undisclosed actor from
+    // submitting two claims under two different claim_id strings for a
+    // stipulated genuinely-meaningful capability -- there is no
+    // independent issuer-identity concept in this repository to make
+    // "two claims" mean "two different parties agreed" (see inspection
+    // note: no authority/issuer type exists, and none is invented here).
+    let x = CapabilityId("x".into());
+    let fabricated_claims = vec![
+        RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("fabricated-witness-1".into()),
+        },
+        RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("fabricated-witness-2".into()),
+        },
+    ];
+
+    let distinct_claim_ids: std::collections::HashSet<&str> = fabricated_claims
+        .iter()
+        .map(|claim| claim.claim_id.0.as_str())
+        .collect();
+
+    assert_eq!(
+        distinct_claim_ids.len(),
+        2,
+        "a >=2-distinct-claim_id corroboration rule would be satisfied here, exactly as easily \
+         as a single fabricated claim -- REJECTED: multiplicity of unauthenticated claim_ids \
+         establishes nothing about truth without an issuer-identity/authority concept, which \
+         this mission is explicitly forbidden from inventing"
+    );
+}
