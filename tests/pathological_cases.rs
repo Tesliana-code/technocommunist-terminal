@@ -6426,3 +6426,619 @@ fn path_037_q2_counterexample_chain_decomposition_defeats_branch_loss_count_cand
          attack"
     );
 }
+
+// =======================================================================
+// PATH-038: REPRESENTATION CANONICALIZATION / SEMANTIC CAPABILITY COLLAPSE
+//
+// INSPECTION RESULT: no existing primitive performs any node collapse or
+// canonical rewriting of `edges`. `effective_structural_branches`
+// (PATH-029/030) deduplicates/subsumes BRANCH ROOTS for counting
+// purposes but never rewrites the edge list. `first_structural_
+// convergences`/`shared_structural_bottlenecks` (PATH-027/028) compute
+// facts ABOUT the graph but do not alter it. `structural_counterfactual`/
+// `structural_propagation_surface` (PATH-036/037) only ever add/remove
+// edges via `remove_capability`, never fold a pass-through node's edges
+// into a bypass edge. PATH-038 is the first mission to attempt this.
+//
+// CONTRACT TESTED: `canonicalize_pure_relays(source, protected, edges)`
+// collapses a node only if, from topology alone: it is not `source`; it
+// is not in the caller-supplied `protected` set; it has exactly one
+// distinct predecessor AND exactly one distinct successor (this alone
+// makes a branch point, PATH-038-C, or a convergence point, PATH-038-D,
+// structurally uncollapsible); and its sole successor cannot reach it
+// again (excludes cycle members, PATH-038-G). Collapse redirects the
+// predecessor directly to the successor and is repeated to a fixed
+// point. Every collapse is logged in `RelayCollapseProvenance` --
+// nothing is silently deleted.
+//
+// H9 (as actually tested): does this topology-only contract remove
+// representation-granularity artifacts (PATH-035/037) while preserving
+// meaningful branch/convergence/target-transition structure? The
+// evidence below is mixed and the strongest counterexample is NOT a
+// contrived semantic scenario but a purely structural one
+// (`path_038_k`/`path_038_p`): collapsing two INDIVIDUALLY-valid relay
+// nodes that happen to feed the same downstream convergence point from
+// a common ancestor can cascade into erasing the convergence itself from
+// the CANONICAL EDGES ALONE, even though nothing is topologically wrong
+// with either individual collapse and even though the full
+// (edges, provenance) pair remains completely lossless. See FIND-015 for
+// the full verdict, and PATH-038-N for the separate (semantic, not
+// structural) reason topology alone cannot certify a degree-(1,1) node
+// as representation-only in the first place.
+//
+// No test below claims the canonical graph is economically correct,
+// unique, or that topology reveals semantic capability identity. No
+// floats, no weights, no severity, no economic meaning anywhere in this
+// test group.
+// =======================================================================
+
+#[test]
+fn path_038_a_simple_relay_collapses_to_match_the_direct_graph() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let a = CapabilityId("a".into());
+    let target = CapabilityId("target".into());
+
+    // Protecting `a` isolates this test to RELAY specifically -- without
+    // it, `a` itself would also be an eligible degree-(1,1) node.
+    let protected = vec![a.clone(), target.clone()];
+
+    let direct = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "target"),
+    ];
+    let via_relay = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "relay"),
+        DependencyEdge::new("relay", "target"),
+    ];
+
+    let (canonical_direct, direct_provenance) =
+        canonicalize_pure_relays(&source, &protected, &direct);
+    let (canonical_relay, relay_provenance) =
+        canonicalize_pure_relays(&source, &protected, &via_relay);
+
+    assert_eq!(canonical_direct, canonical_relay);
+    assert!(direct_provenance.is_empty());
+    assert_eq!(relay_provenance.len(), 1);
+    assert_eq!(relay_provenance[0].collapsed, CapabilityId("relay".into()));
+}
+
+#[test]
+fn path_038_b_chain_decomposition_collapses_to_the_same_canonical_graph() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let protected = vec![target.clone()];
+
+    let baseline = vec![DependencyEdge::new("source", "target")];
+    let decomposed = vec![
+        DependencyEdge::new("source", "a1"),
+        DependencyEdge::new("a1", "a2"),
+        DependencyEdge::new("a2", "target"),
+    ];
+
+    let (canonical_baseline, _) = canonicalize_pure_relays(&source, &protected, &baseline);
+    let (canonical_decomposed, decomposed_provenance) =
+        canonicalize_pure_relays(&source, &protected, &decomposed);
+
+    assert_eq!(canonical_baseline, canonical_decomposed);
+    assert_eq!(canonical_decomposed, vec![DependencyEdge::new("source", "target")]);
+    assert_eq!(decomposed_provenance.len(), 2, "both A1 and A2 must be collapsed");
+}
+
+#[test]
+fn path_038_c_branch_point_never_collapses() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let mut edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("x", "b"),
+    ];
+    edges.sort_by(|e1, e2| e1.source.0.cmp(&e2.source.0).then(e1.target.0.cmp(&e2.target.0)));
+
+    let (canonical, provenance) = canonicalize_pure_relays(&source, &[], &edges);
+
+    assert!(provenance.is_empty(), "X has two successors and must never be a collapse candidate");
+    assert_eq!(canonical, edges);
+}
+
+#[test]
+fn path_038_d_convergence_point_never_collapses_merely_for_having_one_successor() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let a = CapabilityId("a".into());
+    let mut edges = vec![
+        DependencyEdge::new("a", "m"),
+        DependencyEdge::new("b", "m"),
+        DependencyEdge::new("m", "target"),
+    ];
+    edges.sort_by(|e1, e2| e1.source.0.cmp(&e2.source.0).then(e1.target.0.cmp(&e2.target.0)));
+
+    // `a` is used as `source` here purely to give the function a
+    // required parameter; M's survival is due to its TWO predecessors,
+    // not source-exclusion (B is untouched by source-exclusion and M's
+    // predecessor count is what matters).
+    let (canonical, provenance) = canonicalize_pure_relays(&a, &[], &edges);
+
+    assert!(
+        provenance.is_empty(),
+        "M has two predecessors (A and B) and must never be a collapse candidate, regardless \
+         of its single successor"
+    );
+    assert_eq!(canonical, edges);
+}
+
+#[test]
+fn path_038_e_protected_target_survives_only_when_declared() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "target"),
+        DependencyEdge::new("target", "y"),
+    ];
+
+    let (canonical_unprotected, _) = canonicalize_pure_relays(&source, &[], &edges);
+    assert!(
+        !canonical_unprotected
+            .iter()
+            .any(|e| e.source == target || e.target == target),
+        "without protection, TARGET is itself degree-(1,1) and non-cyclic, so it collapses too"
+    );
+
+    let (canonical_protected, _) =
+        canonicalize_pure_relays(&source, &[target.clone()], &edges);
+    assert!(
+        canonical_protected
+            .iter()
+            .any(|e| e.source == target || e.target == target),
+        "DECISION: an explicitly protected target must survive even though topology alone \
+         would have allowed its collapse"
+    );
+}
+
+#[test]
+fn path_038_f_source_never_collapses_even_when_topologically_relay_shaped() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    // `source` here has exactly one predecessor (z) and one successor
+    // (x) -- topologically indistinguishable from a pure relay -- yet
+    // must never be collapsed.
+    let edges = vec![
+        DependencyEdge::new("z", "source"),
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "target"),
+    ];
+
+    let (canonical, _) = canonicalize_pure_relays(&source, &[], &edges);
+
+    assert!(
+        canonical.iter().any(|e| e.source == source || e.target == source),
+        "source must survive regardless of its own topological shape"
+    );
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "target"), DependencyEdge::new("z", "source")]);
+}
+
+#[test]
+fn path_038_g_cycle_is_never_collapsed() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("a".into());
+    let mut edges = vec![
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "a"),
+    ];
+    edges.sort_by(|e1, e2| e1.source.0.cmp(&e2.source.0).then(e1.target.0.cmp(&e2.target.0)));
+
+    let (canonical, provenance) = canonicalize_pure_relays(&source, &[], &edges);
+
+    assert!(
+        provenance.is_empty(),
+        "every member of a 3-cycle has exactly one predecessor/successor, but each also lies \
+         on the cycle, so none may be collapsed without erasing real cycle topology"
+    );
+    assert_eq!(canonical, edges);
+}
+
+#[test]
+fn path_038_h_duplicate_edge_invariance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let single = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "target"),
+    ];
+    let mut duplicated = single.clone();
+    for _ in 0..10 {
+        duplicated.push(DependencyEdge::new("source", "a"));
+        duplicated.push(DependencyEdge::new("a", "target"));
+    }
+
+    assert_eq!(
+        canonicalize_pure_relays(&source, &[], &single).0,
+        canonicalize_pure_relays(&source, &[], &duplicated).0
+    );
+}
+
+#[test]
+fn path_038_i_edge_order_invariance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let forward = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "target"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+
+    let forward_result = canonicalize_pure_relays(&source, &[], &forward);
+    let shuffled_result = canonicalize_pure_relays(&source, &[], &shuffled);
+
+    assert_eq!(
+        forward_result, shuffled_result,
+        "ORDERING VIOLATION: input edge order must not change the canonical graph or provenance"
+    );
+    assert_eq!(forward_result.0, vec![DependencyEdge::new("source", "target")]);
+    assert_eq!(forward_result.1.len(), 2);
+}
+
+#[test]
+fn path_038_j_renaming_is_inert_modulo_target_identity() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let original_edges = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "target"),
+    ];
+    let renamed_edges = vec![
+        DependencyEdge::new("root", "p"),
+        DependencyEdge::new("p", "q"),
+        DependencyEdge::new("q", "goal"),
+    ];
+
+    let (canonical_original, provenance_original) = canonicalize_pure_relays(
+        &CapabilityId("source".into()),
+        &[CapabilityId("target".into())],
+        &original_edges,
+    );
+    let (canonical_renamed, provenance_renamed) = canonicalize_pure_relays(
+        &CapabilityId("root".into()),
+        &[CapabilityId("goal".into())],
+        &renamed_edges,
+    );
+
+    assert_eq!(canonical_original.len(), 1);
+    assert_eq!(canonical_renamed.len(), 1);
+    assert_eq!(
+        provenance_original.len(),
+        provenance_renamed.len(),
+        "RENAMING VIOLATION: the number of collapsed nodes must not depend on labels"
+    );
+}
+
+#[test]
+fn path_038_k_cascading_collapse_can_erase_a_real_shared_bottleneck() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays, shared_structural_bottlenecks,
+    };
+
+    let source = CapabilityId("source".into());
+    let payment = CapabilityId("payment".into());
+    let m = CapabilityId("m".into());
+
+    // A genuine, existing-primitive-verified shared bottleneck: X and Y
+    // are two structurally distinct branches that both converge at M
+    // before reaching PAYMENT.
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    assert!(
+        !shared_structural_bottlenecks(&source, &edges).is_empty(),
+        "M is a genuine shared structural bottleneck in the original graph"
+    );
+
+    // Only PAYMENT is protected. X and Y are each, INDIVIDUALLY,
+    // legitimate degree-(1,1) non-cyclic relay candidates -- there is
+    // nothing topologically wrong with collapsing either one on its own.
+    let (canonical_payment_only, provenance) =
+        canonicalize_pure_relays(&source, &[payment.clone()], &edges);
+
+    assert_eq!(
+        canonical_payment_only,
+        vec![DependencyEdge::new("source", "payment")],
+        "CASCADING FALSE COLLAPSE: after X and Y each independently collapse into \
+         `source -> m`, M's predecessor count drops from 2 to 1 (both branches now point at \
+         the identical edge, which deduplicates), making M ITSELF newly eligible -- the \
+         canonical graph ends up structurally indistinguishable from a single unshared path, \
+         even though nothing about the original convergence was semantically uninteresting"
+    );
+    assert_eq!(provenance.len(), 3, "x, y, and m are all collapsed in sequence");
+
+    // Protecting M too reduces, but does not eliminate, the loss: M
+    // survives as a NODE, but the fact that it once had two distinct
+    // predecessors is no longer visible in the edges alone.
+    let (canonical_m_protected, _) =
+        canonicalize_pure_relays(&source, &[payment.clone(), m.clone()], &edges);
+    assert_eq!(
+        canonical_m_protected,
+        vec![
+            DependencyEdge::new("m", "payment"),
+            DependencyEdge::new("source", "m"),
+        ],
+        "even with M explicitly protected, its predecessor count has still silently dropped \
+         from 2 to 1 in the canonical edges -- node-level protection does not preserve \
+         BRANCH-COUNT/convergence information"
+    );
+}
+
+#[test]
+fn path_038_l_multiple_relays_collapse_to_a_fixed_point_idempotently() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "r1"),
+        DependencyEdge::new("r1", "r2"),
+        DependencyEdge::new("r2", "target"),
+    ];
+
+    let (once, _) = canonicalize_pure_relays(&source, &[target.clone()], &edges);
+    assert_eq!(once, vec![DependencyEdge::new("source", "target")]);
+
+    let (twice, provenance_second_pass) = canonicalize_pure_relays(&source, &[target.clone()], &once);
+    assert_eq!(
+        once, twice,
+        "IDEMPOTENCE: canonicalizing an already-canonical graph must be a no-op on the edges"
+    );
+    assert!(provenance_second_pass.is_empty());
+}
+
+#[test]
+fn path_038_m_provenance_fully_recovers_every_collapsed_node() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "r1"),
+        DependencyEdge::new("r1", "r2"),
+        DependencyEdge::new("r2", "target"),
+    ];
+
+    let (_, provenance) = canonicalize_pure_relays(&source, &[target], &edges);
+
+    let collapsed: std::collections::HashSet<CapabilityId> =
+        provenance.iter().map(|entry| entry.collapsed.clone()).collect();
+
+    assert_eq!(
+        collapsed,
+        [
+            CapabilityId("a".into()),
+            CapabilityId("r1".into()),
+            CapabilityId("r2".into())
+        ]
+        .into_iter()
+        .collect(),
+        "NO HIDDEN DELETION: every removed node must appear exactly once in the provenance"
+    );
+    // The original chain is fully reconstructable by chaining
+    // predecessor -> collapsed -> successor across entries.
+    for entry in &provenance {
+        assert_ne!(entry.predecessor, entry.collapsed);
+        assert_ne!(entry.successor, entry.collapsed);
+    }
+}
+
+#[test]
+fn path_038_n_topology_cannot_distinguish_a_relay_from_a_meaningful_capability() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays,
+    };
+
+    // Test premise (explicit, not inferred from the label "x"): in THIS
+    // scenario, X is stipulated to be a genuinely meaningful capability
+    // that simply happens to sit between exactly one predecessor and one
+    // successor -- topologically this graph is IDENTICAL in shape to
+    // path_038_a's true relay case.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let x = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "target"),
+    ];
+
+    // Without external declaration, topology alone collapses X exactly
+    // as it would a true relay -- there is no topological signal here
+    // that distinguishes "meaningful capability" from "pure relay."
+    let (canonical_unprotected, provenance) =
+        canonicalize_pure_relays(&source, &[target.clone()], &edges);
+    assert_eq!(canonical_unprotected, vec![DependencyEdge::new("source", "target")]);
+    assert_eq!(provenance.len(), 1);
+    assert_eq!(provenance[0].collapsed, x);
+
+    // The ONLY way to prevent this false collapse is an external
+    // declaration -- never derived from topology.
+    let (canonical_protected, provenance_protected) =
+        canonicalize_pure_relays(&source, &[x.clone(), target], &edges);
+    assert_eq!(canonical_protected, edges);
+    assert!(provenance_protected.is_empty());
+}
+
+#[test]
+fn path_038_o_replay_pass_through_relays_are_normalized_but_leaf_decomposition_is_not() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let payment = CapabilityId("payment".into());
+
+    // PATH-037-Q shape: a pass-through relay on the removed branch.
+    let direct = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+    let via_relay = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "relay"),
+        DependencyEdge::new("relay", "payment"),
+    ];
+
+    let direct_surface = structural_propagation_surface(&source, &direct, &removed);
+
+    let (canonical_relay, _) =
+        canonicalize_pure_relays(&source, &[removed.clone(), payment.clone()], &via_relay);
+    let canonicalized_relay_surface =
+        structural_propagation_surface(&source, &canonical_relay, &removed);
+
+    assert_eq!(
+        direct_surface, canonicalized_relay_surface,
+        "PASS-THROUGH case: canonicalizing the relay before computing the propagation surface \
+         removes PATH-037-H/Q's cardinality inflation entirely -- both surfaces now agree"
+    );
+
+    // PATH-037-Q2 shape: a LEAF decomposition node (A2 has no outgoing
+    // edge at all), not a pass-through relay.
+    let baseline = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "a"),
+    ];
+    let decomposed = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "a"),
+        DependencyEdge::new("a", "a2"),
+    ];
+
+    // `y` is the genuine surviving branch into `a` (the actual
+    // redundancy the removal counterfactual depends on), so it must be
+    // protected too -- otherwise it is itself topologically relay-shaped
+    // (one predecessor, one successor) and would be collapsed as an
+    // unrelated side effect, contaminating this specific comparison.
+    let (canonical_decomposed, decomposed_provenance) = canonicalize_pure_relays(
+        &source,
+        &[
+            removed.clone(),
+            CapabilityId("a".into()),
+            CapabilityId("y".into()),
+        ],
+        &decomposed,
+    );
+
+    assert!(
+        decomposed_provenance.is_empty(),
+        "A2 has no outgoing edge at all, so it is not a PASS-THROUGH relay under this contract \
+         and is never collapsed -- this specific canonicalization does not cover leaf/terminal \
+         decomposition nodes"
+    );
+
+    let baseline_surface = structural_propagation_surface(&source, &baseline, &removed);
+    let decomposed_surface = structural_propagation_surface(&source, &canonical_decomposed, &removed);
+
+    assert_ne!(
+        baseline_surface.len(),
+        decomposed_surface.len(),
+        "SCOPE LIMIT (recorded, not hidden): PATH-037-Q2's leaf-decomposition inflation is NOT \
+         resolved by this pure-relay contract, because A2 is never eligible for collapse"
+    );
+}
+
+#[test]
+fn path_038_p_canonical_edges_alone_lose_convergence_information_that_provenance_still_preserves() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, canonicalize_pure_relays, shared_structural_bottlenecks,
+    };
+
+    let source = CapabilityId("source".into());
+    let payment = CapabilityId("payment".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    assert!(!shared_structural_bottlenecks(&source, &edges).is_empty());
+
+    let (canonical, provenance) = canonicalize_pure_relays(&source, &[payment], &edges);
+
+    // H9 NARROWED/REJECTED for "canonical edges as a drop-in
+    // replacement": an existing, previously-verified primitive reports
+    // NOTHING on the canonical graph alone -- the convergence fact is
+    // invisible without consulting provenance.
+    assert!(
+        shared_structural_bottlenecks(&source, &canonical).is_empty(),
+        "the canonical graph alone no longer exhibits the shared bottleneck at all"
+    );
+
+    // But it is NOT silently destroyed overall: two DISTINCT provenance
+    // entries recorded `m` as their successor, which is exactly the
+    // signature of two branches having converged there before collapse.
+    let entries_feeding_m: Vec<&CapabilityId> = provenance
+        .iter()
+        .filter(|entry| entry.successor == m)
+        .map(|entry| &entry.collapsed)
+        .collect();
+
+    assert_eq!(
+        entries_feeding_m.len(),
+        2,
+        "RECOVERABLE: the full (canonical edges, provenance) pair still lets a careful reader \
+         reconstruct that two distinct branches (x and y) converged at M -- nothing is \
+         irrecoverably deleted, but the canonical EDGES ALONE are not a safe substitute for \
+         convergence-sensitive structural analysis"
+    );
+    assert_ne!(entries_feeding_m[0], entries_feeding_m[1]);
+}

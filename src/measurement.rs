@@ -1716,6 +1716,180 @@ pub fn structural_propagation_surface(
     surface
 }
 
+/// PATH-038 provenance record: one node collapsed by
+/// [`canonicalize_pure_relays`], with its predecessor/successor AT THE
+/// MOMENT it was collapsed. Recording the predecessor/successor (not
+/// just the collapsed node's id) is what makes a multi-hop chain fully
+/// reconstructable: for a chain `A -> R1 -> R2 -> TARGET` collapsed in
+/// order R1 then R2, the two entries `{R1, A, R2}` and `{R2, A, TARGET}`
+/// together recover the full original chain, even though R2 no longer
+/// existed as an edge target by the time it was itself collapsed. No
+/// entry is ever silently dropped -- every collapsed node has exactly
+/// one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCollapseProvenance {
+    pub collapsed: CapabilityId,
+    pub predecessor: CapabilityId,
+    pub successor: CapabilityId,
+}
+
+/// PATH-038 experimental canonicalization: collapse PURE RELAY nodes out
+/// of `edges`, relative to `source` and an explicit `protected` set,
+/// returning the canonical edge list plus complete collapse provenance.
+///
+/// ## The contract (topology-only, exactly four conditions)
+///
+/// A node is eligible for collapse only if ALL of the following hold,
+/// determined purely from `edges` (never from labels):
+/// 1. it is not `source`;
+/// 2. it is not in the caller-supplied `protected` set;
+/// 3. it has EXACTLY ONE distinct predecessor and EXACTLY ONE distinct
+///    successor (duplicate edges do not count twice; a node with zero or
+///    two-or-more of either is never eligible -- this is what makes a
+///    branch point, per PATH-038-C, and a convergence point, per
+///    PATH-038-D, structurally incapable of ever being collapsed: a
+///    branch point has >= 2 successors, a convergence point has >= 2
+///    predecessors);
+/// 4. it does not lie on a cycle: its sole successor must not be able to
+///    reach it again ([`is_reachable`]). This is what makes
+///    `A -> B -> C -> A` (PATH-038-G) collapse to nothing at all, even
+///    though every member has exactly one predecessor and successor --
+///    collapsing any one of them would silently destroy the cycle's
+///    real topology (turning a 3-cycle into a 2-cycle, then a
+///    self-loop), which is not a case this contract accepts.
+///
+/// Collapsing an eligible node `R` with predecessor `P` and successor
+/// `S` removes `P -> R` and `R -> S` and adds `P -> S` (deduplicated
+/// against any edge already present). This is repeated to a fixed point
+/// (recomputing eligibility fresh after every single collapse, one node
+/// at a time, in lexical order among that pass's candidates, for
+/// determinism), so a multi-hop relay chain fully collapses in one call
+/// -- see PATH-038-L. Calling this function again on its own output is a
+/// no-op on the returned edges (idempotent), because after reaching a
+/// fixed point no node can satisfy all four conditions.
+///
+/// ## What this does NOT establish
+///
+/// This is a TOPOLOGY-ONLY mechanism. It cannot, and does not attempt
+/// to, determine whether a degree-(1,1) non-cyclic node is a genuine
+/// implementation pass-through or an economically meaningful capability
+/// that simply happens to sit between exactly one predecessor and one
+/// successor -- **those two situations are topologically identical**
+/// (PATH-038-N/P). The `protected` parameter is the ONLY thing standing
+/// between a real capability and a false collapse: any node the caller
+/// does not think to protect, and that happens to have this shape, is
+/// collapsed unconditionally. This function does not claim, and PATH-038
+/// did not establish, that the canonical graph it produces is
+/// economically correct, unique, or that topology reveals semantic
+/// capability identity. See FIND-015 for the full verdict.
+///
+/// No floats, no weights, no severity, no economic meaning anywhere in
+/// this function.
+pub fn canonicalize_pure_relays(
+    source: &CapabilityId,
+    protected: &[CapabilityId],
+    edges: &[DependencyEdge],
+) -> (Vec<DependencyEdge>, Vec<RelayCollapseProvenance>) {
+    use std::collections::{HashMap, HashSet};
+
+    let protected_set: HashSet<CapabilityId> = protected.iter().cloned().collect();
+
+    let mut current: HashSet<(CapabilityId, CapabilityId)> = edges
+        .iter()
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
+
+    let mut provenance: Vec<RelayCollapseProvenance> = Vec::new();
+
+    loop {
+        let mut predecessors: HashMap<CapabilityId, HashSet<CapabilityId>> = HashMap::new();
+        let mut successors: HashMap<CapabilityId, HashSet<CapabilityId>> = HashMap::new();
+        let mut nodes: HashSet<CapabilityId> = HashSet::new();
+
+        for (edge_source, edge_target) in &current {
+            nodes.insert(edge_source.clone());
+            nodes.insert(edge_target.clone());
+            successors
+                .entry(edge_source.clone())
+                .or_default()
+                .insert(edge_target.clone());
+            predecessors
+                .entry(edge_target.clone())
+                .or_default()
+                .insert(edge_source.clone());
+        }
+
+        let current_edges_vec: Vec<DependencyEdge> = current
+            .iter()
+            .map(|(edge_source, edge_target)| DependencyEdge {
+                source: edge_source.clone(),
+                target: edge_target.clone(),
+            })
+            .collect();
+
+        let mut candidates: Vec<CapabilityId> = Vec::new();
+
+        for node in &nodes {
+            if node == source || protected_set.contains(node) {
+                continue;
+            }
+
+            let (preds, succs) = match (predecessors.get(node), successors.get(node)) {
+                (Some(p), Some(s)) => (p, s),
+                _ => continue,
+            };
+
+            if preds.len() != 1 || succs.len() != 1 {
+                continue;
+            }
+
+            let predecessor = preds.iter().next().unwrap();
+            let successor = succs.iter().next().unwrap();
+
+            if predecessor == node || successor == node {
+                continue;
+            }
+
+            if is_reachable(successor, node, &current_edges_vec) {
+                continue;
+            }
+
+            candidates.push(node.clone());
+        }
+
+        if candidates.is_empty() {
+            break;
+        }
+
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let chosen = candidates.into_iter().next().unwrap();
+
+        let predecessor = predecessors[&chosen].iter().next().unwrap().clone();
+        let successor = successors[&chosen].iter().next().unwrap().clone();
+
+        current.remove(&(predecessor.clone(), chosen.clone()));
+        current.remove(&(chosen.clone(), successor.clone()));
+        current.insert((predecessor.clone(), successor.clone()));
+
+        provenance.push(RelayCollapseProvenance {
+            collapsed: chosen,
+            predecessor,
+            successor,
+        });
+    }
+
+    let mut canonical_edges: Vec<DependencyEdge> = current
+        .into_iter()
+        .map(|(edge_source, edge_target)| DependencyEdge {
+            source: edge_source,
+            target: edge_target,
+        })
+        .collect();
+    canonical_edges.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+
+    (canonical_edges, provenance)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyPathId(pub String);
 
