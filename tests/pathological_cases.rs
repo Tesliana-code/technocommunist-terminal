@@ -5637,3 +5637,792 @@ fn path_036_m_target_scope_leak_unrelated_branch_removal_is_correctly_ignored() 
     assert_eq!(result.before_effective_branches_to_target, 1);
     assert_eq!(result.after_effective_branches_to_target, 1);
 }
+
+// =======================================================================
+// PATH-037: MULTI-TARGET COUNTERFACTUAL PROPAGATION SURFACE
+//
+// INSPECTION RESULT: no existing function enumerated reachable/downstream
+// capabilities as production code before this mission (PATH-035's
+// `naive_downstream_reachable_count` was a test-only strawman, not
+// production). No existing function produced per-target structural
+// facts across multiple targets at once -- `structural_counterfactual`
+// (PATH-036) answers one `(source, target, removed)` query at a time.
+// `failure_blast_radius` (PATH-035/FIND-012) remains an unspecified raw
+// `u32` input with no derivation of any kind; it is evaluated as a
+// candidate MEANING below, not assumed to already be one of these.
+//
+// TARGET UNIVERSE (chosen, and why): `reachable_capabilities(source,
+// edges)` -- every `CapabilityId` reachable from `source` BEFORE
+// removal -- with `source` and `removed` excluded. Justification:
+// - A target unreachable before removal can never be usefully included:
+//   `remove_capability` only deletes edges, and deleting edges from a
+//   graph cannot create a path that did not already exist (every edge
+//   usable after removal was already present before). Reachability is
+//   therefore monotonically non-increasing under this removal semantics
+//   -- see `path_037_inspection_removal_cannot_create_new_reachability`
+//   for an executable check on a graph containing a cycle.
+// - `source` is excluded: it is trivially "reachable from itself" by
+//   `is_reachable`'s definition, so an entry for it would always report
+//   `true -> true` with zero informative content.
+// - `removed` is excluded: the query is about DOWNSTREAM CONSEQUENCES of
+//   removing it, not the tautological fact that it is now gone (any
+//   `removed` that was reachable before removal deterministically loses
+//   reachability after, for every possible graph -- see PATH-037-L).
+// - This is an edge-only representation: a `CapabilityId` with no edges
+//   at all cannot appear in this universe (or in any structural
+//   primitive in this module) even if some larger "declared capability
+//   universe" outside the graph considers it to exist. This limitation
+//   is inherited, not fixed, here.
+//
+// H8 (corrected -- see FIND-014's EPISTEMIC CORRECTION): the TESTED
+// count-like scalar blast-radius reductions (candidates A/B/C below) do
+// not faithfully preserve the structural consequences of capability
+// removal, because different targets can experience DIFFERENT KINDS of
+// structural change (hard reachability loss vs. branch-count loss while
+// still reachable vs. no change) that a count collapses together
+// (PATH-037-B/P), AND because each tested "count of changed/unreachable
+// targets" candidate is itself representation-sensitive under chain
+// decomposition and relay insertion (PATH-037-H/Q/Q2) -- the same
+// representation-laundering risk PATH-035/FIND-012 found for raw
+// affected-node counts turns out to also defeat two further candidate
+// counts (B and C) that had not been tested before. This is NOT a claim
+// that every mathematically possible scalar encoding must fail --
+// only that the specific count-like candidates tried here do.
+//
+// No claim in this test group says a target count is severity, that
+// unreachable is worse than branch-loss economically, that more affected
+// targets means more critical, or any monetary consequence. This
+// mission is topology/measurement only. See FIND-014 for the verdict.
+// =======================================================================
+
+#[test]
+fn path_037_inspection_removal_cannot_create_new_reachability() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, reachable_capabilities, remove_capability,
+    };
+    use std::collections::HashSet;
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("y", "a"),
+        DependencyEdge::new("a", "b"),
+    ];
+
+    let after_edges = remove_capability(&edges, &removed);
+
+    let before: HashSet<CapabilityId> = reachable_capabilities(&source, &edges).into_iter().collect();
+    let after: HashSet<CapabilityId> = reachable_capabilities(&source, &after_edges).into_iter().collect();
+
+    assert!(
+        after.is_subset(&before),
+        "MONOTONICITY: `remove_capability` only ever deletes edges, so any node reachable \
+         after removal was already reachable before -- after={:?} must be a subset of \
+         before={:?}",
+        after,
+        before
+    );
+    assert!(before.contains(&CapabilityId("x".into())));
+    assert!(
+        !after.contains(&CapabilityId("x".into())),
+        "the removed node itself loses reachability, consistent with (not a violation of) \
+         monotonicity"
+    );
+    assert!(after.contains(&CapabilityId("a".into())) && after.contains(&CapabilityId("b".into())),
+        "a/b remain reachable via the surviving branch y -- monotonicity does not mean \
+         everything downstream of `removed` is lost, only that nothing NEW becomes reachable"
+    );
+}
+
+#[test]
+fn path_037_a_single_downstream_target() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, StructuralPropagationEntry, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert_eq!(
+        surface,
+        vec![StructuralPropagationEntry {
+            target: CapabilityId("payment".into()),
+            before_reachable: true,
+            after_reachable: false,
+            before_effective_branches_to_target: 1,
+            after_effective_branches_to_target: 0,
+        }]
+    );
+}
+
+#[test]
+fn path_037_b_mixed_consequences_cannot_collapse_to_a_scalar() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("x", "search"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "search"),
+        DependencyEdge::new("source", "z"),
+        DependencyEdge::new("z", "analytics"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    let payment = surface
+        .iter()
+        .find(|e| e.target == CapabilityId("payment".into()))
+        .expect("PAYMENT must be reported as changed");
+    let search = surface
+        .iter()
+        .find(|e| e.target == CapabilityId("search".into()))
+        .expect("SEARCH must be reported as changed");
+
+    assert!(
+        !surface.iter().any(|e| e.target == CapabilityId("analytics".into())),
+        "ANALYTICS is unaffected by removing X and must not appear"
+    );
+
+    assert_eq!(payment.after_reachable, false, "PAYMENT: hard reachability loss");
+    assert_eq!(
+        (search.after_reachable, search.before_effective_branches_to_target, search.after_effective_branches_to_target),
+        (true, 2, 1),
+        "SEARCH: remains reachable, but loses one of two redundant branches"
+    );
+
+    // H8: a single scalar "affected_targets = 2" is identical whether
+    // this actually happened (one hard loss + one branch loss) or two
+    // hard losses, or two branch losses -- see path_037_p for the
+    // executable version of that collapse.
+    assert_eq!(surface.len(), 2);
+    assert_ne!(
+        payment.after_reachable, search.after_reachable,
+        "these two 'affected' targets experienced categorically different structural \
+         transitions -- a scalar count of 2 cannot preserve that distinction"
+    );
+}
+
+#[test]
+fn path_037_c_unrelated_branch_exclusion() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    // Test premise: ANALYTICS and PAYMENT are stipulated as unrelated;
+    // relevance is established by graph structure below, not by labels.
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "analytics"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert!(
+        !surface.iter().any(|e| e.target == CapabilityId("payment".into())),
+        "PAYMENT-SCOPE LEAK (PATH-036-M lesson reused): PAYMENT must not appear as \
+         structurally changed when the removed branch never reached it"
+    );
+    assert_eq!(surface.len(), 1);
+    assert_eq!(surface[0].target, CapabilityId("analytics".into()));
+    assert!(!surface[0].after_reachable);
+}
+
+#[test]
+fn path_037_d_cascade_deterministic_enumeration_and_ordering() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    let targets: Vec<&str> = surface.iter().map(|e| e.target.0.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec!["a", "b", "c"],
+        "deterministic lexical ordering, not a claim of severity ordering"
+    );
+    for entry in &surface {
+        assert!(entry.before_reachable);
+        assert!(!entry.after_reachable);
+        assert_eq!(entry.before_effective_branches_to_target, 1);
+        assert_eq!(entry.after_effective_branches_to_target, 0);
+    }
+}
+
+#[test]
+fn path_037_e_partial_propagation_with_bypass() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, StructuralPropagationEntry, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "b"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert_eq!(
+        surface,
+        vec![
+            StructuralPropagationEntry {
+                target: CapabilityId("a".into()),
+                before_reachable: true,
+                after_reachable: false,
+                before_effective_branches_to_target: 1,
+                after_effective_branches_to_target: 0,
+            },
+            StructuralPropagationEntry {
+                target: CapabilityId("b".into()),
+                before_reachable: true,
+                after_reachable: true,
+                before_effective_branches_to_target: 2,
+                after_effective_branches_to_target: 1,
+            },
+        ],
+        "A suffers a hard reachability loss (its only path ran through X); B remains reachable \
+         via the Y bypass but still loses one of its two branches -- both are real, DIFFERENT \
+         consequences of the same removal"
+    );
+}
+
+#[test]
+fn path_037_f_shared_bottleneck_blind_spot_persists_in_the_surface() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, first_structural_convergences, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let target = CapabilityId("payment".into());
+
+    let shared_bottleneck_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let truly_independent_shape = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "payment"),
+    ];
+
+    // Reused from PATH-036-D/L: an existing primitive already
+    // distinguishes these two graphs structurally.
+    let bottleneck_convergences = first_structural_convergences(&source, &shared_bottleneck_shape);
+    let independent_convergences = first_structural_convergences(&source, &truly_independent_shape);
+    assert!(bottleneck_convergences.iter().any(|node| *node != target));
+    assert!(independent_convergences.iter().all(|node| *node == target));
+
+    let bottleneck_surface = structural_propagation_surface(&source, &shared_bottleneck_shape, &removed);
+    let independent_surface = structural_propagation_surface(&source, &truly_independent_shape, &removed);
+
+    let bottleneck_payment = bottleneck_surface
+        .iter()
+        .find(|e| e.target == target)
+        .expect("PAYMENT must appear as changed in the bottleneck shape");
+    let independent_payment = independent_surface
+        .iter()
+        .find(|e| e.target == target)
+        .expect("PAYMENT must appear as changed in the independent shape");
+
+    assert_eq!(
+        bottleneck_payment, independent_payment,
+        "BLIND SPOT PERSISTS: the surface's own entry for the shared queried target (PAYMENT) \
+         is identical between the two structurally distinguishable graphs -- the surface does \
+         not incorporate shared-bottleneck/convergence information any more than \
+         structural_counterfactual did (PATH-036-D/L)"
+    );
+
+    // The surfaces DO differ in overall length (M is an extra entry in
+    // the bottleneck shape), but that is evidence of the SAME
+    // representation-sensitivity PATH-037-H/Q attack, not evidence that
+    // the surface principledly captures shared-bottleneck risk: M only
+    // appears because it happens to be modeled as its own labeled node
+    // in this representation, not because anything computed its
+    // bottleneck role.
+    assert_ne!(bottleneck_surface.len(), independent_surface.len());
+}
+
+#[test]
+fn path_037_g_duplicate_edge_invariance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let single = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "b"),
+    ];
+    let mut duplicated = single.clone();
+    for _ in 0..10 {
+        duplicated.push(DependencyEdge::new("source", "y"));
+        duplicated.push(DependencyEdge::new("y", "b"));
+    }
+
+    assert_eq!(
+        structural_propagation_surface(&source, &single, &removed),
+        structural_propagation_surface(&source, &duplicated, &removed),
+        "DUPLICATE-EDGE VIOLATION: repeated observation of the same edge must not change the \
+         propagation surface"
+    );
+}
+
+#[test]
+fn path_037_h_relay_insertion_inflates_surface_cardinality_with_a_redundant_entry() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    let direct = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+    let via_relay = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "relay"),
+        DependencyEdge::new("relay", "payment"),
+    ];
+
+    let direct_surface = structural_propagation_surface(&source, &direct, &removed);
+    let relay_surface = structural_propagation_surface(&source, &via_relay, &removed);
+
+    assert_eq!(direct_surface.len(), 1);
+    assert_eq!(
+        relay_surface.len(),
+        2,
+        "REPRESENTATION PROBLEM (recorded, not hidden): inserting a single stipulated \
+         pass-through node changes surface cardinality from 1 to 2, purely because RELAY is \
+         itself a distinct graph node in this representation"
+    );
+
+    let relay_entry = relay_surface
+        .iter()
+        .find(|e| e.target == CapabilityId("relay".into()))
+        .unwrap();
+    let payment_entry = relay_surface
+        .iter()
+        .find(|e| e.target == CapabilityId("payment".into()))
+        .unwrap();
+
+    assert_eq!(
+        (relay_entry.before_reachable, relay_entry.after_reachable, relay_entry.before_effective_branches_to_target, relay_entry.after_effective_branches_to_target),
+        (payment_entry.before_reachable, payment_entry.after_reachable, payment_entry.before_effective_branches_to_target, payment_entry.after_effective_branches_to_target),
+        "RELAY's entry has the IDENTICAL transition shape to PAYMENT's -- it carries no \
+         distinguishing structural information, only duplicates the same fact at a finer \
+         representational granularity (directly connects back to PATH-035/FIND-012)"
+    );
+}
+
+#[test]
+fn path_037_i_renaming_is_inert_modulo_target_identity() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+    use std::collections::HashMap;
+
+    let original_edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "b"),
+    ];
+    let renamed_edges = vec![
+        DependencyEdge::new("root", "branch-x"),
+        DependencyEdge::new("branch-x", "node-p"),
+        DependencyEdge::new("node-p", "node-q"),
+        DependencyEdge::new("root", "branch-y"),
+        DependencyEdge::new("branch-y", "node-q"),
+    ];
+
+    let original_surface = structural_propagation_surface(
+        &CapabilityId("source".into()),
+        &original_edges,
+        &CapabilityId("x".into()),
+    );
+    let renamed_surface = structural_propagation_surface(
+        &CapabilityId("root".into()),
+        &renamed_edges,
+        &CapabilityId("branch-x".into()),
+    );
+
+    // Explicit test-premise correspondence -- never inferred from labels.
+    let correspondence: HashMap<&str, &str> =
+        [("a", "node-p"), ("b", "node-q")].into_iter().collect();
+
+    assert_eq!(original_surface.len(), renamed_surface.len());
+    for original_entry in &original_surface {
+        let expected_renamed_target = correspondence[original_entry.target.0.as_str()];
+        let renamed_entry = renamed_surface
+            .iter()
+            .find(|e| e.target.0 == expected_renamed_target)
+            .expect("corresponding renamed target must be present");
+
+        assert_eq!(
+            (
+                original_entry.before_reachable,
+                original_entry.after_reachable,
+                original_entry.before_effective_branches_to_target,
+                original_entry.after_effective_branches_to_target,
+            ),
+            (
+                renamed_entry.before_reachable,
+                renamed_entry.after_reachable,
+                renamed_entry.before_effective_branches_to_target,
+                renamed_entry.after_effective_branches_to_target,
+            ),
+            "RENAMING VIOLATION: relabeling must not change the structural transition"
+        );
+    }
+}
+
+#[test]
+fn path_037_j_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let forward = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "b"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    assert_eq!(
+        structural_propagation_surface(&source, &forward, &removed),
+        structural_propagation_surface(&source, &shuffled, &removed),
+        "ORDERING VIOLATION: edge order must not change the propagation surface"
+    );
+}
+
+#[test]
+fn path_037_k_cycle_terminates_deterministically() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "a"),
+        DependencyEdge::new("b", "payment"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    let targets: Vec<&str> = surface.iter().map(|e| e.target.0.as_str()).collect();
+    assert_eq!(targets, vec!["a", "b", "payment"]);
+    for entry in &surface {
+        assert!(entry.before_reachable);
+        assert!(!entry.after_reachable);
+    }
+}
+
+#[test]
+fn path_037_l_removed_capability_is_excluded_from_its_own_surface() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert!(
+        !surface.iter().any(|e| e.target == removed),
+        "DECISION (justified): the removed capability itself is excluded -- the query is about \
+         downstream consequences, not the tautological fact that the removed node is gone"
+    );
+}
+
+#[test]
+fn path_037_m_source_removal_causes_total_propagation_without_panicking() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "b"),
+    ];
+
+    // removed == source: not special-cased, not panicking. Documented as
+    // a well-defined (if degenerate) consequence of the same removal
+    // semantics, not a separate contract.
+    let surface = structural_propagation_surface(&source, &edges, &source);
+
+    let targets: Vec<&str> = surface.iter().map(|e| e.target.0.as_str()).collect();
+    assert_eq!(targets, vec!["a", "b", "x", "y"]);
+    for entry in &surface {
+        assert!(entry.before_reachable);
+        assert!(
+            !entry.after_reachable,
+            "removing source strips every one of its outgoing edges, so every previously \
+             reachable target becomes unreachable"
+        );
+    }
+}
+
+#[test]
+fn path_037_n_empty_graph_is_non_panicking() {
+    use distribution_machine::measurement::{CapabilityId, structural_propagation_surface};
+
+    let source = CapabilityId("solo".into());
+    let removed = CapabilityId("ghost".into());
+    let edges: Vec<distribution_machine::measurement::DependencyEdge> = vec![];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert_eq!(surface, vec![]);
+}
+
+#[test]
+fn path_037_o_disconnected_component_is_excluded() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("disconnected-a", "disconnected-b"),
+    ];
+
+    let surface = structural_propagation_surface(&source, &edges, &removed);
+
+    assert!(
+        !surface
+            .iter()
+            .any(|e| e.target.0 == "disconnected-a" || e.target.0 == "disconnected-b"),
+        "a component with no path from source must never appear merely because its edges exist"
+    );
+    assert_eq!(surface.len(), 1);
+    assert_eq!(surface[0].target, CapabilityId("payment".into()));
+}
+
+#[test]
+fn path_037_p_counterexample_equal_affected_target_count_different_transition_vectors() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    // Scenario 1: X is the sole path to two independent targets. Removing
+    // X leaves BOTH hard-unreachable.
+    let hard_loss_scenario = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("x", "b"),
+    ];
+
+    // Scenario 2: X is one of two branches feeding each of two
+    // independent targets. Removing X leaves BOTH still reachable, each
+    // losing one of two branches.
+    let branch_loss_scenario = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("x", "b"),
+        DependencyEdge::new("source", "w"),
+        DependencyEdge::new("w", "a"),
+        DependencyEdge::new("source", "v"),
+        DependencyEdge::new("v", "b"),
+    ];
+
+    let hard_loss_surface = structural_propagation_surface(&source, &hard_loss_scenario, &removed);
+    let branch_loss_surface = structural_propagation_surface(&source, &branch_loss_scenario, &removed);
+
+    assert_eq!(hard_loss_surface.len(), 2);
+    assert_eq!(branch_loss_surface.len(), 2);
+    assert_eq!(
+        hard_loss_surface.len(),
+        branch_loss_surface.len(),
+        "H8 COUNTEREXAMPLE: both scenarios report the same scalar affected-target count (2)"
+    );
+
+    assert!(
+        hard_loss_surface.iter().all(|e| !e.after_reachable),
+        "scenario 1: both targets suffer hard reachability loss"
+    );
+    assert!(
+        branch_loss_surface.iter().all(|e| e.after_reachable
+            && e.after_effective_branches_to_target < e.before_effective_branches_to_target),
+        "scenario 2: both targets remain reachable, only losing a redundant branch"
+    );
+    assert_ne!(
+        hard_loss_surface, branch_loss_surface,
+        "the equal scalar count of 2 masks a completely different structural reality in each \
+         scenario -- no economic claim is made about which is 'worse'"
+    );
+}
+
+#[test]
+fn path_037_q_counterexample_relay_insertion_defeats_target_count_candidates() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    let direct = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "payment"),
+    ];
+    let via_relay = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "relay"),
+        DependencyEdge::new("relay", "payment"),
+    ];
+
+    let direct_surface = structural_propagation_surface(&source, &direct, &removed);
+    let relay_surface = structural_propagation_surface(&source, &via_relay, &removed);
+
+    // Candidate A (section 7): "number of targets losing reachability".
+    let candidate_a_direct = direct_surface.iter().filter(|e| !e.after_reachable).count();
+    let candidate_a_relay = relay_surface.iter().filter(|e| !e.after_reachable).count();
+
+    // Candidate B (section 7): "number of targets with any structural
+    // change" -- coincides with the surface length here, since every
+    // changed target in this graph shape is a hard-reachability loss.
+    let candidate_b_direct = direct_surface.len();
+    let candidate_b_relay = relay_surface.len();
+
+    assert_ne!(
+        candidate_a_direct, candidate_a_relay,
+        "CANDIDATE A FALSIFIED: 'targets losing reachability' inflates 1 -> 2 purely from \
+         inserting a stipulated pass-through relay"
+    );
+    assert_ne!(
+        candidate_b_direct, candidate_b_relay,
+        "CANDIDATE B FALSIFIED: 'targets with any structural change' inflates 1 -> 2 for the \
+         same reason -- identical to PATH-035/FIND-012's node-splitting attack on raw \
+         affected-node counts, now shown against this candidate too"
+    );
+}
+
+#[test]
+fn path_037_q2_counterexample_chain_decomposition_defeats_branch_loss_count_candidate() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, structural_propagation_surface,
+    };
+
+    let source = CapabilityId("source".into());
+    let removed = CapabilityId("x".into());
+
+    // Test premise: A2 is stipulated as internal decomposition of the
+    // same capability as A (PATH-035 lesson reused), reached only via A.
+    let baseline = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "a"),
+    ];
+    let decomposed = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "a"),
+        DependencyEdge::new("a", "a2"),
+    ];
+
+    let baseline_surface = structural_propagation_surface(&source, &baseline, &removed);
+    let decomposed_surface = structural_propagation_surface(&source, &decomposed, &removed);
+
+    // Candidate C (section 7): "number of target-scoped branch losses"
+    // -- targets that remain reachable but whose target-scoped branch
+    // count decreased.
+    let branch_loss_count = |surface: &[distribution_machine::measurement::StructuralPropagationEntry]| {
+        surface
+            .iter()
+            .filter(|e| {
+                e.after_reachable
+                    && e.after_effective_branches_to_target < e.before_effective_branches_to_target
+            })
+            .count()
+    };
+
+    let candidate_c_baseline = branch_loss_count(&baseline_surface);
+    let candidate_c_decomposed = branch_loss_count(&decomposed_surface);
+
+    assert_eq!(candidate_c_baseline, 1);
+    assert_eq!(
+        candidate_c_decomposed, 2,
+        "A2 shows the identical branch-loss transition as A purely because it is an internal \
+         decomposition reached only through A"
+    );
+    assert_ne!(
+        candidate_c_baseline, candidate_c_decomposed,
+        "CANDIDATE C FALSIFIED: 'count of target-scoped branch losses' also inflates under \
+         chain decomposition of a single stipulated capability into two graph nodes -- no \
+         scalar reduction of the propagation surface tried in this mission survived this \
+         attack"
+    );
+}

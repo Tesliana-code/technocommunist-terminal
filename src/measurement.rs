@@ -1563,6 +1563,159 @@ pub fn structural_counterfactual(
     }
 }
 
+/// All `CapabilityId`s reachable from `source` by following `edges`
+/// forward, EXCLUDING `source` itself (PATH-037). Cycle-safe via a
+/// visited-set BFS (the same traversal shape as [`is_reachable`]).
+/// Sorted lexically by `CapabilityId` value for deterministic output --
+/// that ordering exists purely for stable enumeration/serialization and
+/// carries no structural or economic meaning.
+///
+/// This is topology-only: a `CapabilityId` that never appears as the
+/// source or target of any edge in `edges` cannot appear here, even if
+/// some larger "declared capability universe" outside this graph
+/// representation considers it to exist. This edge-only representation
+/// cannot express a capability with no relationships at all -- that
+/// limitation is inherited by every function built on top of this one,
+/// including [`structural_propagation_surface`].
+pub fn reachable_capabilities(source: &CapabilityId, edges: &[DependencyEdge]) -> Vec<CapabilityId> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_default()
+            .push(edge.target.clone());
+    }
+
+    let mut visited: HashSet<CapabilityId> = HashSet::new();
+    let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+    visited.insert(source.clone());
+    queue.push_back(source.clone());
+
+    while let Some(node) = queue.pop_front() {
+        if let Some(children) = adjacency.get(&node) {
+            for child in children {
+                if visited.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+
+    visited.remove(source);
+    let mut result: Vec<CapabilityId> = visited.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// One target's structural transition inside a [`structural_propagation_
+/// surface`] result (PATH-037). Field meanings are identical to
+/// [`StructuralCounterfactual`]'s, scoped to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralPropagationEntry {
+    pub target: CapabilityId,
+    pub before_reachable: bool,
+    pub after_reachable: bool,
+    pub before_effective_branches_to_target: usize,
+    pub after_effective_branches_to_target: usize,
+}
+
+/// Multi-target structural propagation surface of removing `removed`
+/// from `edges` (PATH-037): the [`StructuralCounterfactual`] of every
+/// target in `source`'s PRE-REMOVAL reachable set, for targets whose
+/// structural state actually changed.
+///
+/// ## Target universe
+///
+/// The candidate target universe is `reachable_capabilities(source,
+/// edges)` (every `CapabilityId` reachable from `source` before
+/// removal), with `source` and `removed` excluded:
+///
+/// - `source` is excluded because `is_reachable` treats a node as
+///   trivially reachable from itself, so an entry for `source` would
+///   always report `before_reachable == after_reachable == true` with no
+///   informative content.
+/// - `removed` is excluded because the query is about DOWNSTREAM
+///   CONSEQUENCES of removing it, not the tautological fact that the
+///   removed capability itself is now gone. If `removed` was reachable
+///   from `source` before removal, it deterministically becomes
+///   unreachable after (nothing can point into a node with all its
+///   incident edges stripped, except `source` itself in the degenerate
+///   `removed == source` case) -- that transition is guaranteed by
+///   construction for ANY removed capability and reports nothing about
+///   propagation to OTHER capabilities.
+/// - A target that was NOT reachable before removal is never included,
+///   and could not usefully be: `remove_capability` only ever deletes
+///   edges, and deleting edges from a graph cannot create a directed
+///   path that did not already exist (every path usable in the
+///   post-removal edge set is, by construction, also usable in the
+///   pre-removal one, since post-removal edges are a subset of
+///   pre-removal edges). Reachability can therefore only be lost or
+///   preserved by removal, never gained -- see `path_037_inspection_*`
+///   for an executable check of this on a graph containing a cycle.
+///
+/// A target is included in the returned `Vec` only if its
+/// `StructuralCounterfactual` (built with [`structural_counterfactual`])
+/// differs from the trivial "before" baseline in `after_reachable` or
+/// `after_effective_branches_to_target` -- i.e. only targets whose
+/// structural state actually changed. Because every candidate target is
+/// drawn from `source`'s pre-removal reachable set, `before_reachable`
+/// is always `true` and `before_effective_branches_to_target` is always
+/// at least 1 for every entry this function can ever produce; the
+/// interesting information is entirely in the `after_*` fields.
+///
+/// Entries are sorted lexically by `target` for deterministic output;
+/// that ordering is for stable enumeration only and carries no
+/// structural or economic meaning.
+///
+/// This is NOT a complete summary of removal consequences: it does not
+/// incorporate `shared_structural_bottlenecks` or
+/// `first_structural_convergences`, so it inherits the same blind spot
+/// `StructuralCounterfactual` has for a shared bottleneck the removed
+/// capability does not itself sit on (PATH-036-D/L; see `path_037_f`).
+/// It also does NOT reduce to a scalar, and PATH-037 found no scalar
+/// reduction of it (count of changed targets, count of targets losing
+/// reachability, count of targets losing a branch while remaining
+/// reachable) that is representation-invariant under chain
+/// decomposition or relay insertion -- see `path_037_q*` and FIND-014.
+/// No floats, no weights, no severity, no economic meaning anywhere in
+/// this type or function.
+pub fn structural_propagation_surface(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+    removed: &CapabilityId,
+) -> Vec<StructuralPropagationEntry> {
+    let mut targets = reachable_capabilities(source, edges);
+    targets.retain(|target| target != removed);
+
+    let mut surface: Vec<StructuralPropagationEntry> = targets
+        .into_iter()
+        .filter_map(|target| {
+            let result = structural_counterfactual(source, &target, edges, removed);
+
+            let changed = result.before_reachable != result.after_reachable
+                || result.before_effective_branches_to_target
+                    != result.after_effective_branches_to_target;
+
+            if !changed {
+                return None;
+            }
+
+            Some(StructuralPropagationEntry {
+                target,
+                before_reachable: result.before_reachable,
+                after_reachable: result.after_reachable,
+                before_effective_branches_to_target: result.before_effective_branches_to_target,
+                after_effective_branches_to_target: result.after_effective_branches_to_target,
+            })
+        })
+        .collect();
+
+    surface.sort_by(|a, b| a.target.0.cmp(&b.target.0));
+    surface
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyPathId(pub String);
 
