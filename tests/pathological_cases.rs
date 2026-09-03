@@ -4702,3 +4702,359 @@ fn path_034_i_counterexample_search_tau_alone_does_not_capture_partial_restorati
     // restoration-degree function `S_X(t)`, per the mission's
     // formal-model notes, is explicitly NOT implemented here).
 }
+
+// =======================================================================
+// PATH-035: FAILURE BLAST RADIUS GRANULARITY / REPRESENTATION LAUNDERING
+//
+// INSPECTION RESULT (before any test below): `CriticalityObservables.
+// failure_blast_radius` is a raw `u32` field. There is NO `Evidence ->
+// FailureBlastRadius` derivation anywhere in this module --
+// `measure_criticality` only ever *consumes* the value (via
+// `saturating_count(value, 5)` then a linear weight); it never computes
+// it from `DependencyEdge`, `CapabilityId`, or any other graph
+// primitive. Every existing call site that sets `failure_blast_radius`
+// (PATH-012, and the `measurement.rs` unit tests) supplies it as a
+// literal integer. This is the same shape of finding as PATH-034 /
+// FIND-011 for `Substitutability`: the problem is ABSENCE of a
+// deterministic, representation-invariant derivation function, not proof
+// that an existing derivation performs naive downstream-node counting.
+// No test below claims current production code "counts downstream
+// nodes" -- it does not compute a count of anything.
+//
+// H6 (as actually tested): raw affected-NODE count is not a
+// representation-invariant measure of failure blast radius, because one
+// real-world affected capability can be represented as either one graph
+// node or several internal graph nodes (a chain). H6 is tested against a
+// NAIVE STRAWMAN counting function defined only in this test module
+// (`naive_downstream_reachable_count`, below) -- explicitly NOT a claim
+// about what `failure_blast_radius` currently computes, since it
+// computes nothing today. The strawman exists solely to give H6 a
+// concrete function to attack, matching the mission's own A/B graphs.
+//
+// The mission also asks whether an existing PATH-027..033 graph
+// primitive already gives a representation-invariant STRUCTURAL
+// reduction that could stand in for extent.
+// `effective_structural_branches(source, edges).len()` (PATH-029/030) is
+// tested here as exactly that candidate: it already deduplicates edges
+// (`build_structural_adjacency`'s `seen_edges`), already collapses
+// subsumed/chain branches via PATH-029's counterfactual-removal
+// analysis, and PATH-028-i / PATH-033-f/g already established
+// ordering/renaming invariance for the same underlying traversal. NO NEW
+// PRODUCTION CODE is added for PATH-035: every test below calls existing
+// `src/measurement.rs` functions as-is.
+//
+// PATH-024/025/026 (`FailureDomainId`, `deduplicate_failure_domains`,
+// `aggregate_failure_domains_with_model`) were inspected for relevance
+// and found NOT to bear on this question: that machinery operates on
+// `DependencyRecord` / `QualifiedDependency` for the economic dependency
+// WEIGHT aggregation pipeline (`aggregate_*_with_model` -> f64), which is
+// structurally disjoint from `CapabilityId` / `DependencyEdge` /
+// `CriticalityObservables.failure_blast_radius` (u32). No function in
+// this module bridges a `FailureDomainId` computation into
+// `CriticalityObservables`. PATH-026 already established (for its own
+// purpose) that identifier metadata is not authoritative evidence of
+// independence; nothing here re-derives or contradicts that. This is
+// recorded as an already-answered sub-question (no PATH-035-E test is
+// added, per the mission's instruction to record rather than duplicate
+// already-solved ground).
+//
+// See FIND-012 for the verdict this test group establishes.
+// =======================================================================
+
+/// STRAWMAN naive measure for H6 only: every node reachable from `source`
+/// (excluding `source` itself), deduplicated by an ordinary visited-set
+/// BFS. This is deliberately NOT a claim about `failure_blast_radius`'s
+/// derivation -- inspection found no such derivation exists in
+/// production code at all (see banner comment above). It exists only so
+/// H6 ("raw affected-node count is not representation-invariant") has a
+/// concrete function to attack.
+fn naive_downstream_reachable_count(
+    source: &distribution_machine::measurement::CapabilityId,
+    edges: &[distribution_machine::measurement::DependencyEdge],
+) -> usize {
+    use distribution_machine::measurement::CapabilityId;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_default()
+            .push(edge.target.clone());
+    }
+
+    let mut visited: HashSet<CapabilityId> = HashSet::new();
+    let mut queue: VecDeque<CapabilityId> = VecDeque::new();
+    queue.push_back(source.clone());
+    visited.insert(source.clone());
+
+    while let Some(node) = queue.pop_front() {
+        if let Some(children) = adjacency.get(&node) {
+            for child in children {
+                if visited.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+
+    visited.len() - 1
+}
+
+#[test]
+fn path_035_a_node_splitting_inflates_naive_count_but_not_effective_branch_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // Test premise (explicit, not inferred from labels): PAYMENT_FRONTEND
+    // -> PAYMENT_BACKEND is STIPULATED here to be internal decomposition
+    // of the same external capability as bare PAYMENT, with the same
+    // real-world failure consequence. This equivalence is asserted as
+    // test setup, never derived from the labels or from any code.
+    let source = CapabilityId("x".into());
+
+    let single_node = vec![DependencyEdge::new("x", "payment")];
+    let split_chain = vec![
+        DependencyEdge::new("x", "payment_frontend"),
+        DependencyEdge::new("payment_frontend", "payment_backend"),
+    ];
+
+    let naive_single = naive_downstream_reachable_count(&source, &single_node);
+    let naive_split = naive_downstream_reachable_count(&source, &split_chain);
+
+    assert_ne!(
+        naive_single, naive_split,
+        "H6 REPRESENTATION LAUNDERING (naive strawman): downstream node count inflates from {} \
+         to {} purely from internal chain decomposition of a stipulated single capability, with \
+         no change in real-world failure consequence",
+        naive_single, naive_split
+    );
+    assert_eq!(naive_single, 1);
+    assert_eq!(naive_split, 2);
+
+    // Candidate structural reduction: PATH-029/030's
+    // effective_structural_branches is invariant to this exact attack --
+    // both graphs have exactly one immediate branch root from `x`.
+    let effective_single = effective_structural_branches(&source, &single_node).len();
+    let effective_split = effective_structural_branches(&source, &split_chain).len();
+
+    assert_eq!(
+        effective_single, effective_split,
+        "candidate: effective_structural_branches count survives chain decomposition"
+    );
+    assert_eq!(effective_single, 1);
+}
+
+#[test]
+fn path_035_b_relay_insertion_inflates_naive_count_but_not_effective_branch_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // Test premise: RELAY is stipulated to introduce no independent
+    // economic capability -- a pure pass-through node.
+    let source = CapabilityId("x".into());
+
+    let direct = vec![DependencyEdge::new("x", "a"), DependencyEdge::new("a", "b")];
+    let via_relay = vec![
+        DependencyEdge::new("x", "a"),
+        DependencyEdge::new("a", "relay"),
+        DependencyEdge::new("relay", "b"),
+    ];
+
+    let naive_direct = naive_downstream_reachable_count(&source, &direct);
+    let naive_relay = naive_downstream_reachable_count(&source, &via_relay);
+
+    assert_ne!(
+        naive_direct, naive_relay,
+        "H6 REPRESENTATION LAUNDERING (naive strawman): inserting a stipulated pass-through node \
+         inflates downstream node count from {} to {}",
+        naive_direct, naive_relay
+    );
+
+    let effective_direct = effective_structural_branches(&source, &direct).len();
+    let effective_relay = effective_structural_branches(&source, &via_relay).len();
+
+    assert_eq!(
+        effective_direct, effective_relay,
+        "candidate: effective_structural_branches count is invariant to relay insertion"
+    );
+    assert_eq!(effective_direct, 1);
+}
+
+#[test]
+fn path_035_c_duplicate_representation_is_already_neutralized() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    let source = CapabilityId("x".into());
+    let single = vec![DependencyEdge::new("x", "payment")];
+    let duplicated = vec![
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("x", "payment"),
+    ];
+
+    // Already-existing structural dedup (`build_structural_adjacency`'s
+    // `seen_edges`, and the naive strawman's own BFS visited-set) already
+    // neutralizes duplicate-edge representation of one affected
+    // capability, consistent with FIND-007 ("duplicate edges must not
+    // create value"). Recorded here rather than re-solved with new
+    // machinery.
+    assert_eq!(
+        naive_downstream_reachable_count(&source, &single),
+        naive_downstream_reachable_count(&source, &duplicated),
+    );
+    assert_eq!(
+        effective_structural_branches(&source, &single).len(),
+        effective_structural_branches(&source, &duplicated).len(),
+    );
+}
+
+#[test]
+fn path_035_d_genuine_independent_expansion_is_still_detected() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // Test premise: PAYMENT and SHIPPING are stipulated as independent --
+    // neither reaches the other in this graph.
+    let source = CapabilityId("x".into());
+    let one_capability = vec![DependencyEdge::new("x", "payment")];
+    let two_capabilities = vec![
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("x", "shipping"),
+    ];
+
+    let naive_one = naive_downstream_reachable_count(&source, &one_capability);
+    let naive_two = naive_downstream_reachable_count(&source, &two_capabilities);
+    assert!(naive_two > naive_one);
+
+    let effective_one = effective_structural_branches(&source, &one_capability).len();
+    let effective_two = effective_structural_branches(&source, &two_capabilities).len();
+
+    assert!(
+        effective_two > effective_one,
+        "the candidate reduction must not flatten genuine independent expansion to a constant"
+    );
+    assert_eq!(effective_one, 1);
+    assert_eq!(effective_two, 2);
+}
+
+#[test]
+fn path_035_f_renaming_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    let original = vec![
+        DependencyEdge::new("x", "payment_frontend"),
+        DependencyEdge::new("payment_frontend", "payment_backend"),
+        DependencyEdge::new("x", "shipping"),
+    ];
+    let renamed = vec![
+        DependencyEdge::new("node-1", "node-2"),
+        DependencyEdge::new("node-2", "node-3"),
+        DependencyEdge::new("node-1", "node-4"),
+    ];
+
+    let original_count =
+        effective_structural_branches(&CapabilityId("x".into()), &original).len();
+    let renamed_count =
+        effective_structural_branches(&CapabilityId("node-1".into()), &renamed).len();
+
+    assert_eq!(
+        original_count, renamed_count,
+        "RENAMING VIOLATION: relabeling capabilities must not change the candidate extent count"
+    );
+    assert_eq!(renamed_count, 2);
+}
+
+#[test]
+fn path_035_g_ordering_is_inert() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    let forward = vec![
+        DependencyEdge::new("x", "payment_frontend"),
+        DependencyEdge::new("payment_frontend", "payment_backend"),
+        DependencyEdge::new("x", "shipping"),
+    ];
+    let mut shuffled = forward.clone();
+    shuffled.reverse();
+
+    let source = CapabilityId("x".into());
+    let forward_count = effective_structural_branches(&source, &forward).len();
+    let shuffled_count = effective_structural_branches(&source, &shuffled).len();
+
+    assert_eq!(
+        forward_count, shuffled_count,
+        "ORDERING VIOLATION: edge order must not change the candidate extent count"
+    );
+    assert_eq!(forward_count, 2);
+}
+
+#[test]
+fn path_035_h_equal_extent_cannot_distinguish_consequence_severity() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // Labels below are for human readability only -- no code in this test
+    // or in `effective_structural_branches` performs semantic inference
+    // from "reporting" or "payment". Both graphs have the identical
+    // shape: one source, one downstream capability, extent = 1.
+    let source = CapabilityId("x".into());
+    let optional_reporting_failure = vec![DependencyEdge::new("x", "reporting_dashboard")];
+    let payment_failure = vec![DependencyEdge::new("x", "payment_settlement")];
+
+    let reporting_extent =
+        effective_structural_branches(&source, &optional_reporting_failure).len();
+    let payment_extent = effective_structural_branches(&source, &payment_failure).len();
+
+    assert_eq!(
+        reporting_extent, payment_extent,
+        "SUFFICIENCY COUNTEREXAMPLE: structural extent alone (1 == 1) cannot distinguish an \
+         optional reporting capability from a payment capability -- this equality is the finding, \
+         not a claim that the two failures are equally consequential"
+    );
+}
+
+#[test]
+fn path_035_i_equal_extent_cannot_distinguish_degradation_degree_or_duration() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, effective_structural_branches,
+    };
+
+    // Same topology reused for two DECLARED (test-premise-only) scenarios
+    // that differ only in dimensions the graph carries no evidence for:
+    // total-vs-partial capacity loss, and long-vs-short duration. Neither
+    // dimension is represented anywhere in `DependencyEdge` or
+    // `CapabilityId`, so the candidate structural reduction is, by
+    // construction, blind to both. That blindness -- not a new
+    // observable for either dimension -- is the counterexample this test
+    // records.
+    let source = CapabilityId("x".into());
+    let edges = vec![
+        DependencyEdge::new("x", "payment"),
+        DependencyEdge::new("x", "shipping"),
+    ];
+
+    // Scenario 1 (stipulated, not represented in the graph): total,
+    // multi-day outage of both capabilities.
+    let scenario_total_long = effective_structural_branches(&source, &edges).len();
+
+    // Scenario 2 (stipulated, not represented in the graph): partial,
+    // sub-second degraded-capacity blip of both capabilities.
+    let scenario_partial_short = effective_structural_branches(&source, &edges).len();
+
+    assert_eq!(
+        scenario_total_long, scenario_partial_short,
+        "COUNTEREXAMPLE: identical structural extent (2 == 2) cannot distinguish total/long \
+         degradation from partial/short degradation, because degradation degree and duration are \
+         not represented in DependencyEdge/CapabilityId topology at all"
+    );
+}
