@@ -7932,3 +7932,389 @@ fn path_039_candidate_c_corroboration_without_identity_does_not_prevent_launderi
          this mission is explicitly forbidden from inventing"
     );
 }
+
+// =====================================================================
+// PATH-040 -- PROVENANCE-PRESERVING CANONICALIZATION (H11)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement`, wired into `canonicalize_pure_relays`
+// / `canonicalize_declared_representation_nodes` (both left untouched), or
+// wired into any economic/allocation path. Candidate B is built entirely
+// from data the existing PATH-038/039 production functions already return
+// (`RelayCollapseProvenance`), plus a thin bookkeeping layer local to this
+// test file.
+// =====================================================================
+
+/// Candidate A -- RAW MULTIPLICITY. Counts literal occurrences of
+/// `(from, to)` in the raw input list, independent of any set-based
+/// structural dedup. This is the naive baseline PATH-040 requires be
+/// attacked: it is the FIND-007/PATH-017 pathology (duplicate raw records
+/// inflate a count) transplanted to the edge level.
+fn path_040_candidate_a_raw_multiplicity(
+    edges: &[distribution_machine::measurement::DependencyEdge],
+    from: &distribution_machine::measurement::CapabilityId,
+    to: &distribution_machine::measurement::CapabilityId,
+) -> usize {
+    edges.iter().filter(|e| &e.source == from && &e.target == to).count()
+}
+
+/// Candidate B -- DISTINCT STRUCTURAL ORIGINS. Replays the REAL
+/// `RelayCollapseProvenance` list (produced by the unmodified PATH-039
+/// production function) as a union of origin sets: every raw edge seeds
+/// its own singleton origin set (a `HashSet` insert, so a duplicated raw
+/// edge seeds exactly ONE origin -- never two, per FIND-007), and each
+/// collapse event unions the two origin sets it consumes into the origin
+/// set of the edge it produces. The result maps each SURVIVING canonical
+/// edge to the set of raw pre-collapse edges that were folded into it.
+fn path_040_candidate_b_origins(
+    original_edges: &[distribution_machine::measurement::DependencyEdge],
+    provenance: &[distribution_machine::measurement::RelayCollapseProvenance],
+) -> std::collections::HashMap<
+    (
+        distribution_machine::measurement::CapabilityId,
+        distribution_machine::measurement::CapabilityId,
+    ),
+    std::collections::HashSet<(
+        distribution_machine::measurement::CapabilityId,
+        distribution_machine::measurement::CapabilityId,
+    )>,
+> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut origins: HashMap<_, HashSet<_>> = HashMap::new();
+    for e in original_edges {
+        let key = (e.source.clone(), e.target.clone());
+        origins.entry(key.clone()).or_insert_with(HashSet::new).insert(key);
+    }
+
+    for p in provenance {
+        let left = (p.predecessor.clone(), p.collapsed.clone());
+        let right = (p.collapsed.clone(), p.successor.clone());
+        let merged_key = (p.predecessor.clone(), p.successor.clone());
+
+        let mut merged: HashSet<_> = origins.remove(&left).unwrap_or_default();
+        merged.extend(origins.remove(&right).unwrap_or_default());
+        if let Some(existing) = origins.remove(&merged_key) {
+            merged.extend(existing);
+        }
+        origins.insert(merged_key, merged);
+    }
+
+    origins
+}
+
+/// The statistic PATH-040-A/C/D/E/F actually test: how many of `source`'s
+/// distinct immediate branch roots are represented within one canonical
+/// edge's origin set. Parameterized by `source` for the same reason every
+/// other PATH-027..030 primitive in this module is -- no invented "root"
+/// concept, just the existing explicit-source convention.
+fn path_040_distinct_origin_branch_count(
+    source: &distribution_machine::measurement::CapabilityId,
+    origin_set: &std::collections::HashSet<(
+        distribution_machine::measurement::CapabilityId,
+        distribution_machine::measurement::CapabilityId,
+    )>,
+) -> usize {
+    let branches: std::collections::HashSet<_> =
+        origin_set.iter().filter(|(from, _)| from == source).map(|(_, to)| to).collect();
+    branches.len()
+}
+
+#[test]
+fn path_040_candidate_a_raw_multiplicity_is_inflated_by_a_duplicate_raw_edge() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+
+    // One genuine structural edge, serialized twice (e.g. two evidence
+    // records describing the same real relationship -- PATH-017's exact
+    // scenario, at the edge level instead of the aggregation level).
+    let edges_genuine = vec![DependencyEdge::new("source", "x")];
+    let edges_duplicated =
+        vec![DependencyEdge::new("source", "x"), DependencyEdge::new("source", "x")];
+
+    assert_eq!(path_040_candidate_a_raw_multiplicity(&edges_genuine, &source, &x), 1);
+    assert_eq!(
+        path_040_candidate_a_raw_multiplicity(&edges_duplicated, &source, &x),
+        2,
+        "REJECTED: a raw occurrence count reports two structural relationships where there is \
+         only one -- serialization multiplicity, not structural convergence, exactly the \
+         FIND-007 pathology"
+    );
+}
+
+#[test]
+fn path_040_a_truthful_convergence_preserves_two_distinct_origins() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes, shared_structural_bottlenecks,
+    };
+
+    // Exact path_039_o graph (FIND-016's strongest counterexample).
+    let source = CapabilityId("source".into());
+    let m = CapabilityId("m".into());
+    let payment = CapabilityId("payment".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("m", "payment"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let claims = vec![
+        RepresentationClaim {
+            capability: CapabilityId("x".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-x-truthful".into()),
+        },
+        RepresentationClaim {
+            capability: CapabilityId("y".into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-y-truthful".into()),
+        },
+    ];
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[payment.clone()], &claims, &edges);
+    assert!(conflicts.is_empty());
+
+    // Reproduce path_039_o's exact failure first: the canonical graph
+    // alone has already lost the fact that M had two incoming branches.
+    assert!(
+        shared_structural_bottlenecks(&source, &canonical).is_empty(),
+        "must reproduce FIND-016's exact erasure before any candidate is credited with fixing it"
+    );
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let m_origin_set = origins
+        .get(&(source.clone(), m.clone()))
+        .expect("source->m must exist as a canonical edge");
+
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, m_origin_set),
+        2,
+        "H11: provenance must show M had two structurally distinct incoming branches (x and y) \
+         even though the canonical edge list alone erased this"
+    );
+
+    // The derived predicate recovers exactly what shared_structural_bottlenecks
+    // lost, WITHOUT reconstructing the original edge list at the call site --
+    // the caller only needs `origins`, not `edges`.
+    let recovered_bottlenecks: Vec<&CapabilityId> = origins
+        .iter()
+        .filter(|((from, _), set)| from == &source && path_040_distinct_origin_branch_count(&source, set) >= 2)
+        .map(|((_, to), _)| to)
+        .collect();
+    assert_eq!(recovered_bottlenecks, vec![&m]);
+}
+
+#[test]
+fn path_040_b_duplicate_raw_edge_does_not_manufacture_a_second_origin() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    // Only ONE genuine branch (source -> x -> target). Its raw input
+    // edges are each duplicated in the serialized list -- an attacker (or
+    // a careless double-import) submitting the same structural fact twice
+    // must not be interpreted as a second independent branch converging.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "target"),
+        DependencyEdge::new("x", "target"),
+    ];
+    let claims = vec![RepresentationClaim {
+        capability: CapabilityId("x".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-x".into()),
+    }];
+
+    let (_, provenance, _) =
+        canonicalize_declared_representation_nodes(&source, &[target.clone()], &claims, &edges);
+    assert_eq!(provenance.len(), 1, "the production collapse loop already dedups raw input edges");
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let origin_set = &origins[&(source.clone(), target.clone())];
+
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, origin_set),
+        1,
+        "FIND-007 consistency: a duplicated raw edge must not be counted as a second structural \
+         origin"
+    );
+}
+
+#[test]
+fn path_040_c_independent_multi_hop_branches_converge_with_origins_preserved() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes, shared_structural_bottlenecks,
+    };
+
+    // Two genuinely distinct branches, each two representation-hops deep,
+    // converging at m: source -> x1 -> x2 -> m, source -> y1 -> y2 -> m.
+    let source = CapabilityId("source".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x1"),
+        DependencyEdge::new("x1", "x2"),
+        DependencyEdge::new("x2", "m"),
+        DependencyEdge::new("source", "y1"),
+        DependencyEdge::new("y1", "y2"),
+        DependencyEdge::new("y2", "m"),
+    ];
+    let claims = ["x1", "x2", "y1", "y2"]
+        .iter()
+        .map(|id| RepresentationClaim {
+            capability: CapabilityId((*id).into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("claim-{id}")),
+        })
+        .collect::<Vec<_>>();
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+    assert!(conflicts.is_empty());
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "m")]);
+    assert!(shared_structural_bottlenecks(&source, &canonical).is_empty());
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let origin_set = &origins[&(source.clone(), m.clone())];
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, origin_set),
+        2,
+        "two-hop-deep representation chains must still register as two distinct origins, not \
+         collapse into ambiguity alongside the erased canonical edge"
+    );
+}
+
+#[test]
+fn path_040_d_cascading_collapse_does_not_erase_or_inflate_origins() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    // Branch 1 needs THREE successive collapse stages to reach m
+    // (a -> b -> c all representation-only). Branch 2 is a single hop.
+    // Provenance produced for branch 1 must still fold down to exactly
+    // ONE origin at m, not three (one per collapse stage) and not zero
+    // (erased by the later stages overwriting the earlier ones).
+    let source = CapabilityId("source".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "a"),
+        DependencyEdge::new("a", "b"),
+        DependencyEdge::new("b", "c"),
+        DependencyEdge::new("c", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let claims = ["a", "b", "c", "y"]
+        .iter()
+        .map(|id| RepresentationClaim {
+            capability: CapabilityId((*id).into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("claim-{id}")),
+        })
+        .collect::<Vec<_>>();
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+    assert!(conflicts.is_empty());
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "m")]);
+    assert_eq!(provenance.len(), 4, "a, b, c, and y each collapse individually");
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let origin_set = &origins[&(source.clone(), m.clone())];
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, origin_set),
+        2,
+        "a 3-stage cascading collapse on one branch must still register as exactly ONE origin \
+         at m, converging with branch y's single origin -- not 3 (one per stage) and not 0 \
+         (later stages silently overwriting earlier provenance)"
+    );
+}
+
+#[test]
+fn path_040_e_no_convergence_control_manufactures_no_extra_provenance() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes, shared_structural_bottlenecks,
+    };
+
+    // A plain single chain, no branching or convergence at all.
+    let source = CapabilityId("source".into());
+    let target = CapabilityId("target".into());
+    let edges = vec![DependencyEdge::new("source", "a"), DependencyEdge::new("a", "target")];
+    let claims = vec![RepresentationClaim {
+        capability: CapabilityId("a".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-a".into()),
+    }];
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+    assert!(conflicts.is_empty());
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "target")]);
+    assert!(shared_structural_bottlenecks(&source, &canonical).is_empty());
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let origin_set = &origins[&(source.clone(), target.clone())];
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, origin_set),
+        1,
+        "no convergence exists; the candidate must not manufacture a second origin out of a \
+         single plain chain"
+    );
+}
+
+#[test]
+fn path_040_f_relabeling_and_relay_depth_are_inert_to_origin_count() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole, canonicalize_declared_representation_nodes,
+    };
+
+    // Same shape as path_040_a, but every representation node is renamed
+    // to an arbitrary label, edge order is reversed, and one branch gets
+    // an extra harmless representation relay inserted.
+    let source = CapabilityId("source".into());
+    let m = CapabilityId("checkout_relay".into());
+    let mut edges = vec![
+        DependencyEdge::new("zzz_relay_alpha", "checkout_relay"),
+        DependencyEdge::new("source", "zzz_relay_alpha"),
+        DependencyEdge::new("qqq_relay_beta_extra", "checkout_relay"),
+        DependencyEdge::new("qqq_relay_beta", "qqq_relay_beta_extra"),
+        DependencyEdge::new("source", "qqq_relay_beta"),
+    ];
+    edges.reverse();
+
+    let claims = ["zzz_relay_alpha", "qqq_relay_beta", "qqq_relay_beta_extra"]
+        .iter()
+        .map(|id| RepresentationClaim {
+            capability: CapabilityId((*id).into()),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("claim-{id}")),
+        })
+        .collect::<Vec<_>>();
+
+    let (canonical, provenance, conflicts) =
+        canonicalize_declared_representation_nodes(&source, &[], &claims, &edges);
+    assert!(conflicts.is_empty());
+    assert_eq!(canonical, vec![DependencyEdge::new("source", "checkout_relay")]);
+
+    let origins = path_040_candidate_b_origins(&edges, &provenance);
+    let origin_set = &origins[&(source.clone(), m.clone())];
+    assert_eq!(
+        path_040_distinct_origin_branch_count(&source, origin_set),
+        2,
+        "arbitrary node labels, reversed edge order, and one branch's harmless extra \
+         representation-relay depth must not change the distinct-origin count"
+    );
+}
