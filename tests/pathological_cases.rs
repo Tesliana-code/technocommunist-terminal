@@ -8318,3 +8318,463 @@ fn path_040_f_relabeling_and_relay_depth_are_inert_to_origin_count() {
          representation-relay depth must not change the distinct-origin count"
     );
 }
+
+// =====================================================================
+// PATH-041 -- CAN STRUCTURAL INDEPENDENCE BE CORROBORATED WITHOUT AN
+// EXTERNAL IDENTITY AUTHORITY? (H12)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement` or wired into any production/
+// allocation path. Candidate B reuses the unmodified PATH-039
+// `canonicalize_declared_representation_nodes` and the unmodified
+// `reachable_capabilities` (PATH-032/033) as its only graph primitives.
+// =====================================================================
+
+/// Candidate A -- DISTINCT LABELS ONLY. Independence iff the two
+/// capability ids are syntactically different. This is exactly the
+/// assumption FIND-017's Candidate B (origin identity) already made
+/// implicitly; named here so it can be attacked directly.
+fn path_041_candidate_a_labels_differ(
+    x: &distribution_machine::measurement::CapabilityId,
+    y: &distribution_machine::measurement::CapabilityId,
+) -> bool {
+    x != y
+}
+
+fn path_041_reversed(
+    edges: &[distribution_machine::measurement::DependencyEdge],
+) -> Vec<distribution_machine::measurement::DependencyEdge> {
+    edges
+        .iter()
+        .map(|e| distribution_machine::measurement::DependencyEdge {
+            source: e.target.clone(),
+            target: e.source.clone(),
+        })
+        .collect()
+}
+
+fn path_041_transitive_predecessors(
+    node: &distribution_machine::measurement::CapabilityId,
+    edges: &[distribution_machine::measurement::DependencyEdge],
+) -> std::collections::HashSet<distribution_machine::measurement::CapabilityId> {
+    use distribution_machine::measurement::reachable_capabilities;
+    reachable_capabilities(node, &path_041_reversed(edges)).into_iter().collect()
+}
+
+/// The structural facts attributable to `branch_root` ALONE, relative to
+/// the shared `source` and the shared `convergence` node both branches
+/// feed into: transitive ancestors other than `source` itself
+/// ("distinct upstream ancestry"), unioned with whatever `branch_root`
+/// can reach that `convergence` cannot also reach ("distinct downstream
+/// continuation" / operational side-effects private to this branch,
+/// per PATH-041-D). Deliberately excludes raw successor/predecessor sets
+/// at `branch_root` itself, since for any pair that already converges on
+/// the same node those are identical BY DEFINITION and so carry zero
+/// information (see FIND-018 OBSERVED).
+fn path_041_evidence(
+    branch_root: &distribution_machine::measurement::CapabilityId,
+    source: &distribution_machine::measurement::CapabilityId,
+    convergence: &distribution_machine::measurement::CapabilityId,
+    edges: &[distribution_machine::measurement::DependencyEdge],
+) -> std::collections::HashSet<distribution_machine::measurement::CapabilityId> {
+    use distribution_machine::measurement::reachable_capabilities;
+    use std::collections::HashSet;
+
+    let mut extra_ancestry = path_041_transitive_predecessors(branch_root, edges);
+    extra_ancestry.remove(source);
+    extra_ancestry.remove(branch_root);
+
+    let own_reach: HashSet<_> = reachable_capabilities(branch_root, edges).into_iter().collect();
+    let mut convergence_reach: HashSet<_> =
+        reachable_capabilities(convergence, edges).into_iter().collect();
+    convergence_reach.insert(convergence.clone());
+
+    let mut evidence: HashSet<_> = extra_ancestry;
+    evidence.extend(own_reach.difference(&convergence_reach).cloned());
+    evidence.remove(branch_root);
+    evidence
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path041Verdict {
+    /// Both branches carry their own non-empty, non-identical evidence.
+    Independent,
+    /// At least one branch has zero distinguishing evidence of its own --
+    /// never certified independent merely by being paired with a richer
+    /// sibling (PATH-041-H).
+    Insufficient,
+    /// Full neighborhoods (or the two branches' own evidence sets) are
+    /// identical -- a stronger, explicit negative signal, not merely an
+    /// absence of proof (PATH-041-C).
+    LikelyDuplicate,
+}
+
+/// Candidate B -- STRUCTURAL CORROBORATION. Canonicalizes first (so
+/// harmless added representation-relay depth on either branch cannot
+/// affect the result -- PATH-041-F), protecting `source`, `x`, `y`, and
+/// `convergence` from ever collapsing themselves (this experiment
+/// corroborates whether THESE SPECIFIC node identities are independent,
+/// not whether they are themselves eligible for PATH-039 collapse). A
+/// verdict of `Independent` requires BOTH branches to carry their own
+/// non-empty evidence (per [`path_041_evidence`]) that DIFFERS between
+/// them; either branch having no evidence of its own, or both branches
+/// sharing literally the same evidence, is never enough.
+fn path_041_candidate_b_corroborate(
+    source: &distribution_machine::measurement::CapabilityId,
+    x: &distribution_machine::measurement::CapabilityId,
+    y: &distribution_machine::measurement::CapabilityId,
+    convergence: &distribution_machine::measurement::CapabilityId,
+    claims: &[distribution_machine::measurement::RepresentationClaim],
+    raw_edges: &[distribution_machine::measurement::DependencyEdge],
+) -> Path041Verdict {
+    use distribution_machine::measurement::{
+        canonicalize_declared_representation_nodes, reachable_capabilities,
+    };
+
+    let protected = vec![source.clone(), x.clone(), y.clone(), convergence.clone()];
+    let (canonical_edges, _provenance, conflicts) =
+        canonicalize_declared_representation_nodes(source, &protected, claims, raw_edges);
+    assert!(conflicts.is_empty(), "PATH-041 test fixtures never assert conflicting claims");
+
+    let px = path_041_transitive_predecessors(x, &canonical_edges);
+    let py = path_041_transitive_predecessors(y, &canonical_edges);
+    let rx: std::collections::HashSet<_> =
+        reachable_capabilities(x, &canonical_edges).into_iter().collect();
+    let ry: std::collections::HashSet<_> =
+        reachable_capabilities(y, &canonical_edges).into_iter().collect();
+
+    if px == py && rx == ry {
+        return Path041Verdict::LikelyDuplicate;
+    }
+
+    let evidence_x = path_041_evidence(x, source, convergence, &canonical_edges);
+    let evidence_y = path_041_evidence(y, source, convergence, &canonical_edges);
+
+    if evidence_x.is_empty() || evidence_y.is_empty() {
+        return Path041Verdict::Insufficient;
+    }
+    if evidence_x == evidence_y {
+        return Path041Verdict::LikelyDuplicate;
+    }
+    Path041Verdict::Independent
+}
+
+#[test]
+fn path_041_candidate_a_distinct_labels_alone_certifies_a_split_label_launder() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    assert!(
+        path_041_candidate_a_labels_differ(&x, &y),
+        "REJECTED: Candidate A certifies x and y independent purely because their labels \
+         differ, with zero regard for whether they denote the same real dependency -- exactly \
+         the split-label laundering surface PATH-040/FIND-017 left unresolved"
+    );
+}
+
+#[test]
+fn path_041_a_true_independence_with_distinguishing_structure_is_confirmed() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, shared_structural_bottlenecks,
+    };
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("db_a", "x"),
+        DependencyEdge::new("db_b", "y"),
+        DependencyEdge::new("x", "audit_x"),
+        DependencyEdge::new("y", "audit_y"),
+    ];
+
+    assert!(!shared_structural_bottlenecks(&source, &edges).is_empty());
+
+    let verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &[], &edges);
+    assert_eq!(
+        verdict,
+        Path041Verdict::Independent,
+        "x and y each have their own distinct upstream feed (db_a/db_b) and their own private \
+         downstream continuation (audit_x/audit_y) -- genuinely distinguishing structure, not \
+         just distinct labels"
+    );
+}
+
+#[test]
+fn path_041_b_bare_split_label_launder_is_not_certified_independent() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole,
+    };
+
+    // The minimal shape PATH-041-A and PATH-041-B share in the mission text
+    // itself: source -> x -> m, source -> y -> m, with x and y stipulated as
+    // aliases/splits of one real dependency. Structurally this graph is
+    // IDENTICAL to what path_041_a would produce if db_a/db_b/audit_x/audit_y
+    // were removed -- which is the entire point (see FIND-018 strongest
+    // counterexample).
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let claims = vec![
+        RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-x".into()),
+        },
+        RepresentationClaim {
+            capability: y.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId("claim-y".into()),
+        },
+    ];
+
+    let verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &claims, &edges);
+    assert_eq!(
+        verdict,
+        Path041Verdict::LikelyDuplicate,
+        "distinct labels alone, with zero other distinguishing structure, must not be \
+         certified independent"
+    );
+}
+
+#[test]
+fn path_041_c_duplicate_effective_ancestry_survives_relabeling_and_depth_padding() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole,
+    };
+
+    // Different raw shapes (one branch padded with an extra representation
+    // hop under a completely different name) that canonicalize down to the
+    // EFFECTIVELY identical neighborhood PATH-041-B already rejected.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "relay_padding"),
+        DependencyEdge::new("relay_padding", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let claims = vec![RepresentationClaim {
+        capability: CapabilityId("relay_padding".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-padding".into()),
+    }];
+
+    let verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &claims, &edges);
+    assert_eq!(
+        verdict,
+        Path041Verdict::LikelyDuplicate,
+        "different raw names/depth must not be mistaken for independence once the EFFECTIVE \
+         (canonicalized) neighborhoods are identical"
+    );
+}
+
+#[test]
+fn path_041_d_shared_upstream_but_genuine_operational_divergence_is_confirmed() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // x and y share the SAME immediate (and only) upstream ancestor --
+    // no distinct-ancestry signal is available at all -- but each has its
+    // own private downstream continuation before reconverging at m.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "audit_x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "audit_y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    let verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &[], &edges);
+    assert_eq!(
+        verdict,
+        Path041Verdict::Independent,
+        "a rule that DEMANDED distinct upstream ancestry would wrongly reject this: x and y \
+         share their only ancestor (source) yet still have genuinely independent operational \
+         structure (audit_x vs audit_y) before reconverging"
+    );
+}
+
+#[test]
+fn path_041_e_disjoint_subgraphs_are_invisible_to_any_topological_corroboration() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, shared_structural_bottlenecks,
+    };
+
+    // Two differently-routed representations stipulated, at the semantic
+    // level this experiment cannot see, to be the SAME real dependency --
+    // but they never share a single graph node, so no candidate above (A,
+    // B, or the claim-based attempt in path_041_g) even has a pair of
+    // nodes to compare. This is a distinct failure mode from laundering:
+    // not a wrong answer, but no question the graph lets you pose at all.
+    let source = CapabilityId("source".into());
+    let edges = vec![
+        DependencyEdge::new("source", "p"),
+        DependencyEdge::new("p", "real_dependency_alias_1"),
+        DependencyEdge::new("source", "q"),
+        DependencyEdge::new("q", "real_dependency_alias_2"),
+    ];
+
+    assert!(
+        shared_structural_bottlenecks(&source, &edges).is_empty(),
+        "the graph never represents alias_1 and alias_2 as related at all"
+    );
+}
+
+#[test]
+fn path_041_f_harmless_representation_depth_does_not_change_either_verdict() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, RepresentationClaim, RepresentationClaimId,
+        RepresentationRole,
+    };
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+
+    // Case 1: pad the genuinely-independent path_041_a graph with an extra
+    // harmless relay on x's branch. Depth alone must not remove the
+    // Independent verdict.
+    let mut independent_edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "x_extra"),
+        DependencyEdge::new("x_extra", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("db_a", "x"),
+        DependencyEdge::new("db_b", "y"),
+        DependencyEdge::new("x", "audit_x"),
+        DependencyEdge::new("y", "audit_y"),
+    ];
+    independent_edges.reverse();
+    let independent_claims = vec![RepresentationClaim {
+        capability: CapabilityId("x_extra".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-x-extra".into()),
+    }];
+    assert_eq!(
+        path_041_candidate_b_corroborate(
+            &source,
+            &x,
+            &y,
+            &m,
+            &independent_claims,
+            &independent_edges
+        ),
+        Path041Verdict::Independent,
+        "depth padding on the genuinely independent branch must not erase its Independent verdict"
+    );
+
+    // Case 2: pad the bare split-label launder with an extra harmless relay
+    // on ONE side. Depth alone must not manufacture an Independent verdict.
+    let mut duplicate_edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "x_extra"),
+        DependencyEdge::new("x_extra", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    duplicate_edges.reverse();
+    let duplicate_claims = vec![RepresentationClaim {
+        capability: CapabilityId("x_extra".into()),
+        role: RepresentationRole::RepresentationOnly,
+        claim_id: RepresentationClaimId("claim-x-extra".into()),
+    }];
+    assert_eq!(
+        path_041_candidate_b_corroborate(&source, &x, &y, &m, &duplicate_claims, &duplicate_edges),
+        Path041Verdict::LikelyDuplicate,
+        "depth padding on ONE side of an otherwise-bare split must not manufacture an \
+         Independent verdict out of nothing"
+    );
+}
+
+#[test]
+fn path_041_g_self_derived_claim_ids_are_circular_not_independent_corroboration() {
+    use distribution_machine::measurement::{
+        CapabilityId, RepresentationClaim, RepresentationClaimId, RepresentationRole,
+    };
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+
+    // Candidate C attempt: "corroborate" x and y's independence with one
+    // RepresentationOnly claim each, each evidenced by a claim_id DERIVED
+    // FROM the very capability it is about -- i.e. each node vouches for
+    // itself. This repository has no issuer/authority concept (confirmed
+    // absent by FIND-016 observation 1) capable of telling this apart from
+    // two claims a single undisclosed actor fabricated about a stipulated
+    // single real dependency split into x/y.
+    let claims = vec![
+        RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("self-attested-by-{}", x.0)),
+        },
+        RepresentationClaim {
+            capability: y.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("self-attested-by-{}", y.0)),
+        },
+    ];
+
+    assert_ne!(claims[0].claim_id, claims[1].claim_id);
+    assert!(
+        claims[0].claim_id.0.contains(&x.0) && claims[1].claim_id.0.contains(&y.0),
+        "REJECTED: two distinct claim_ids exist -- exactly as many as PATH-039's already-\
+         rejected Candidate C (path_039_candidate_c) required -- but each is derived from the \
+         same node identity it is supposed to corroborate. Circular lineage, not independent \
+         support; verifying claim_id distinctness proves nothing here"
+    );
+}
+
+#[test]
+fn path_041_h_asymmetrical_evidence_does_not_upgrade_the_bare_branch() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // x has rich, genuine distinguishing structure; y has none at all
+    // (the bare split-label shape in isolation). Pairing y with a richly-
+    // evidenced sibling must not "borrow" x's evidence for y.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("db_a", "x"),
+        DependencyEdge::new("x", "audit_x"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+
+    let verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &[], &edges);
+    assert_eq!(
+        verdict,
+        Path041Verdict::Insufficient,
+        "y carries zero distinguishing evidence of its own; being paired with a richly-\
+         evidenced x must not silently certify y as independent too"
+    );
+}
