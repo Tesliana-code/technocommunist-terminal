@@ -8778,3 +8778,622 @@ fn path_041_h_asymmetrical_evidence_does_not_upgrade_the_bare_branch() {
          evidenced x must not silently certify y as independent too"
     );
 }
+
+// =====================================================================
+// PATH-042 -- MINIMUM EXTERNAL EVIDENCE NEEDED TO BREAK THE
+// IDENTITY-TRUTH DEADLOCK (H13)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement` or wired into any production/
+// allocation path. No cryptography or authority infrastructure is built:
+// the one "trust axiom" parameter introduced below
+// (`trusted_distinct_domains`) is a plain function argument that this
+// code never derives, verifies, or fabricates -- it exists purely to make
+// explicit exactly what PATH-042's impossibility-boundary outcome
+// requires the CALLER to already know from outside this system.
+// =====================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObserverId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedFact {
+    observer: ObserverId,
+    left: distribution_machine::measurement::CapabilityId,
+    right: distribution_machine::measurement::CapabilityId,
+    asserted_distinct: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DomainId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EvidenceEventContent {
+    subject: distribution_machine::measurement::CapabilityId,
+    origin_domain: DomainId,
+    fact_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvidenceEvent {
+    event_id: String,
+    content: EvidenceEventContent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path042Verdict {
+    Independent,
+    SameDependency,
+    Conflicted,
+    Insufficient,
+}
+
+/// A fact whose `observer` is literally derived from one of the subjects
+/// it is about contributes zero corroboration -- a node cannot vouch for
+/// its own independence (PATH-042-B).
+fn path_042_is_self_observation(fact: &ObservedFact) -> bool {
+    fact.observer.0 == fact.left.0 || fact.observer.0 == fact.right.0
+}
+
+/// Candidate B -- INDEPENDENT OBSERVER IDENTITY. Requires at least TWO
+/// DISTINCT, non-self observers to agree `x` and `y` are distinct before
+/// certifying `Independent`. A single observer establishes only "one
+/// witness asserted this," never corroboration (PATH-042-C).
+/// Disagreement among relevant observers is surfaced as `Conflicted`,
+/// never resolved (mirrors PATH-039's `RepresentationDecision::Conflicted`).
+///
+/// Deliberately does NOT verify that two distinct `ObserverId`s denote
+/// two actually-independent parties -- nothing in this experiment (or
+/// this repository) can. PATH-042-D/E show this candidate alone cannot
+/// tell two genuinely independent observers from two labels secretly
+/// controlled by one source: it merely relocates the identity question
+/// from `CapabilityId` to `ObserverId`.
+fn path_042_candidate_b_observer_corroboration(
+    x: &distribution_machine::measurement::CapabilityId,
+    y: &distribution_machine::measurement::CapabilityId,
+    facts: &[ObservedFact],
+) -> Path042Verdict {
+    use std::collections::HashSet;
+
+    let relevant: Vec<&ObservedFact> = facts
+        .iter()
+        .filter(|f| !path_042_is_self_observation(f))
+        .filter(|f| (&f.left == x && &f.right == y) || (&f.left == y && &f.right == x))
+        .collect();
+
+    if relevant.is_empty() {
+        return Path042Verdict::Insufficient;
+    }
+
+    let distinct_observers_saying_distinct: HashSet<&str> =
+        relevant.iter().filter(|f| f.asserted_distinct).map(|f| f.observer.0.as_str()).collect();
+    let distinct_observers_saying_same: HashSet<&str> = relevant
+        .iter()
+        .filter(|f| !f.asserted_distinct)
+        .map(|f| f.observer.0.as_str())
+        .collect();
+
+    if !distinct_observers_saying_distinct.is_empty() && !distinct_observers_saying_same.is_empty()
+    {
+        return Path042Verdict::Conflicted;
+    }
+    if !distinct_observers_saying_same.is_empty() {
+        return Path042Verdict::SameDependency;
+    }
+    if distinct_observers_saying_distinct.len() >= 2 {
+        return Path042Verdict::Independent;
+    }
+    Path042Verdict::Insufficient
+}
+
+/// Candidate C -- INDEPENDENT EVENT ORIGIN, structural half. Deduplicates
+/// `events` by CONTENT (subject + origin_domain + fact_kind) -- exactly
+/// the `DependencyStructuralKey` pattern this repository already uses for
+/// FIND-007 (`deduplicate_structural_dependencies`): a free-form
+/// `event_id` field is never trusted as identity on its own, so
+/// duplicating a serialized event (PATH-042-F) or replaying it under a
+/// new id (PATH-042-G) both collapse to the same single event.
+fn path_042_deduplicate_events(events: &[EvidenceEvent]) -> Vec<EvidenceEvent> {
+    use std::collections::HashMap;
+
+    let mut by_content: HashMap<EvidenceEventContent, EvidenceEvent> = HashMap::new();
+    for event in events {
+        by_content.entry(event.content.clone()).or_insert_with(|| event.clone());
+    }
+
+    let mut result: Vec<EvidenceEvent> = by_content.into_values().collect();
+    result.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    result
+}
+
+/// Candidate D -- CROSS-DOMAIN CORROBORATION. `trusted_distinct_domains`
+/// is the one deliberately exogenous input in this entire experiment: a
+/// plain `Option<(&DomainId, &DomainId)>` that this function NEVER
+/// derives, verifies, or fabricates from `events` -- it must be supplied
+/// by the caller as a fact known from OUTSIDE this analysis. Without it,
+/// two subjects backed by two different domain labels are `Insufficient`
+/// -- exactly like unverified observer distinctness, domain identity is
+/// just another self-issuable label (PATH-042-D) unless something
+/// exogenous vouches for a SPECIFIC pair. With a correct axiom, the same
+/// shape of evidence resolves to `Independent` (PATH-042-E). With an
+/// INCORRECT axiom, it resolves to exactly the same `Independent` -- the
+/// function has no way to tell the difference, which is the entire
+/// point: it can only propagate a trust assumption, never manufacture or
+/// verify one.
+fn path_042_candidate_d_cross_domain_corroboration(
+    x: &distribution_machine::measurement::CapabilityId,
+    y: &distribution_machine::measurement::CapabilityId,
+    events: &[EvidenceEvent],
+    trusted_distinct_domains: Option<(&DomainId, &DomainId)>,
+) -> Path042Verdict {
+    use std::collections::HashSet;
+
+    let deduped = path_042_deduplicate_events(events);
+
+    let domains_for = |subject: &distribution_machine::measurement::CapabilityId| -> HashSet<DomainId> {
+        deduped
+            .iter()
+            .filter(|e| &e.content.subject == subject)
+            .map(|e| e.content.origin_domain.clone())
+            .collect()
+    };
+
+    let dx = domains_for(x);
+    let dy = domains_for(y);
+
+    if dx.is_empty() || dy.is_empty() {
+        return Path042Verdict::Insufficient;
+    }
+    if !dx.is_disjoint(&dy) {
+        // x and y share at least one origin domain -- direct evidence
+        // against separation, not for it.
+        return Path042Verdict::SameDependency;
+    }
+
+    match trusted_distinct_domains {
+        None => Path042Verdict::Insufficient,
+        Some((a, b)) => {
+            let vouched = (dx.contains(a) && dy.contains(b)) || (dx.contains(b) && dy.contains(a));
+            if vouched { Path042Verdict::Independent } else { Path042Verdict::Insufficient }
+        }
+    }
+}
+
+#[test]
+fn path_042_candidate_a_claim_count_inflation_does_not_certify_independence() {
+    use distribution_machine::measurement::{
+        CapabilityId, RepresentationClaim, RepresentationClaimId, RepresentationRole,
+    };
+
+    // One real dependency split into x/y, each backed by an arbitrarily
+    // large number of distinct claim_ids -- Candidate A's metric (bare
+    // claim count) grows without bound on both sides.
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let x_claims: Vec<RepresentationClaim> = (0..50)
+        .map(|i| RepresentationClaim {
+            capability: x.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("x-claim-{i}")),
+        })
+        .collect();
+    let y_claims: Vec<RepresentationClaim> = (0..50)
+        .map(|i| RepresentationClaim {
+            capability: y.clone(),
+            role: RepresentationRole::RepresentationOnly,
+            claim_id: RepresentationClaimId(format!("y-claim-{i}")),
+        })
+        .collect();
+
+    assert_eq!(x_claims.len(), 50);
+    assert_eq!(y_claims.len(), 50);
+    // REJECTED: PATH-039-J/M already established duplicate/multiple claims
+    // do not multiply authority; 50 distinct claim_ids is the identical
+    // failure at higher volume -- claim_id carries no issuer identity
+    // (FIND-016 observation 1), so a single undisclosed actor can produce
+    // an arbitrarily large count on both sides of a real single dependency
+    // with no more effort than a loop.
+}
+
+#[test]
+fn path_042_b_self_observation_contributes_no_corroboration() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let facts = vec![
+        ObservedFact {
+            observer: ObserverId("x".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+        ObservedFact {
+            observer: ObserverId("y".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+    ];
+
+    assert_eq!(
+        path_042_candidate_b_observer_corroboration(&x, &y, &facts),
+        Path042Verdict::Insufficient,
+        "both facts are self-observations (observer == one of the subjects); circular lineage \
+         must contribute zero corroboration, not count as two agreeing witnesses"
+    );
+}
+
+#[test]
+fn path_042_c_one_observer_establishes_a_single_witness_not_corroboration() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let facts = vec![ObservedFact {
+        observer: ObserverId("obs-1".into()),
+        left: x.clone(),
+        right: y.clone(),
+        asserted_distinct: true,
+    }];
+
+    assert_eq!(
+        path_042_candidate_b_observer_corroboration(&x, &y, &facts),
+        Path042Verdict::Insufficient,
+        "exactly one non-self observer establishes only that ONE witness asserted x and y are \
+         distinct -- not corroboration. A second, independent observer is required before this \
+         candidate will certify Independent"
+    );
+}
+
+#[test]
+fn path_042_d_and_e_observer_label_distinctness_alone_cannot_tell_alias_from_genuine() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+
+    // PATH-042-D: two observer IDs, STIPULATED (by this test's own
+    // narrative, not by anything in the data) to be aliases controlled by
+    // one underlying source.
+    let alias_facts = vec![
+        ObservedFact {
+            observer: ObserverId("alias-obs-1".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+        ObservedFact {
+            observer: ObserverId("alias-obs-2".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+    ];
+
+    // PATH-042-E: two observer IDs stipulated to be genuinely independent.
+    let genuine_facts = vec![
+        ObservedFact {
+            observer: ObserverId("genuine-obs-1".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+        ObservedFact {
+            observer: ObserverId("genuine-obs-2".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+    ];
+
+    let alias_verdict = path_042_candidate_b_observer_corroboration(&x, &y, &alias_facts);
+    let genuine_verdict = path_042_candidate_b_observer_corroboration(&x, &y, &genuine_facts);
+
+    assert_eq!(alias_verdict, Path042Verdict::Independent);
+    assert_eq!(
+        alias_verdict, genuine_verdict,
+        "CENTRAL RESULT: Candidate B produces the IDENTICAL verdict for two stipulated-alias \
+         observer labels and two stipulated-genuinely-independent ones -- the data is \
+         indistinguishable in both cases, exactly PATH-041/FIND-018's topology-level \
+         impossibility restated one level up. Observer-label distinctness alone MERELY \
+         RELOCATES the identity question from CapabilityId to ObserverId; it does not answer it"
+    );
+}
+
+#[test]
+fn path_042_d_cross_domain_evidence_without_an_exogenous_axiom_stays_insufficient() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let domain_1 = DomainId("domain-1".into());
+    let domain_2 = DomainId("domain-2".into());
+    let events = vec![
+        EvidenceEvent {
+            event_id: "e1".into(),
+            content: EvidenceEventContent {
+                subject: x.clone(),
+                origin_domain: domain_1,
+                fact_kind: "observed".into(),
+            },
+        },
+        EvidenceEvent {
+            event_id: "e2".into(),
+            content: EvidenceEventContent {
+                subject: y.clone(),
+                origin_domain: domain_2,
+                fact_kind: "observed".into(),
+            },
+        },
+    ];
+
+    // Two different domain LABELS -- exactly like two different observer
+    // labels, this repository has no way to verify domain-1 and domain-2
+    // are not secretly the same underlying source (PATH-042-D).
+    assert_eq!(
+        path_042_candidate_d_cross_domain_corroboration(&x, &y, &events, None),
+        Path042Verdict::Insufficient,
+        "domain labels differ, but with no exogenous fact vouching for that difference, this is \
+         exactly as inconclusive as unverified observer distinctness"
+    );
+}
+
+#[test]
+fn path_042_e_an_explicit_exogenous_trust_axiom_is_the_minimum_that_resolves_independence() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let domain_a = DomainId("real-region-a".into());
+    let domain_b = DomainId("real-region-b".into());
+    let events = vec![
+        EvidenceEvent {
+            event_id: "e1".into(),
+            content: EvidenceEventContent {
+                subject: x.clone(),
+                origin_domain: domain_a.clone(),
+                fact_kind: "observed".into(),
+            },
+        },
+        EvidenceEvent {
+            event_id: "e2".into(),
+            content: EvidenceEventContent {
+                subject: y.clone(),
+                origin_domain: domain_b.clone(),
+                fact_kind: "observed".into(),
+            },
+        },
+    ];
+
+    // Identical DATA SHAPE to path_042_d above -- two different domain
+    // labels, one event per subject. The only difference is a fact
+    // supplied from OUTSIDE this function, never derived from `events`:
+    // the caller (standing in for an operator/researcher with real-world
+    // knowledge this system does not have) vouches that domain_a and
+    // domain_b are genuinely separate trust roots.
+    let verdict =
+        path_042_candidate_d_cross_domain_corroboration(&x, &y, &events, Some((&domain_a, &domain_b)));
+    assert_eq!(
+        verdict,
+        Path042Verdict::Independent,
+        "H13's narrowest surviving claim: given an explicit, externally-supplied, non-derived \
+         trust fact naming this SPECIFIC domain pair as genuinely distinct, cross-domain \
+         evidence resolves independence -- but the fact itself, not the domain labels, is what \
+         did the work"
+    );
+}
+
+#[test]
+fn path_042_axiom_forgery_produces_false_but_internally_consistent_confidence() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    // The SAME kind of alias domains as path_042_d, now paired with a
+    // FALSE trust axiom asserting they ARE the vouched-distinct pair.
+    let alias_domain_1 = DomainId("alias-domain-1".into());
+    let alias_domain_2 = DomainId("alias-domain-2".into());
+    let events = vec![
+        EvidenceEvent {
+            event_id: "e1".into(),
+            content: EvidenceEventContent {
+                subject: x.clone(),
+                origin_domain: alias_domain_1.clone(),
+                fact_kind: "observed".into(),
+            },
+        },
+        EvidenceEvent {
+            event_id: "e2".into(),
+            content: EvidenceEventContent {
+                subject: y.clone(),
+                origin_domain: alias_domain_2.clone(),
+                fact_kind: "observed".into(),
+            },
+        },
+    ];
+
+    let verdict = path_042_candidate_d_cross_domain_corroboration(
+        &x,
+        &y,
+        &events,
+        Some((&alias_domain_1, &alias_domain_2)),
+    );
+    assert_eq!(
+        verdict,
+        Path042Verdict::Independent,
+        "CRITICAL CAVEAT: the candidate cannot distinguish a TRUE trust axiom from a FALSE one \
+         -- supplying an incorrect axiom over two domains that are actually aliases of one \
+         source produces the exact same Independent verdict a correct axiom would. The entire \
+         correctness burden sits on whoever supplies the axiom; nothing in this experiment (or \
+         this repository) checks it"
+    );
+}
+
+#[test]
+fn path_042_f_duplicated_evidence_event_does_not_manufacture_a_second_origin() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let domain = DomainId("domain-1".into());
+    let event = EvidenceEvent {
+        event_id: "e1".into(),
+        content: EvidenceEventContent { subject: x, origin_domain: domain, fact_kind: "observed".into() },
+    };
+    let events = vec![event.clone(), event.clone(), event];
+
+    let deduped = path_042_deduplicate_events(&events);
+    assert_eq!(
+        deduped.len(),
+        1,
+        "FIND-007 consistency: literal duplicate serialization of one event must not be counted \
+         as multiple independent evidence events"
+    );
+}
+
+#[test]
+fn path_042_g_replayed_event_under_a_new_id_does_not_manufacture_new_evidence() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let domain = DomainId("domain-1".into());
+    let content = EvidenceEventContent {
+        subject: x.clone(),
+        origin_domain: domain.clone(),
+        fact_kind: "observed".into(),
+    };
+    let events = vec![
+        EvidenceEvent { event_id: "original-event".into(), content: content.clone() },
+        EvidenceEvent { event_id: "replayed-under-a-new-id".into(), content },
+    ];
+
+    let deduped = path_042_deduplicate_events(&events);
+    assert_eq!(
+        deduped.len(),
+        1,
+        "raw event_id distinctness alone must not suffice -- identical CONTENT replayed under a \
+         fresh id is the same evidence event, not a second one"
+    );
+
+    // Contrast: genuinely different content (different fact_kind) is NOT
+    // collapsed -- the dedup is content-keyed, not blanket-suppressing.
+    let genuinely_different = EvidenceEvent {
+        event_id: "another-event".into(),
+        content: EvidenceEventContent { subject: x, origin_domain: domain, fact_kind: "provisioned".into() },
+    };
+    let mut all = deduped;
+    all.push(genuinely_different);
+    assert_eq!(path_042_deduplicate_events(&all).len(), 2);
+}
+
+#[test]
+fn path_042_h_cross_domain_evidence_adds_a_new_axis_but_not_new_certainty_by_itself() {
+    use distribution_machine::measurement::CapabilityId;
+
+    // Topology (`DependencyEdge`/`CapabilityId`) has no concept of
+    // "domain" at all -- it cannot even represent the question
+    // cross-domain evidence poses, let alone answer it.
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let domain_1 = DomainId("domain-1".into());
+    let domain_2 = DomainId("domain-2".into());
+    let events = vec![
+        EvidenceEvent {
+            event_id: "e1".into(),
+            content: EvidenceEventContent {
+                subject: x.clone(),
+                origin_domain: domain_1,
+                fact_kind: "observed".into(),
+            },
+        },
+        EvidenceEvent {
+            event_id: "e2".into(),
+            content: EvidenceEventContent {
+                subject: y.clone(),
+                origin_domain: domain_2,
+                fact_kind: "observed".into(),
+            },
+        },
+    ];
+
+    // New DATA exists on an axis topology cannot represent -- but without
+    // an exogenous axiom it does not cross into new CERTAINTY: the
+    // verdict is identical to having no evidence whatsoever.
+    assert_eq!(
+        path_042_candidate_d_cross_domain_corroboration(&x, &y, &events, None),
+        Path042Verdict::Insufficient
+    );
+    assert_eq!(
+        path_042_candidate_d_cross_domain_corroboration(&x, &y, &[], None),
+        Path042Verdict::Insufficient,
+        "cross-domain evidence (without an axiom) and NO evidence at all produce the identical \
+         verdict -- the new axis changes what CAN be represented, not what CAN be concluded"
+    );
+}
+
+#[test]
+fn path_042_i_disagreement_between_independent_origins_is_reported_not_resolved() {
+    use distribution_machine::measurement::CapabilityId;
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let facts = vec![
+        ObservedFact {
+            observer: ObserverId("obs-1".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: true,
+        },
+        ObservedFact {
+            observer: ObserverId("obs-2".into()),
+            left: x.clone(),
+            right: y.clone(),
+            asserted_distinct: false,
+        },
+    ];
+
+    assert_eq!(
+        path_042_candidate_b_observer_corroboration(&x, &y, &facts),
+        Path042Verdict::Conflicted,
+        "two non-self observers disagree about whether x and y are distinct -- this must \
+         surface as Conflicted, never silently resolved toward either answer"
+    );
+}
+
+#[test]
+fn path_042_j_strong_topology_without_any_lineage_stays_unresolved_not_independent() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // Reuse PATH-041's richest "genuinely independent"-looking topology
+    // (path_041_a's graph): distinct ancestry, distinct side-effects.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let edges = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("db_a", "x"),
+        DependencyEdge::new("db_b", "y"),
+        DependencyEdge::new("x", "audit_x"),
+        DependencyEdge::new("y", "audit_y"),
+    ];
+
+    let structural_verdict = path_041_candidate_b_corroborate(&source, &x, &y, &m, &[], &edges);
+    assert_eq!(structural_verdict, Path041Verdict::Independent);
+
+    // But PATH-042's evidentiary layer has been given NOTHING -- no
+    // ObservedFact, no EvidenceEvent, at all.
+    let no_facts: Vec<ObservedFact> = vec![];
+    let no_events: Vec<EvidenceEvent> = vec![];
+    assert_eq!(path_042_candidate_b_observer_corroboration(&x, &y, &no_facts), Path042Verdict::Insufficient);
+    assert_eq!(
+        path_042_candidate_d_cross_domain_corroboration(&x, &y, &no_events, None),
+        Path042Verdict::Insufficient,
+        "strong STRUCTURAL corroboration (FIND-018) must not be silently upgraded into \
+         evidentiary confirmation -- 'structurally plausible' and 'independently evidenced' \
+         remain distinct claims, and missing evidence stays missing, not magically independent"
+    );
+}
