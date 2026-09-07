@@ -14,6 +14,10 @@ pub fn allocate_contribution_pool(
     weights: &ContributionWeights,
     contribution_pool: f64,
 ) -> Result<Vec<ContributionAllocation>, &'static str> {
+    if !contribution_pool.is_finite() {
+        return Err("contribution pool must be finite");
+    }
+
     if contribution_pool < 0.0 {
         return Err("contribution pool cannot be negative");
     }

@@ -12330,31 +12330,26 @@ fn path_046_l_zero_total_worlds_are_handled_explicitly_not_invented() {
 
 #[test]
 fn path_046_m_negative_and_nan_infinity_domain_behavior() {
-    // Negative: rejected by construction (validated).
+    // HISTORICAL NOTE: this test originally demonstrated that NaN/
+    // Infinity were NOT rejected by production and silently poisoned
+    // every contributor's share inside Ok(...). PATH-046.5 fixed that
+    // defect (finite validation added to `ContributionWeights::
+    // validate`, `ContributionFactors::validate`,
+    // `ContributionEvent::calculate`, and `allocate_contribution_pool`).
+    // This test now documents the FIXED behavior; see PATH-046.5's
+    // dedicated `path_046_5_a*` tests below for the full required suite.
+
+    // Negative: rejected by construction (validated) -- unchanged.
     let negative = path_046_allocate(&[("A", -5.0), ("B", 10.0)], 100.0);
     assert_eq!(negative, Err("base work value cannot be negative"), "negative contribution is impossible by construction -- rejected before normalization");
 
-    // NaN: NOT caught by `base_work_value < 0.0` (NaN comparisons are
-    // always false in IEEE-754) -- confirmed against REAL production.
+    // NaN: now explicitly rejected before normalization.
     let nan_result = path_046_allocate(&[("A", f64::NAN), ("B", 10.0)], 100.0);
-    assert!(nan_result.is_ok(), "production does NOT reject NaN input -- this is a confirmed gap, not an assumption");
-    let nan_allocations = nan_result.unwrap();
-    assert!(
-        nan_allocations.iter().all(|a| a.normalized_share.is_nan()),
-        "a single NaN contributor POISONS EVERY contributor's normalized_share with NaN, inside \
-         an Ok(...) result rather than surfacing as an error -- B's share becomes NaN too, even \
-         though B's own input was perfectly valid"
-    );
+    assert_eq!(nan_result, Err("base work value must be finite"), "NaN is now rejected explicitly, not silently propagated");
 
-    // Infinity: also not rejected (no upper bound check at all).
+    // Infinity: also now explicitly rejected.
     let inf_result = path_046_allocate(&[("A", f64::INFINITY), ("B", 10.0)], 100.0);
-    assert!(inf_result.is_ok());
-    let inf_allocations = inf_result.unwrap();
-    assert!(
-        path_046_share_of(&inf_allocations, "A").is_nan(),
-        "infinity/infinity for the infinite contributor's own share is NaN"
-    );
-    assert_eq!(path_046_share_of(&inf_allocations, "B"), 0.0, "a finite contributor's share against an infinite total silently becomes exactly 0.0, not an error");
+    assert_eq!(inf_result, Err("base work value must be finite"));
 }
 
 #[test]
@@ -12517,4 +12512,292 @@ fn path_046_compositional_question_separately_derived_bounds_do_not_compose_into
          joint compatibility relation (the actual joint admissible vector set); without it, \
          composition is REJECTED, not merely unproven"
     );
+}
+
+// =====================================================================
+// PATH-046.5 -- PRODUCTION HARDENING AT THE ALLOCATION INPUT BOUNDARY
+//
+// Part A tests exercise the REAL, now-patched production functions
+// (`ContributionEvent::calculate`, `ContributionWeights::validate`,
+// `ContributionFactors::validate`, `allocate_contribution_pool`) --
+// this is a production remediation mission, not test-local machinery.
+//
+// Part B is a CASE 3 finding: no authoritative event identity exists
+// for `ContributionEvent` (inventory below), so NO deduplication was
+// implemented. The block ends with an executable impossibility
+// demonstration instead of B1-B6 (which require CASE 1/2).
+//
+// IDENTITY INVENTORY (read before Part B):
+// `ContributionEvent { contributor_id: String, contribution_id: String,
+// base_work_value: f64, factors: ContributionFactors }`.
+// - `contribution_id` is a bare, caller-supplied `String` with NO
+//   documentation, NO uniqueness validation anywhere in
+//   `distribution.rs`/`contribution.rs`, and NO special handling on
+//   repetition -- `allocate_contribution_pool` never inspects it except
+//   to copy it into the output `ContributionAllocation`. Every existing
+//   call site (production tests) uses it purely as a human-readable
+//   label ("capability-a", "unverified-claim", ...).
+// - No `event_id`, `idempot*`, `source_id`, `provenance`, `sequence`,
+//   `request_id`, or `transaction` concept exists anywhere in
+//   `contribution.rs`, `distribution.rs`, `capital.rs`, or
+//   `stewardship.rs` (grepped; zero hits outside this comment).
+// - This is the SAME shape FIND-016/019 already identified for
+//   `RepresentationClaimId`/`DependencyId`: a bare, self-issued string
+//   with no issuer/authority semantics -- CASE 3 (no authoritative
+//   identity), not CASE 1 or 2. Inventing dedup-by-`contribution_id` (or
+//   any other field/combination) would be exactly the "we deduped
+//   matching payloads because it seemed reasonable" outcome this
+//   mission explicitly forbids.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Part A -- non-finite value remediation (REQUIRED, FIXED).
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_046_5_a1_nan_contribution_is_rejected() {
+    let result = path_046_allocate(&[("A", f64::NAN), ("B", 10.0)], 100.0);
+    assert_eq!(result, Err("base work value must be finite"), "NaN must be rejected explicitly, before normalization");
+}
+
+#[test]
+fn path_046_5_a2_positive_infinity_is_rejected() {
+    let result = path_046_allocate(&[("A", f64::INFINITY), ("B", 10.0)], 100.0);
+    assert_eq!(result, Err("base work value must be finite"));
+}
+
+#[test]
+fn path_046_5_a3_negative_infinity_is_rejected() {
+    let result = path_046_allocate(&[("A", f64::NEG_INFINITY), ("B", 10.0)], 100.0);
+    // -Infinity is caught by the finite check before the negativity
+    // check ever runs -- same error, confirmed explicitly rather than
+    // assumed.
+    assert_eq!(result, Err("base work value must be finite"));
+}
+
+#[test]
+fn path_046_5_a4_valid_zero_remains_legal() {
+    // Zero base_work_value among other positive contributors: legal,
+    // contributes exactly 0 share.
+    let allocations = path_046_allocate(&[("A", 0.0), ("B", 10.0)], 100.0).unwrap();
+    assert_eq!(path_046_share_of(&allocations, "A"), 0.0);
+    assert!((path_046_share_of(&allocations, "B") - 1.0).abs() < 1e-9);
+
+    // All-zero + positive pool: existing zero-total policy unchanged
+    // (still an explicit Err, not affected by the finite patch).
+    let all_zero_positive_pool = path_046_allocate(&[("A", 0.0), ("B", 0.0)], 100.0);
+    assert_eq!(all_zero_positive_pool, Err("cannot allocate a positive contribution pool with zero verified contribution"));
+
+    // All-zero + zero pool: existing empty-vec policy unchanged.
+    let all_zero_zero_pool = path_046_allocate(&[("A", 0.0), ("B", 0.0)], 0.0).unwrap();
+    assert!(all_zero_zero_pool.is_empty());
+}
+
+#[test]
+fn path_046_5_a5_valid_finite_behavior_is_unchanged() {
+    // Identical to the pre-patch `path_046_a` exact-control result --
+    // backward compatibility check.
+    let allocations = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 100.0).unwrap();
+    assert!((path_046_share_of(&allocations, "A") - 0.4).abs() < 1e-9);
+    assert!((path_046_share_of(&allocations, "B") - 0.3).abs() < 1e-9);
+    assert!((path_046_share_of(&allocations, "C") - 0.3).abs() < 1e-9);
+    let total: f64 = allocations.iter().map(|a| a.allocated_amount).sum();
+    assert!((total - 100.0).abs() < 1e-9);
+}
+
+#[test]
+fn path_046_5_a6_mixed_valid_and_non_finite_fails_atomically() {
+    // One NaN contributor among otherwise-valid contributors: the WHOLE
+    // operation fails -- no partial/poisoned allocation vector.
+    let result = path_046_allocate(&[("A", 40.0), ("B", f64::NAN), ("C", 30.0)], 100.0);
+    assert_eq!(result, Err("base work value must be finite"));
+
+    // Also verify at the boundary: NaN weights/factors are caught too
+    // (the same finite patch applied to `ContributionWeights::validate`
+    // and `ContributionFactors::validate`), not just base_work_value.
+    let events = path_046_events(&[("A", 40.0), ("B", 30.0)]);
+    let mut nan_weights = path_046_weights();
+    nan_weights.criticality = f64::NAN;
+    let weights_result = distribution_machine::distribution::allocate_contribution_pool(&events, &nan_weights, 100.0);
+    assert_eq!(weights_result, Err("contribution weights must be finite"));
+
+    let mut nan_factor_events = events.clone();
+    nan_factor_events[0].factors.evidence_confidence = f64::NAN;
+    let factors_result = distribution_machine::distribution::allocate_contribution_pool(&nan_factor_events, &path_046_weights(), 100.0);
+    assert_eq!(factors_result, Err("contribution factors must be finite"));
+
+    // A NaN/Infinite pool is rejected too (allocated_amount = pool *
+    // share would otherwise be poisoned even with perfectly finite
+    // shares).
+    let pool_result = path_046_allocate(&[("A", 40.0), ("B", 60.0)], f64::NAN);
+    assert_eq!(pool_result, Err("contribution pool must be finite"));
+    let inf_pool_result = path_046_allocate(&[("A", 40.0), ("B", 60.0)], f64::INFINITY);
+    assert_eq!(inf_pool_result, Err("contribution pool must be finite"));
+}
+
+#[test]
+fn path_046_5_a7_no_successful_allocation_contains_non_finite_shares() {
+    let allocations = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 100.0).unwrap();
+    for allocation in &allocations {
+        assert!(allocation.normalized_share.is_finite(), "share for {} must be finite", allocation.contributor_id);
+        assert!(allocation.allocated_amount.is_finite(), "amount for {} must be finite", allocation.contributor_id);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Backward-compatibility spot checks (scale invariance, ordering,
+// contributor set effects) re-run against the PATCHED production
+// function, mirroring PATH-046-O/P/N exactly to confirm the finite
+// patch changed nothing about valid economic behavior.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_046_5_backward_compatible_scale_invariance_ordering_and_conservation() {
+    let base = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 100.0).unwrap();
+    let scaled = path_046_allocate(&[("A", 40.0 * 3.7), ("B", 30.0 * 3.7), ("C", 30.0 * 3.7)], 100.0).unwrap();
+    for id in ["A", "B", "C"] {
+        assert!((path_046_share_of(&base, id) - path_046_share_of(&scaled, id)).abs() < 1e-9, "scale invariance unchanged");
+    }
+
+    let ordered = path_046_allocate(&[("low", 0.1), ("high", 0.9)], 100.0).unwrap();
+    assert_eq!(ordered[0].contributor_id, "low", "input-order output unchanged");
+    assert_eq!(ordered[1].contributor_id, "high");
+
+    let total: f64 = base.iter().map(|a| a.allocated_amount).sum();
+    assert!((total - 100.0).abs() < 1e-9, "conservation epsilon-semantics unchanged");
+}
+
+// ---------------------------------------------------------------------
+// Part B -- replay/duplicate remediation: CASE 3, proven blocker.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_046_5_replay_identity_impossibility() {
+    // Construct ONE ContributionEvent value.
+    let event = distribution_machine::contribution::ContributionEvent {
+        contributor_id: "alice".to_string(),
+        contribution_id: "code-review".to_string(),
+        base_work_value: 40.0,
+        factors: distribution_machine::contribution::ContributionFactors {
+            responsibility: 1.0,
+            criticality: 1.0,
+            deal_impact: 1.0,
+            stewardship: 1.0,
+            dependency_reach: 1.0,
+            evidence_confidence: 1.0,
+        },
+    };
+
+    // WORLD A: one real economic event, delivered twice (a transport
+    // replay -- e.g. a retried network call).
+    let world_a_replay = vec![event.clone(), event.clone()];
+
+    // WORLD B: two genuinely distinct real economic events -- e.g. two
+    // different reviewers each independently logging a $40 code review,
+    // where both intake systems happened to generate the same
+    // human-readable `contribution_id` label ("code-review") and the
+    // same `base_work_value`.
+    let world_b_two_legitimate_events = vec![event.clone(), event.clone()];
+
+    // The current `ContributionEvent` representation is BYTE-IDENTICAL
+    // between the two worlds -- there is no field anywhere in this type
+    // that distinguishes "the same occurrence, observed twice" from
+    // "two different occurrences that happen to match."
+    assert_eq!(world_a_replay, world_b_two_legitimate_events, "the two worlds are represented identically");
+
+    // Consequently, `allocate_contribution_pool` -- or ANY deterministic
+    // function over `&[ContributionEvent]` -- computes the exact same
+    // total contribution for both worlds, even though the economically
+    // CORRECT total differs: WORLD A's true economic contribution is
+    // 40 (one event, replayed), WORLD B's true economic contribution is
+    // 80 (two independent events).
+    let events_a = path_046_events(&[("B", 60.0)])
+        .into_iter()
+        .chain(world_a_replay.clone())
+        .collect::<Vec<_>>();
+    let events_b = path_046_events(&[("B", 60.0)])
+        .into_iter()
+        .chain(world_b_two_legitimate_events.clone())
+        .collect::<Vec<_>>();
+    let alloc_a = distribution_machine::distribution::allocate_contribution_pool(&events_a, &path_046_weights(), 1.0).unwrap();
+    let alloc_b = distribution_machine::distribution::allocate_contribution_pool(&events_b, &path_046_weights(), 1.0).unwrap();
+    let alice_share_a: f64 = alloc_a.iter().filter(|a| a.contributor_id == "alice").map(|a| a.normalized_share).sum();
+    let alice_share_b: f64 = alloc_b.iter().filter(|a| a.contributor_id == "alice").map(|a| a.normalized_share).sum();
+    assert_eq!(
+        alice_share_a, alice_share_b,
+        "PROOF: given byte-identical input, ANY deterministic function -- including production's \
+         actual `allocate_contribution_pool` -- necessarily produces the identical result for \
+         both worlds. No dedup function could correctly collapse WORLD A to alice's true \
+         contribution (40, one event replayed) while correctly preserving WORLD B's true \
+         contribution (80, two legitimate events) from this representation alone, because both \
+         worlds present the identical input. This is FIND-018/019's central-obstruction pattern \
+         (identical representation, opposite required ground truth), recurring at the allocation \
+         input boundary. No heuristic is introduced to paper over this."
+    );
+
+    // Per this mission's forbidden-key list and CASE 3 doctrine: no
+    // deduplication was implemented anywhere in production for this
+    // mission. `contribution_id` remains a bare, unvalidated, non-
+    // authoritative label -- exactly as before.
+}
+
+/// PATH-046.5-B2 analogue, run against CASE 3's conclusion rather than
+/// a dedup implementation: two events with the SAME contributor and
+/// VALUE but genuinely DIFFERENT `contribution_id`s must both survive
+/// (this already holds today, since no dedup exists at all -- but it is
+/// the one property any FUTURE identity-based fix must preserve, so it
+/// is pinned here as a regression guard).
+#[test]
+fn path_046_5_distinct_identical_valued_events_both_survive() {
+    // Two DISTINCT contribution events for the SAME contributor (alice),
+    // with different `contribution_id`s but identical `base_work_value`
+    // -- constructed explicitly, not via `path_046_events` (which
+    // derives `contribution_id` from `contributor_id` and so cannot
+    // express two events for one contributor).
+    let neutral_factors = distribution_machine::contribution::ContributionFactors {
+        responsibility: 1.0,
+        criticality: 1.0,
+        deal_impact: 1.0,
+        stewardship: 1.0,
+        dependency_reach: 1.0,
+        evidence_confidence: 1.0,
+    };
+
+    let events = vec![
+        distribution_machine::contribution::ContributionEvent {
+            contributor_id: "alice".to_string(),
+            contribution_id: "review-1".to_string(),
+            base_work_value: 40.0,
+            factors: neutral_factors,
+        },
+        distribution_machine::contribution::ContributionEvent {
+            contributor_id: "alice".to_string(),
+            contribution_id: "review-2".to_string(),
+            base_work_value: 40.0,
+            factors: neutral_factors,
+        },
+        distribution_machine::contribution::ContributionEvent {
+            contributor_id: "bob".to_string(),
+            contribution_id: "bob-work".to_string(),
+            base_work_value: 20.0,
+            factors: neutral_factors,
+        },
+    ];
+
+    let allocations = distribution_machine::distribution::allocate_contribution_pool(&events, &path_046_weights(), 1.0).unwrap();
+
+    let total: f64 = allocations.iter().map(|a| a.normalized_share).sum();
+    assert!((total - 1.0).abs() < 1e-9);
+
+    let alice_share: f64 = allocations.iter().filter(|a| a.contributor_id == "alice").map(|a| a.normalized_share).sum();
+    let bob_share: f64 = allocations.iter().filter(|a| a.contributor_id == "bob").map(|a| a.normalized_share).sum();
+
+    assert!(
+        (alice_share - 0.8).abs() < 1e-9,
+        "two genuinely distinct, identically-valued contributions from the SAME contributor must \
+         both count -- alice's summed share (40+40=80 of 100) is 0.8, not 0.4 -- this is the \
+         property FIND-024's proposed identity contract must preserve; it must never be \
+         sacrificed to make replay protection easier"
+    );
+    assert!((bob_share - 0.2).abs() < 1e-9);
 }

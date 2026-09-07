@@ -15,6 +15,10 @@ impl ContributionWeights {
             self.dependency_reach,
         ];
 
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("contribution weights must be finite");
+        }
+
         if values.iter().any(|value| *value < 0.0 || *value > 1.0) {
             return Err("contribution weights must be between 0.0 and 1.0");
         }
@@ -50,6 +54,10 @@ impl ContributionFactors {
             self.evidence_confidence,
         ];
 
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("contribution factors must be finite");
+        }
+
         if values.iter().any(|value| *value < 0.0 || *value > 1.0) {
             return Err("contribution factors must be between 0.0 and 1.0");
         }
@@ -79,6 +87,10 @@ impl ContributionEvent {
     ) -> Result<ContributionScore, &'static str> {
         weights.validate()?;
         self.factors.validate()?;
+
+        if !self.base_work_value.is_finite() {
+            return Err("base work value must be finite");
+        }
 
         if self.base_work_value < 0.0 {
             return Err("base work value cannot be negative");
