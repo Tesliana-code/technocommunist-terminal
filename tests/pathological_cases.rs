@@ -9397,3 +9397,751 @@ fn path_042_j_strong_topology_without_any_lineage_stays_unresolved_not_independe
          remain distinct claims, and missing evidence stays missing, not magically independent"
     );
 }
+
+// =====================================================================
+// PATH-043 -- UNCERTAINTY PROPAGATION WITHOUT FALSE PRECISION (H14)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement` or wired into any production/
+// allocation path. Builds on FIND-018/FIND-019: whether two admissible
+// "worlds" (concrete graphs) are the true one cannot be resolved by any
+// evidence primitive this repository has -- PATH-043 does NOT attempt to
+// resolve that question again (explicitly out of scope). It asks
+// instead what the MEASUREMENT LAYER may honestly report given that the
+// ambiguity exists and is not going to be resolved.
+// =====================================================================
+
+/// Why more than one admissible world might exist for a query, if it
+/// turns out the queried value actually differs across them. Never a
+/// probability, never a confidence coefficient -- see `Measured` below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path043State {
+    /// Every admissible world produces the same value, OR there is no
+    /// relevant ambiguity at all.
+    Supported,
+    /// Admissible worlds disagree and nothing grounded contradicts
+    /// anything else -- missing evidence, not conflicting evidence.
+    Unresolved,
+    /// Admissible worlds disagree AND at least two distinct, grounded,
+    /// non-self-derived evidence origins actively assert incompatible
+    /// facts about the SAME relation.
+    Conflicted,
+}
+
+/// Candidate D -- the smallest representation that survives attack in
+/// this experiment: a structural lower/upper bound (equal, when exact)
+/// carried alongside an explicit epistemic tag. `lower`/`upper` are the
+/// minimum/maximum value the queried measurement takes across every
+/// world this experiment currently considers admissible. `state` records
+/// WHY they might differ -- it is never multiplied into the numbers, and
+/// no probability is invented anywhere in this type or the functions
+/// that build it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Measured {
+    lower: usize,
+    upper: usize,
+    state: Path043State,
+}
+
+impl Measured {
+    fn is_exact(&self) -> bool {
+        self.lower == self.upper
+    }
+}
+
+/// Builds a [`Measured`] from the queried value observed in every
+/// admissible world. If every world agrees, the result collapses to
+/// `Supported`/exact regardless of `ambient_state` -- this is what makes
+/// uncertainty propagation RELEVANCE-SENSITIVE (PATH-043-C): a fact can
+/// be unresolved or conflicted elsewhere in the graph and it will never
+/// reach this function's output unless it actually moves the number
+/// being asked about here.
+fn path_043_from_world_values(values: &[usize], ambient_state: Path043State) -> Measured {
+    let lower = *values.iter().min().expect("at least one admissible world");
+    let upper = *values.iter().max().expect("at least one admissible world");
+    let state = if lower == upper { Path043State::Supported } else { ambient_state };
+    Measured { lower, upper, state }
+}
+
+/// Computes a [`Measured`] "dependency reach from `source`" result across
+/// every admissible world in `worlds`. Each world is canonicalized first
+/// via the UNMODIFIED production `canonicalize_pure_relays` (`protected`
+/// covers every node this query actually cares about, e.g. `source`,
+/// `x`, `y`, the convergence node) so harmless RepresentationOnly relay
+/// padding inserted into a world cannot change the result (PATH-043-J) --
+/// this reuses FIND-017's already-established depth-invariance rather
+/// than reinventing it.
+fn path_043_measure_reach(
+    source: &distribution_machine::measurement::CapabilityId,
+    protected: &[distribution_machine::measurement::CapabilityId],
+    worlds: &[Vec<distribution_machine::measurement::DependencyEdge>],
+    ambient_state: Path043State,
+) -> Measured {
+    use distribution_machine::measurement::{canonicalize_pure_relays, reachable_capabilities};
+
+    let values: Vec<usize> = worlds
+        .iter()
+        .map(|edges| {
+            let (canonical, _provenance) = canonicalize_pure_relays(source, protected, edges);
+            reachable_capabilities(source, &canonical).len()
+        })
+        .collect();
+
+    path_043_from_world_values(&values, ambient_state)
+}
+
+/// Rewrites every occurrence of `alias` to `canonical` in `edges` --
+/// the "x and y are the same real dependency" admissible world, built by
+/// literally merging the two labels.
+fn path_043_collapse_alias(
+    edges: &[distribution_machine::measurement::DependencyEdge],
+    alias: &distribution_machine::measurement::CapabilityId,
+    canonical: &distribution_machine::measurement::CapabilityId,
+) -> Vec<distribution_machine::measurement::DependencyEdge> {
+    edges
+        .iter()
+        .map(|e| distribution_machine::measurement::DependencyEdge {
+            source: if &e.source == alias { canonical.clone() } else { e.source.clone() },
+            target: if &e.target == alias { canonical.clone() } else { e.target.clone() },
+        })
+        .collect()
+}
+
+/// Composes two independently-derived [`Measured`] values into a larger
+/// structural metric via interval arithmetic (naive sum). Deliberately
+/// does NOT recompute a shared world set -- it only has each input's own
+/// bounds and state to work with, exactly like a real caller composing
+/// two already-published measurements. See `path_043_l_*` for why this
+/// must never be narrower than the truth, only ever as wide or wider.
+fn path_043_compose_sum(a: Measured, b: Measured) -> Measured {
+    let lower = a.lower + b.lower;
+    let upper = a.upper + b.upper;
+
+    let worst = match (a.state, b.state) {
+        (Path043State::Conflicted, _) | (_, Path043State::Conflicted) => Path043State::Conflicted,
+        (Path043State::Unresolved, _) | (_, Path043State::Unresolved) => Path043State::Unresolved,
+        _ => Path043State::Supported,
+    };
+
+    let state = if lower == upper { Path043State::Supported } else { worst };
+    Measured { lower, upper, state }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path043AliasAssertion {
+    SameAs,
+    Distinct,
+}
+
+/// Raw, possibly-duplicated, possibly-replayed, possibly-self-derived
+/// alias evidence -- test-local, mirrors PATH-042's `EvidenceEvent`
+/// shape exactly (free-form `event_id`, content-addressed everything
+/// else).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path043AliasEvent {
+    event_id: String,
+    origin: String,
+    a: distribution_machine::measurement::CapabilityId,
+    b: distribution_machine::measurement::CapabilityId,
+    asserted: Path043AliasAssertion,
+}
+
+/// Content-addressed dedup, discarding `event_id` -- direct transplant
+/// of the FIND-007 / PATH-042 Candidate C pattern: a free-form event id
+/// is never trusted as identity, so literal duplicate serialization
+/// (PATH-043-H) and replay under a fresh id (PATH-043-I) both collapse
+/// to the same single event.
+fn path_043_deduplicate_alias_events(events: &[Path043AliasEvent]) -> Vec<Path043AliasEvent> {
+    use std::collections::HashMap;
+
+    #[derive(PartialEq, Eq, Hash)]
+    struct ContentKey {
+        origin: String,
+        a: String,
+        b: String,
+        same_as: bool,
+    }
+
+    let mut by_content: HashMap<ContentKey, Path043AliasEvent> = HashMap::new();
+    for event in events {
+        let key = ContentKey {
+            origin: event.origin.clone(),
+            a: event.a.0.clone(),
+            b: event.b.0.clone(),
+            same_as: matches!(event.asserted, Path043AliasAssertion::SameAs),
+        };
+        by_content.entry(key).or_insert_with(|| event.clone());
+    }
+
+    let mut result: Vec<Path043AliasEvent> = by_content.into_values().collect();
+    result.sort_by(|x, y| x.event_id.cmp(&y.event_id));
+    result
+}
+
+/// An origin literally derived from one of the two subjects it is
+/// making a claim about contributes zero corroboration -- mirrors
+/// PATH-042-B's self-observation filter. Covers PATH-043-K's
+/// "self-derived" laundering ingredient.
+fn path_043_is_self_derived(event: &Path043AliasEvent) -> bool {
+    event.origin == event.a.0 || event.origin == event.b.0
+}
+
+/// Determines WHY (if at all) more than one world remains admissible for
+/// the identity of `a`/`b`, from raw alias evidence. Deliberately does
+/// NOT attempt to resolve which world is true -- per FIND-019 and this
+/// mission's own non-goals, nothing in this repository can, and
+/// reopening that question is explicitly out of scope. A single
+/// grounded, uncontested assertion (no matter how many times duplicated
+/// or replayed -- PATH-043-H/I/K) is NOT enough to collapse the
+/// ambiguity to `Supported`: only a genuine two-sided disagreement
+/// between distinct grounded (non-self-derived) origins is distinguished
+/// at all, and even then only as `Conflicted`, never resolved in either
+/// direction (PATH-043-F). Zero relevant evidence is `Unresolved`, never
+/// silently treated as "distinct" (PATH-043-G).
+fn path_043_relation_state(
+    a: &distribution_machine::measurement::CapabilityId,
+    b: &distribution_machine::measurement::CapabilityId,
+    events: &[Path043AliasEvent],
+) -> Path043State {
+    let deduped = path_043_deduplicate_alias_events(events);
+
+    let relevant: Vec<&Path043AliasEvent> = deduped
+        .iter()
+        .filter(|e| !path_043_is_self_derived(e))
+        .filter(|e| (&e.a == a && &e.b == b) || (&e.a == b && &e.b == a))
+        .collect();
+
+    let says_same = relevant.iter().any(|e| e.asserted == Path043AliasAssertion::SameAs);
+    let says_distinct = relevant.iter().any(|e| e.asserted == Path043AliasAssertion::Distinct);
+
+    if says_same && says_distinct {
+        return Path043State::Conflicted;
+    }
+
+    Path043State::Unresolved
+}
+
+// ---------------------------------------------------------------------
+// Candidate attacks (A, B, C) -- required before Candidate D is trusted.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_043_candidate_a_forced_scalar_depends_on_an_unverified_representation_assumption() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, reachable_capabilities};
+
+    // Candidate A: compute directly from whatever graph happens to be
+    // materialized, and ignore that a second, equally admissible world
+    // exists. FIND-018/019's own minimal shape.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+
+    let forced_scalar = reachable_capabilities(&source, &world_independent).len();
+    let value_in_the_other_admissible_world = reachable_capabilities(&source, &world_alias).len();
+
+    assert_ne!(
+        forced_scalar, value_in_the_other_admissible_world,
+        "Candidate A reports an exact dependency_reach = {forced_scalar} that LOOKS precise \
+         but is silently conditional on an unverified assumption (x and y are independent); \
+         the identical evidence admits a second world where the true value is \
+         {value_in_the_other_admissible_world}, and Candidate A has no way to represent that \
+         this happened at all"
+    );
+}
+
+#[test]
+fn path_043_candidate_b_blanket_unknown_discards_provable_structure() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // Candidate B: "if any relevant unresolved fact exists, return
+    // Unknown/None." Attacked with PATH-043-D's shape: worlds disagree,
+    // but every world still establishes a real minimum.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let z = CapabilityId("z".into());
+    let w = CapabilityId("w".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("source", "z"),
+        DependencyEdge::new("z", "w"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+
+    // Candidate B, applied literally: relevant ambiguity exists (x/y),
+    // therefore the whole query collapses to nothing at all.
+    let candidate_b_result: Option<usize> = None;
+    assert!(candidate_b_result.is_none(), "Candidate B discards everything once any ambiguity exists");
+
+    let measured = path_043_measure_reach(
+        &source,
+        &[source.clone(), x.clone(), y.clone(), m.clone(), z.clone(), w.clone()],
+        &[world_independent, world_alias],
+        Path043State::Unresolved,
+    );
+
+    assert!(
+        measured.lower > 0,
+        "Candidate D preserves a provable minimum ({}) that Candidate B's blanket Unknown \
+         would have discarded entirely, even though that minimum is true in EVERY admissible \
+         world",
+        measured.lower
+    );
+}
+
+#[test]
+fn path_043_candidate_c_bounds_alone_conflate_unresolved_with_conflicted() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone()];
+
+    let unresolved_case = path_043_measure_reach(
+        &source,
+        &protected,
+        &[world_independent.clone(), world_alias.clone()],
+        Path043State::Unresolved,
+    );
+    let conflicted_case = path_043_measure_reach(
+        &source,
+        &protected,
+        &[world_independent, world_alias],
+        Path043State::Conflicted,
+    );
+
+    // Candidate C -- bounds only, epistemic state discarded.
+    struct BoundsOnly {
+        lower: usize,
+        upper: usize,
+    }
+    let c_unresolved = BoundsOnly { lower: unresolved_case.lower, upper: unresolved_case.upper };
+    let c_conflicted = BoundsOnly { lower: conflicted_case.lower, upper: conflicted_case.upper };
+
+    assert_eq!(c_unresolved.lower, c_conflicted.lower);
+    assert_eq!(c_unresolved.upper, c_conflicted.upper);
+    assert_ne!(
+        unresolved_case.state, conflicted_case.state,
+        "Candidate D distinguishes 'missing evidence, honest ambiguity' from 'two grounded \
+         origins actively disagree'; Candidate C's bounds-only representation cannot -- both \
+         collapse to the identical {{lower, upper}} pair, even though a Conflicted result \
+         must never be silently trusted the way an Unresolved one safely can be"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PATH-043-A through L -- required pathological cases.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_043_a_fully_supported_control_stays_exact() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // No relevant unresolved identity/evidence anywhere: exactly one
+    // admissible world.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let z = CapabilityId("z".into());
+    let edges = vec![DependencyEdge::new("source", "x"), DependencyEdge::new("source", "z")];
+
+    let measured = path_043_measure_reach(&source, &[source.clone(), x.clone(), z.clone()], &[edges], Path043State::Unresolved);
+
+    assert!(measured.is_exact(), "the sole admissible world must yield an exact result");
+    assert_eq!(measured.state, Path043State::Supported);
+    assert_eq!(measured.lower, 2);
+    assert_eq!(measured.upper, 2);
+}
+
+#[test]
+fn path_043_b_unresolved_alias_vs_independence_refuses_one_unconditional_scalar() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone()];
+
+    let ambient = path_043_relation_state(&x, &y, &[]);
+    assert_eq!(ambient, Path043State::Unresolved);
+
+    let measured = path_043_measure_reach(&source, &protected, &[world_independent, world_alias], ambient);
+
+    assert!(!measured.is_exact(), "identical observable representation admits two worlds with different reach -- one unconditional exact scalar must not be emitted");
+    assert_eq!(measured.state, Path043State::Unresolved);
+    assert_eq!(measured.lower, 2);
+    assert_eq!(measured.upper, 3);
+}
+
+#[test]
+fn path_043_c_irrelevant_uncertainty_does_not_downgrade_an_unrelated_query() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    // The x/y alias ambiguity exists in the graph, but the query is
+    // about a disjoint, unaffected subgraph.
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let root = CapabilityId("root".into());
+    let p = CapabilityId("p".into());
+    let q = CapabilityId("q".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("root", "p"),
+        DependencyEdge::new("p", "q"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+
+    let ambient = path_043_relation_state(&x, &y, &[]);
+    assert_eq!(ambient, Path043State::Unresolved, "the ambiguity is real -- it is just irrelevant to this query");
+
+    let protected = vec![root.clone(), p.clone(), q.clone(), source.clone(), x.clone(), y.clone(), m.clone()];
+    let measured = path_043_measure_reach(&root, &protected, &[world_independent, world_alias], ambient);
+
+    assert!(
+        measured.is_exact(),
+        "unresolved x/y identity exists elsewhere in the graph, but every admissible world \
+         produces the same reach from `root` -- the result must not be downgraded merely \
+         because uncertainty exists somewhere"
+    );
+    assert_eq!(measured.state, Path043State::Supported);
+    assert_eq!(measured.lower, 2);
+}
+
+#[test]
+fn path_043_d_lower_bound_survives_disagreement() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let z = CapabilityId("z".into());
+    let w = CapabilityId("w".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("source", "z"),
+        DependencyEdge::new("z", "w"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone(), z.clone(), w.clone()];
+
+    let measured = path_043_measure_reach(&source, &protected, &[world_independent, world_alias], Path043State::Unresolved);
+
+    assert_eq!(measured.lower, 4, "reach differs by admissible world, but never falls below 4 (z, w, m, and whichever of x/y remain distinct) -- that provable minimum must survive");
+    assert_eq!(measured.upper, 5);
+    assert_eq!(measured.state, Path043State::Unresolved);
+}
+
+#[test]
+fn path_043_e_upper_bound_survives_disagreement() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let z = CapabilityId("z".into());
+    let w = CapabilityId("w".into());
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+        DependencyEdge::new("source", "z"),
+        DependencyEdge::new("z", "w"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone(), z.clone(), w.clone()];
+
+    let measured = path_043_measure_reach(&source, &protected, &[world_independent, world_alias], Path043State::Unresolved);
+
+    assert_eq!(measured.upper, 5, "impact cannot exceed 5 in any admissible world -- that provable maximum must survive, not just be dropped in favor of the smaller number");
+    assert_eq!(measured.lower, 4);
+}
+
+#[test]
+fn path_043_f_conflict_is_not_averaged_into_a_scalar() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+
+    let events = vec![
+        Path043AliasEvent {
+            event_id: "e1".into(),
+            origin: "auditor_1".into(),
+            a: x.clone(),
+            b: y.clone(),
+            asserted: Path043AliasAssertion::SameAs,
+        },
+        Path043AliasEvent {
+            event_id: "e2".into(),
+            origin: "auditor_2".into(),
+            a: x.clone(),
+            b: y.clone(),
+            asserted: Path043AliasAssertion::Distinct,
+        },
+    ];
+    let ambient = path_043_relation_state(&x, &y, &events);
+    assert_eq!(ambient, Path043State::Conflicted, "two independently grounded, non-self origins disagree -- this must be reported as CONFLICTED, not silently resolved either way");
+
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone()];
+
+    let measured = path_043_measure_reach(&source, &protected, &[world_independent, world_alias], ambient);
+
+    assert_eq!(measured.state, Path043State::Conflicted);
+    assert_ne!(measured.lower, measured.upper, "the two contradictory worlds must not be averaged into one scalar -- only lower/upper bounds are exposed, never a single reconciled number");
+}
+
+#[test]
+fn path_043_g_missing_evidence_is_not_treated_as_false() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+
+    // No claims at all -- neither supported nor contradicted.
+    let state = path_043_relation_state(&x, &y, &[]);
+    assert_eq!(state, Path043State::Unresolved, "missing evidence must stay Unresolved, never silently resolved to 'distinct' (false) just because nothing was asserted");
+
+    // Contrast with a naive candidate that treats "no alias claim" as
+    // proof of independence and only ever materializes the independent
+    // world.
+    let source = CapabilityId("source".into());
+    let m = CapabilityId("m".into());
+    let world_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let world_alias = path_043_collapse_alias(&world_independent, &y, &x);
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone()];
+
+    let naive_missing_as_false =
+        distribution_machine::measurement::reachable_capabilities(&source, &world_independent).len();
+    let measured = path_043_measure_reach(&source, &protected, &[world_independent, world_alias], state);
+
+    assert_eq!(naive_missing_as_false, 3, "the naive candidate silently commits to one world");
+    assert!(
+        measured.lower < naive_missing_as_false,
+        "the correct handling of missing evidence retains the second admissible world \
+         (reach 2) that the naive 'missing = false/independent' shortcut discards entirely"
+    );
+}
+
+#[test]
+fn path_043_h_duplicate_evidence_does_not_narrow_or_upgrade() {
+    let x = distribution_machine::measurement::CapabilityId("x".into());
+    let y = distribution_machine::measurement::CapabilityId("y".into());
+
+    let single = vec![Path043AliasEvent {
+        event_id: "e1".into(),
+        origin: "auditor_1".into(),
+        a: x.clone(),
+        b: y.clone(),
+        asserted: Path043AliasAssertion::SameAs,
+    }];
+
+    // Literal duplicate serialization: identical event, repeated.
+    let mut duplicated = single.clone();
+    for _ in 0..9 {
+        duplicated.push(single[0].clone());
+    }
+
+    assert_eq!(path_043_deduplicate_alias_events(&duplicated).len(), 1, "FIND-007: duplicate serialization must not be counted as new evidence");
+    assert_eq!(
+        path_043_relation_state(&x, &y, &single),
+        path_043_relation_state(&x, &y, &duplicated),
+        "10 literal duplicates of the same one-sided claim must not narrow the ambiguity or \
+         improve the epistemic state relative to a single copy"
+    );
+    assert_eq!(path_043_relation_state(&x, &y, &duplicated), Path043State::Unresolved, "one-sided evidence, no matter how many times duplicated, is still not corroboration -- it stays Unresolved, never Supported");
+}
+
+#[test]
+fn path_043_i_replay_under_a_new_id_does_not_narrow_or_upgrade() {
+    let x = distribution_machine::measurement::CapabilityId("x".into());
+    let y = distribution_machine::measurement::CapabilityId("y".into());
+
+    let baseline = vec![Path043AliasEvent {
+        event_id: "e1".into(),
+        origin: "auditor_1".into(),
+        a: x.clone(),
+        b: y.clone(),
+        asserted: Path043AliasAssertion::SameAs,
+    }];
+
+    // Same content, replayed under fresh event ids each time.
+    let replayed: Vec<Path043AliasEvent> = (0..5)
+        .map(|i| Path043AliasEvent {
+            event_id: format!("replay-{i}"),
+            origin: "auditor_1".into(),
+            a: x.clone(),
+            b: y.clone(),
+            asserted: Path043AliasAssertion::SameAs,
+        })
+        .collect();
+
+    assert_eq!(path_043_deduplicate_alias_events(&replayed).len(), 1, "a free-form event_id is never trusted as identity -- content-identical replay collapses to one event regardless of how many fresh ids are used");
+    assert_eq!(
+        path_043_relation_state(&x, &y, &baseline),
+        path_043_relation_state(&x, &y, &replayed),
+        "replay under a new event id must not narrow the measurement interval or upgrade certainty"
+    );
+}
+
+#[test]
+fn path_043_j_representation_depth_does_not_change_measurement_or_state() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge};
+
+    let source = CapabilityId("source".into());
+    let x = CapabilityId("x".into());
+    let y = CapabilityId("y".into());
+    let m = CapabilityId("m".into());
+    let protected = vec![source.clone(), x.clone(), y.clone(), m.clone()];
+
+    let bare_independent = vec![
+        DependencyEdge::new("source", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let bare_alias = path_043_collapse_alias(&bare_independent, &y, &x);
+    let bare = path_043_measure_reach(&source, &protected, &[bare_independent, bare_alias], Path043State::Unresolved);
+
+    // Insert a harmless RepresentationOnly relay between `source` and
+    // `x`, and pad `y`'s branch with an extra relay too.
+    let padded_independent = vec![
+        DependencyEdge::new("source", "relay_x"),
+        DependencyEdge::new("relay_x", "x"),
+        DependencyEdge::new("x", "m"),
+        DependencyEdge::new("source", "relay_y"),
+        DependencyEdge::new("relay_y", "y"),
+        DependencyEdge::new("y", "m"),
+    ];
+    let padded_alias = path_043_collapse_alias(&padded_independent, &y, &x);
+    let padded = path_043_measure_reach(&source, &protected, &[padded_independent, padded_alias], Path043State::Unresolved);
+
+    assert_eq!(bare, padded, "harmless RepresentationOnly relay depth must be invariant to both the measurement and the epistemic state");
+}
+
+#[test]
+fn path_043_k_claim_volume_does_not_launder_unresolved_into_supported() {
+    let x = distribution_machine::measurement::CapabilityId("x".into());
+    let y = distribution_machine::measurement::CapabilityId("y".into());
+
+    let mut laundering: Vec<Path043AliasEvent> = Vec::new();
+    // Self-derived claims: the "origin" is literally one of the subjects.
+    for i in 0..10 {
+        laundering.push(Path043AliasEvent {
+            event_id: format!("self-{i}"),
+            origin: "x".into(),
+            a: x.clone(),
+            b: y.clone(),
+            asserted: Path043AliasAssertion::SameAs,
+        });
+    }
+    // Weak/circular claims: many duplicates of the same single grounded
+    // origin's assertion.
+    for i in 0..20 {
+        laundering.push(Path043AliasEvent {
+            event_id: format!("weak-{i}"),
+            origin: "single_actor".into(),
+            a: x.clone(),
+            b: y.clone(),
+            asserted: Path043AliasAssertion::SameAs,
+        });
+    }
+
+    let sparse = path_043_relation_state(&x, &y, &laundering[10..11]);
+    let laundered = path_043_relation_state(&x, &y, &laundering);
+
+    assert_eq!(sparse, Path043State::Unresolved);
+    assert_eq!(laundered, Path043State::Unresolved, "30 self-derived/circular/duplicate claims must not convert UNRESOLVED into SUPPORTED -- claim count is free for a single actor to manufacture (FIND-018/019)");
+    assert_eq!(sparse, laundered, "the epistemic state must be identical whether backed by 1 relevant claim or 30 manufactured ones");
+}
+
+#[test]
+fn path_043_l_composition_never_becomes_more_precise_than_its_inputs_justify() {
+    // Two measurements driven by the SAME underlying two-world
+    // ambiguity, but anti-correlated: measurement 1 is higher in the
+    // independent world, measurement 2 is higher in the alias world.
+    let per_world_1 = [3usize, 2usize]; // [independent, alias]
+    let per_world_2 = [1usize, 4usize];
+
+    let measured_1 = path_043_from_world_values(&per_world_1, Path043State::Unresolved);
+    let measured_2 = path_043_from_world_values(&per_world_2, Path043State::Unresolved);
+
+    let composed = path_043_compose_sum(measured_1, measured_2);
+
+    // The TRUE joint value, computed by actually summing within each
+    // shared admissible world rather than combining published bounds.
+    let true_joint_values: Vec<usize> =
+        per_world_1.iter().zip(per_world_2.iter()).map(|(a, b)| a + b).collect();
+    let true_joint = path_043_from_world_values(&true_joint_values, Path043State::Unresolved);
+
+    assert!(composed.lower <= true_joint.lower, "naive interval-sum composition must never claim a HIGHER minimum than the true joint minimum -- that would be false precision");
+    assert!(composed.upper >= true_joint.upper, "naive interval-sum composition must never claim a LOWER maximum than the true joint maximum -- that would be false precision");
+    assert_eq!(composed.state, Path043State::Unresolved, "composing an unresolved input keeps the composite unresolved -- uncertainty is not erased by composition");
+
+    // Composing two fully exact/Supported measurements preserves
+    // exactness -- composition must not manufacture uncertainty either.
+    let exact_1 = path_043_from_world_values(&[5, 5], Path043State::Unresolved);
+    let exact_2 = path_043_from_world_values(&[7, 7], Path043State::Unresolved);
+    let composed_exact = path_043_compose_sum(exact_1, exact_2);
+    assert!(composed_exact.is_exact());
+    assert_eq!(composed_exact.state, Path043State::Supported);
+    assert_eq!(composed_exact.lower, 12);
+}
