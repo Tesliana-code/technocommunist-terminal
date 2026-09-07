@@ -11089,3 +11089,672 @@ fn path_044_o_lossy_compression_counterexample() {
          only retaining the actual admissible set (Candidate D) answers this correctly"
     );
 }
+
+// =====================================================================
+// PATH-045 -- RANKING / ALLOCATION BOUNDARY UNDER EPISTEMIC UNCERTAINTY
+// (H16)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement`/`distribution`/`contribution` or
+// wired into any production/allocation path.
+//
+// PRODUCTION RANKING INVENTORY (read before designing anything below):
+//
+// grepped `src/*.rs` for rank/sort/compare/partial_cmp/total_cmp/
+// priority/normalized/share/allocation. Findings:
+//
+// - `allocate_contribution_pool` / `allocate_stewardship_pool` /
+//   `allocate_capital_pool` (distribution.rs / capital.rs) compute a
+//   `normalized_share = value / total` for EVERY entry and never compare
+//   two entries against each other -- output order is INPUT order (the
+//   code simply `.map()`s over the input slice), not sorted by value.
+//   There is no comparison/ranking function between two
+//   contributors/capabilities anywhere in this pipeline. Confirmed
+//   executable in PATH-045-N.
+// - Every `sort_by` in `measurement.rs` (bottleneck lists, convergence
+//   regions, canonicalization candidates, dedup output, etc.) sorts by
+//   `CapabilityId`/`DependencyPathId`/`FailureDomainId` STRING content --
+//   deterministic output-enumeration stabilizers, several already
+//   self-documented in-code as carrying "no structural or economic
+//   meaning" (e.g. `structural_propagation_surface`'s doc comment).
+//   None of these compare economic VALUE.
+// - The one place raw `f64` scores are sorted is
+//   `DependencyAggregationModel::RankedDecay`
+//   (`scores.sort_by(|a,b| b.partial_cmp(a)...)`), and that sort is a
+//   purely internal step of aggregating ONE capability's OWN dependency
+//   list into ONE scalar -- it never compares two different
+//   capabilities/contributors against each other, so it is not a
+//   "ranking" in the sense this mission investigates.
+//
+// CONCLUSION: no production ranking/comparison-between-two-capabilities
+// function exists to attack or extend. This experiment builds one from
+// scratch, test-local, and asks what shape it would have to take to be
+// epistemically honest, reusing FIND-020/021's `Measured`/state
+// machinery and `CriticalityObservables`/`measure_criticality` for
+// realistic scalar inputs.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path045State {
+    Supported,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Measured045 {
+    lower: f64,
+    upper: f64,
+    state: Path045State,
+}
+
+impl Measured045 {
+    fn from_values(values: &[f64], ambient_state: Path045State) -> Self {
+        let lower = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let upper = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let state = if (upper - lower).abs() < 1e-9 { Path045State::Supported } else { ambient_state };
+        Measured045 { lower, upper, state }
+    }
+}
+
+fn path_045_weights() -> distribution_machine::measurement::CriticalityMeasurementWeights {
+    distribution_machine::measurement::CriticalityMeasurementWeights {
+        qualified_dependency_weight: 0.30,
+        blocking_paths: 0.30,
+        failure_blast_radius: 0.25,
+        substitutability: 0.15,
+    }
+}
+
+fn path_045_world(
+    qdw: f64,
+    blocking: u32,
+    blast: u32,
+    sub: distribution_machine::measurement::Substitutability,
+) -> distribution_machine::measurement::CriticalityObservables {
+    distribution_machine::measurement::CriticalityObservables {
+        qualified_dependency_weight: qdw,
+        blocking_paths: blocking,
+        failure_blast_radius: blast,
+        substitutability: sub,
+    }
+}
+
+fn path_045_score(o: distribution_machine::measurement::CriticalityObservables) -> f64 {
+    distribution_machine::measurement::measure_criticality(o, path_045_weights()).unwrap().score
+}
+
+fn path_045_dep(score: f64) -> distribution_machine::measurement::QualifiedDependency {
+    distribution_machine::measurement::QualifiedDependency {
+        blocking_relevance: score,
+        failure_propagation: score,
+        operational_reliance: score,
+        business_path_relevance: score,
+        score,
+    }
+}
+
+fn path_045_dep_record(
+    dep_id: &str,
+    path_id: &str,
+    domain_id: &str,
+    source: &str,
+    target: &str,
+    score: f64,
+) -> distribution_machine::measurement::DependencyRecord {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyId, DependencyPathId, DependencyRelationshipType, FailureDomainId,
+    };
+
+    distribution_machine::measurement::DependencyRecord {
+        dependency_id: DependencyId(dep_id.into()),
+        dependency_path_id: DependencyPathId(path_id.into()),
+        failure_domain_id: FailureDomainId(domain_id.into()),
+        source_capability: CapabilityId(source.into()),
+        target_capability: CapabilityId(target.into()),
+        relationship_type: DependencyRelationshipType::Runtime,
+        qualified: path_045_dep(score),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path045Relation {
+    Greater,
+    Equal,
+    Less,
+    /// We HAVE the joint/correlated admissible-state information, and it
+    /// establishes that no single strict order (Greater/Equal/Less)
+    /// holds across every jointly admissible world.
+    Incomparable,
+    /// We do NOT have enough information to determine the relation --
+    /// either only marginal (uncorrelated) bounds are available, or
+    /// evidence for one side is simply missing.
+    Unresolved,
+    Conflicted,
+}
+
+// ---------------------------------------------------------------------
+// Candidate A -- compare midpoints. Expected: killed (PATH-045-J).
+// ---------------------------------------------------------------------
+fn path_045_candidate_a_midpoint(a: Measured045, b: Measured045) -> Path045Relation {
+    let mid_a = (a.lower + a.upper) / 2.0;
+    let mid_b = (b.lower + b.upper) / 2.0;
+    if mid_a > mid_b {
+        Path045Relation::Greater
+    } else if mid_a < mid_b {
+        Path045Relation::Less
+    } else {
+        Path045Relation::Equal
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate B -- compare marginal bounds only, no joint/correlation
+// information. Conservative: refuses to rank whenever ranges overlap,
+// REGARDLESS of whether a joint correlation might actually justify a
+// strict order (PATH-045-K/L show exactly this gap).
+// ---------------------------------------------------------------------
+fn path_045_candidate_b_bounds_only(a: Measured045, b: Measured045) -> Path045Relation {
+    if a.lower > b.upper {
+        Path045Relation::Greater
+    } else if b.lower > a.upper {
+        Path045Relation::Less
+    } else {
+        Path045Relation::Unresolved
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate C -- all-worlds dominance over the actual jointly admissible
+// (score_a, score_b) pairs.
+// ---------------------------------------------------------------------
+fn path_045_candidate_c_joint_dominance(joint_worlds: &[(f64, f64)]) -> Path045Relation {
+    let all_equal = joint_worlds.iter().all(|(a, b)| (a - b).abs() < 1e-9);
+    if all_equal {
+        return Path045Relation::Equal;
+    }
+    let all_greater = joint_worlds.iter().all(|(a, b)| *a > *b + 1e-9);
+    let all_less = joint_worlds.iter().all(|(a, b)| *b > *a + 1e-9);
+    if all_greater {
+        Path045Relation::Greater
+    } else if all_less {
+        Path045Relation::Less
+    } else {
+        Path045Relation::Incomparable
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate D -- ranking verdict + explanation state. Conflict overrides
+// everything else (PATH-045-F): a relevant Conflicted input state must
+// remain visible even when the raw joint pairs would otherwise look
+// decisive.
+// ---------------------------------------------------------------------
+fn path_045_candidate_d_ranking_verdict(joint_worlds: &[(f64, f64)], conflicted: bool) -> Path045Relation {
+    if conflicted {
+        return Path045Relation::Conflicted;
+    }
+    path_045_candidate_c_joint_dominance(joint_worlds)
+}
+
+fn path_045_permits_allocation_ordering_assumption(relation: Path045Relation) -> bool {
+    matches!(relation, Path045Relation::Greater | Path045Relation::Less | Path045Relation::Equal)
+}
+
+// =====================================================================
+// Candidate A attack
+// =====================================================================
+
+#[test]
+fn path_045_j_midpoint_ranking_is_explicitly_rejected() {
+    // Overlapping marginal ranges where midpoint(A) > midpoint(B), but
+    // an actual jointly admissible world has B > A.
+    let a = Measured045::from_values(&[0.3, 0.9], Path045State::Unresolved); // midpoint 0.6
+    let b = Measured045::from_values(&[0.5, 0.55], Path045State::Unresolved); // midpoint 0.525
+
+    let midpoint_verdict = path_045_candidate_a_midpoint(a, b);
+    assert_eq!(midpoint_verdict, Path045Relation::Greater, "midpoint comparison claims A > B");
+
+    let joint_worlds = [(0.3, 0.55), (0.9, 0.5)];
+    // World 1 (A=0.3, B=0.55): B > A here -- directly contradicts the
+    // midpoint's claim.
+    assert!(joint_worlds[0].1 > joint_worlds[0].0);
+
+    let truth = path_045_candidate_c_joint_dominance(&joint_worlds);
+    assert_eq!(
+        truth,
+        Path045Relation::Incomparable,
+        "the ACTUAL admissible worlds disagree on direction -- midpoint's confident 'A > B' is \
+         simply wrong, not merely imprecise. Candidate A is rejected: it can assert a relation \
+         that does not hold in every (or even most) admissible worlds"
+    );
+}
+
+// =====================================================================
+// PATH-045-A through P -- required pathological cases.
+// =====================================================================
+
+#[test]
+fn path_045_a_definite_dominance_survives() {
+    let a = Measured045::from_values(&[0.8, 0.9], Path045State::Unresolved);
+    let b = Measured045::from_values(&[0.3, 0.5], Path045State::Unresolved);
+
+    assert_eq!(path_045_candidate_b_bounds_only(a, b), Path045Relation::Greater);
+
+    // Every combination of A's and B's values (not just a specific
+    // pairing) has A > B, since the marginal ranges are disjoint.
+    let joint_worlds = [(0.8, 0.3), (0.8, 0.5), (0.9, 0.3), (0.9, 0.5)];
+    assert_eq!(path_045_candidate_c_joint_dominance(&joint_worlds), Path045Relation::Greater);
+}
+
+#[test]
+fn path_045_b_overlapping_ranges_refuse_a_strict_ranking_from_bounds_alone() {
+    let a = Measured045::from_values(&[0.4, 0.8], Path045State::Unresolved);
+    let b = Measured045::from_values(&[0.6, 0.9], Path045State::Unresolved);
+
+    assert_eq!(path_045_candidate_b_bounds_only(a, b), Path045Relation::Unresolved);
+}
+
+/// Shared construction for C and O: two joint admissible-state sets with
+/// BYTE-IDENTICAL marginal ranges for A and for B (same two raw values
+/// on each side, only the PAIRING differs), one giving definite
+/// dominance, the other genuine disagreement.
+fn path_045_same_marginals_different_correlation() -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    // Monotone pairing: sorted ascending on both sides, paired
+    // low-with-low, high-with-high -- A > B in every world.
+    let set1_dominant = vec![(0.4, 0.3), (0.6, 0.5)];
+    // Crossed pairing of the EXACT SAME raw value sets -- disagreement.
+    let set2_disagreeing = vec![(0.4, 0.5), (0.6, 0.3)];
+    (set1_dominant, set2_disagreeing)
+}
+
+#[test]
+fn path_045_c_identical_marginal_ranges_different_joint_correlation() {
+    let (set1, set2) = path_045_same_marginals_different_correlation();
+
+    let marginal_a = |worlds: &[(f64, f64)]| -> (f64, f64) {
+        (
+            worlds.iter().map(|(a, _)| *a).fold(f64::INFINITY, f64::min),
+            worlds.iter().map(|(a, _)| *a).fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let marginal_b = |worlds: &[(f64, f64)]| -> (f64, f64) {
+        (
+            worlds.iter().map(|(_, b)| *b).fold(f64::INFINITY, f64::min),
+            worlds.iter().map(|(_, b)| *b).fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+
+    assert_eq!(marginal_a(&set1), marginal_a(&set2), "A's marginal range is byte-identical across both sets");
+    assert_eq!(marginal_b(&set1), marginal_b(&set2), "B's marginal range is byte-identical across both sets");
+
+    let set1_a = Measured045::from_values(&set1.iter().map(|(a, _)| *a).collect::<Vec<_>>(), Path045State::Unresolved);
+    let set1_b = Measured045::from_values(&set1.iter().map(|(_, b)| *b).collect::<Vec<_>>(), Path045State::Unresolved);
+    assert_eq!(
+        path_045_candidate_b_bounds_only(set1_a, set1_b),
+        Path045Relation::Unresolved,
+        "marginal bounds alone overlap in BOTH sets -- Candidate B cannot see the difference"
+    );
+
+    let verdict1 = path_045_candidate_c_joint_dominance(&set1);
+    let verdict2 = path_045_candidate_c_joint_dominance(&set2);
+
+    assert_eq!(verdict1, Path045Relation::Greater, "set 1's joint correlation makes A > B definite");
+    assert_eq!(verdict2, Path045Relation::Incomparable, "set 2's joint correlation shows genuine disagreement");
+    assert_ne!(
+        verdict1, verdict2,
+        "PROOF: identical marginal ranges compress to the SAME Candidate-B verdict (Unresolved) \
+         for both sets, yet the true joint-correlation-aware verdicts differ entirely -- marginal \
+         bounds alone cannot determine ranking; joint/correlation information is required"
+    );
+}
+
+#[test]
+fn path_045_d_perfect_tie_returns_equal_not_unresolved() {
+    let joint_worlds = [(0.5, 0.5), (0.6, 0.6), (0.3, 0.3)];
+    assert_eq!(
+        path_045_candidate_c_joint_dominance(&joint_worlds),
+        Path045Relation::Equal,
+        "every jointly admissible world gives A == B exactly -- this is a SUPPORTED fact, not an \
+         absence of information, and must be reported as Equal, never Unresolved"
+    );
+}
+
+#[test]
+fn path_045_e_exact_scalar_order_can_coexist_with_unresolved_explanation() {
+    use distribution_machine::measurement::Substitutability;
+
+    // A has two admissible observable vectors that happen to score
+    // identically (reusing FIND-021's construction): the SCALAR is
+    // exact/Supported, but which vector is real remains Unresolved.
+    let weights = path_045_weights();
+    let a_world_x = path_045_world(0.5, 2, 2, Substitutability::Moderate);
+    let sub_x = 0.33;
+    let sub_y = 0.0;
+    let a_qdw_y = (0.5 * weights.qualified_dependency_weight + sub_x * weights.substitutability
+        - sub_y * weights.substitutability)
+        / weights.qualified_dependency_weight;
+    let a_world_y = path_045_world(a_qdw_y, 2, 2, Substitutability::Easy);
+    assert_ne!(a_world_x, a_world_y, "two genuinely different explanations for A");
+    let a_score = path_045_score(a_world_x);
+    assert!((a_score - path_045_score(a_world_y)).abs() < 1e-9, "both admissible A-vectors score identically");
+
+    // B is fixed, lower, and fully supported.
+    let b_world = path_045_world(0.2, 1, 1, Substitutability::Easy);
+    let b_score = path_045_score(b_world);
+    assert!(a_score > b_score);
+
+    // Joint pairs: A's score is invariant across A's own two admissible
+    // explanations, so every joint pair still has A > B.
+    let joint_worlds = [(path_045_score(a_world_x), b_score), (path_045_score(a_world_y), b_score)];
+    let relation = path_045_candidate_c_joint_dominance(&joint_worlds);
+    assert_eq!(
+        relation,
+        Path045Relation::Greater,
+        "the SCALAR ranking is Supported/definite -- A > B in every admissible world -- even \
+         though A's own EXPLANATION (which of its two admissible observable vectors is real) \
+         remains Unresolved. This extends FIND-021's scalar/explanation split to ranking."
+    );
+
+    let a_explanation_state = if a_world_x == a_world_y { Path045State::Supported } else { Path045State::Unresolved };
+    assert_eq!(a_explanation_state, Path045State::Unresolved);
+}
+
+#[test]
+fn path_045_f_conflicted_a_remains_visible_even_when_bounds_look_decisive() {
+    use distribution_machine::measurement::Substitutability;
+
+    // A's blocking_paths dimension is Conflicted between two grounded,
+    // disagreeing origins (mirrors PATH-044-H). Both of A's admissible
+    // worlds still score ABOVE B -- a naive bounds check would
+    // confidently say Greater.
+    let a_world_1 = path_045_world(0.8, 1, 4, Substitutability::None);
+    let a_world_2 = path_045_world(0.8, 5, 4, Substitutability::None);
+    let b_world = path_045_world(0.1, 0, 0, Substitutability::Easy);
+
+    let joint_worlds = [(path_045_score(a_world_1), path_045_score(b_world)), (path_045_score(a_world_2), path_045_score(b_world))];
+    // Confirm the bounds-only reading really would look decisive.
+    assert!(joint_worlds.iter().all(|(a, b)| a > b), "both of A's conflicted worlds score above B");
+
+    let verdict = path_045_candidate_d_ranking_verdict(&joint_worlds, true);
+    assert_eq!(
+        verdict,
+        Path045Relation::Conflicted,
+        "conflict must remain visible and take priority over even a seemingly-decisive bounds \
+         check -- it must not silently collapse into Greater just because the numbers happen to \
+         separate cleanly"
+    );
+}
+
+#[test]
+fn path_045_g_missing_evidence_is_not_treated_as_low_score() {
+    use distribution_machine::measurement::Substitutability;
+
+    // A's evidence for one dimension is simply missing -- nothing
+    // resolves it, so BOTH a low-scoring and a high-scoring world for A
+    // remain admissible.
+    let a_world_low = path_045_world(0.1, 0, 0, Substitutability::Easy);
+    let a_world_high = path_045_world(0.9, 5, 5, Substitutability::None);
+    let b_world = path_045_world(0.5, 2, 2, Substitutability::Moderate);
+
+    // A naive candidate that treats missing evidence as "assume the low
+    // world" would conclude B > A unconditionally.
+    let naive_missing_as_low = path_045_score(a_world_low) < path_045_score(b_world);
+    assert!(naive_missing_as_low, "the naive shortcut silently commits to A's low world");
+
+    let joint_worlds = [(path_045_score(a_world_low), path_045_score(b_world)), (path_045_score(a_world_high), path_045_score(b_world))];
+    let verdict = path_045_candidate_c_joint_dominance(&joint_worlds);
+    assert_eq!(
+        verdict,
+        Path045Relation::Incomparable,
+        "the correct handling retains A's high-scoring admissible world too -- the true relation \
+         is genuinely undetermined (A could be above or below B), not a false definite 'B > A' \
+         manufactured by treating missing evidence as if it were a low value"
+    );
+}
+
+#[test]
+fn path_045_h_duplicate_replay_evidence_does_not_upgrade_ranking_certainty() {
+    use distribution_machine::measurement::{DependencyAggregationModel, Substitutability, aggregate_structural_dependencies_with_model};
+
+    let a_world1_records = vec![path_045_dep_record("d1", "p1", "f1", "A", "X", 0.4)];
+    let a_world2_records = vec![path_045_dep_record("d1", "p1", "f1", "A", "Z", 0.8)];
+    let b_world = path_045_world(0.5, 2, 2, Substitutability::Moderate);
+    let b_score = path_045_score(b_world);
+
+    let qdw1 = aggregate_structural_dependencies_with_model(&a_world1_records, DependencyAggregationModel::Complementary);
+    let qdw2 = aggregate_structural_dependencies_with_model(&a_world2_records, DependencyAggregationModel::Complementary);
+    let baseline_joint = [
+        (path_045_score(path_045_world(qdw1, 2, 2, Substitutability::Moderate)), b_score),
+        (path_045_score(path_045_world(qdw2, 2, 2, Substitutability::Moderate)), b_score),
+    ];
+    let baseline_verdict = path_045_candidate_c_joint_dominance(&baseline_joint);
+
+    let mut a_world1_replayed = a_world1_records.clone();
+    let mut a_world2_replayed = a_world2_records.clone();
+    for i in 0..9 {
+        a_world1_replayed.push(path_045_dep_record(&format!("d1-r{i}"), &format!("p1-r{i}"), &format!("f1-r{i}"), "A", "X", 0.4));
+        a_world2_replayed.push(path_045_dep_record(&format!("d2-r{i}"), &format!("p2-r{i}"), &format!("f2-r{i}"), "A", "Z", 0.8));
+    }
+    let qdw1_replayed = aggregate_structural_dependencies_with_model(&a_world1_replayed, DependencyAggregationModel::Complementary);
+    let qdw2_replayed = aggregate_structural_dependencies_with_model(&a_world2_replayed, DependencyAggregationModel::Complementary);
+    assert_eq!(qdw1, qdw1_replayed);
+    assert_eq!(qdw2, qdw2_replayed);
+
+    let replayed_joint = [
+        (path_045_score(path_045_world(qdw1_replayed, 2, 2, Substitutability::Moderate)), b_score),
+        (path_045_score(path_045_world(qdw2_replayed, 2, 2, Substitutability::Moderate)), b_score),
+    ];
+    let replayed_verdict = path_045_candidate_c_joint_dominance(&replayed_joint);
+
+    assert_eq!(baseline_verdict, replayed_verdict, "duplicate/replayed evidence must not change A's ranking verdict against B");
+}
+
+#[test]
+fn path_045_i_representation_depth_leaves_ranking_invariant() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, Substitutability, canonicalize_pure_relays, reachable_capabilities,
+    };
+
+    let source = CapabilityId("source".into());
+    let protected = vec![CapabilityId("source".into()), CapabilityId("x".into()), CapabilityId("y".into())];
+
+    let qdw_from_reach = |edges: &[DependencyEdge]| -> f64 {
+        let (canonical, _) = canonicalize_pure_relays(&source, &protected, edges);
+        (reachable_capabilities(&source, &canonical).len() as f64 / 10.0).min(1.0)
+    };
+
+    let bare = vec![DependencyEdge::new("source", "x"), DependencyEdge::new("source", "y")];
+    let padded = vec![
+        DependencyEdge::new("source", "relay1"),
+        DependencyEdge::new("relay1", "x"),
+        DependencyEdge::new("source", "relay2"),
+        DependencyEdge::new("relay2", "y"),
+    ];
+
+    let a_bare = path_045_world(qdw_from_reach(&bare), 2, 2, Substitutability::Moderate);
+    let a_padded = path_045_world(qdw_from_reach(&padded), 2, 2, Substitutability::Moderate);
+    let b = path_045_world(0.1, 0, 0, Substitutability::Easy);
+
+    let verdict_bare = path_045_candidate_c_joint_dominance(&[(path_045_score(a_bare), path_045_score(b))]);
+    let verdict_padded = path_045_candidate_c_joint_dominance(&[(path_045_score(a_padded), path_045_score(b))]);
+
+    assert_eq!(a_bare, a_padded);
+    assert_eq!(verdict_bare, verdict_padded);
+}
+
+#[test]
+fn path_045_k_joint_correlation_justifies_strict_ranking_despite_overlapping_marginals() {
+    let joint_worlds = [(0.55, 0.5), (0.65, 0.6)];
+
+    let a = Measured045::from_values(&joint_worlds.iter().map(|(a, _)| *a).collect::<Vec<_>>(), Path045State::Unresolved);
+    let b = Measured045::from_values(&joint_worlds.iter().map(|(_, b)| *b).collect::<Vec<_>>(), Path045State::Unresolved);
+    assert_eq!(path_045_candidate_b_bounds_only(a, b), Path045Relation::Unresolved, "marginal ranges overlap (a.lower=0.55 < b.upper=0.6)");
+
+    assert_eq!(
+        path_045_candidate_c_joint_dominance(&joint_worlds),
+        Path045Relation::Greater,
+        "every ACTUAL joint world has A > B -- joint/correlation information justifies a strict \
+         ranking that marginal bounds alone refuse"
+    );
+}
+
+#[test]
+fn path_045_l_bounds_rule_is_sound_whenever_it_fires() {
+    // Attempt to break Candidate B's soundness (not its completeness --
+    // K already shows it's too weak). Claim: whenever a.lower > b.upper
+    // (TRUE min/max over the admissible set), every joint pair also has
+    // A > B, regardless of correlation structure, because both bounds
+    // are global facts independent of pairing.
+    let scenarios: Vec<Vec<(f64, f64)>> = vec![
+        vec![(0.8, 0.3), (0.9, 0.5), (0.85, 0.4)],
+        vec![(0.71, 0.3), (0.71, 0.6), (0.9, 0.3)],
+        vec![(1.0, 0.0), (0.51, 0.5)],
+    ];
+
+    for joint_worlds in &scenarios {
+        let a_vals: Vec<f64> = joint_worlds.iter().map(|(a, _)| *a).collect();
+        let b_vals: Vec<f64> = joint_worlds.iter().map(|(_, b)| *b).collect();
+        let a = Measured045::from_values(&a_vals, Path045State::Unresolved);
+        let b = Measured045::from_values(&b_vals, Path045State::Unresolved);
+
+        if path_045_candidate_b_bounds_only(a, b) == Path045Relation::Greater {
+            assert_eq!(
+                path_045_candidate_c_joint_dominance(joint_worlds),
+                Path045Relation::Greater,
+                "PROOF ATTEMPT FAILED (as expected): whenever a.lower > b.upper, every a_i >= \
+                 a.lower > b.upper >= b_i for ANY pairing (a_i, b_j), so joint dominance can never \
+                 disagree with the bounds-only verdict once it fires. The rule is sound, not merely \
+                 usually-right -- no counterexample exists to invent here."
+            );
+        }
+    }
+}
+
+#[test]
+fn path_045_m_cyclic_pairwise_ranking_from_independently_derived_pairwise_sets() {
+    // Three SEPARATE pairwise joint sets, each individually valid, but
+    // never reconciled into one shared 3-way admissible model -- B's
+    // values in the (A,B) set are not the same B's values used in the
+    // (B,C) set.
+    let joint_ab = [(10.0, 1.0), (11.0, 2.0)]; // A > B always
+    let joint_bc = [(0.5, 0.1), (0.6, 0.2)]; // B > C always (a DIFFERENT B range: [0.5,0.6])
+    let joint_ca = [(100.0, 10.0), (101.0, 11.0)]; // C > A always (C here means the first element)
+
+    assert_eq!(path_045_candidate_c_joint_dominance(&joint_ab), Path045Relation::Greater);
+    assert_eq!(path_045_candidate_c_joint_dominance(&joint_bc), Path045Relation::Greater);
+    assert_eq!(path_045_candidate_c_joint_dominance(&joint_ca), Path045Relation::Greater);
+    // A > B, B > C, C > A: a cycle, composed entirely from three
+    // independently-fabricated pairwise joint sets whose "B" (and "C")
+    // ranges don't even overlap between the sets that mention them.
+
+    // Contrast: ONE shared 3-way admissible model, all three pairwise
+    // verdicts derived from the SAME per-world (A,B,C) triples, is
+    // transitive by ordinary real-number transitivity -- no cycle is
+    // possible.
+    let shared_worlds: [(f64, f64, f64); 2] = [(10.0, 5.0, 1.0), (11.0, 6.0, 2.0)]; // (A,B,C) per world, A>B>C in both
+    let ab_from_shared: Vec<(f64, f64)> = shared_worlds.iter().map(|(a, b, _)| (*a, *b)).collect();
+    let bc_from_shared: Vec<(f64, f64)> = shared_worlds.iter().map(|(_, b, c)| (*b, *c)).collect();
+    let ac_from_shared: Vec<(f64, f64)> = shared_worlds.iter().map(|(a, _, c)| (*a, *c)).collect();
+
+    assert_eq!(path_045_candidate_c_joint_dominance(&ab_from_shared), Path045Relation::Greater);
+    assert_eq!(path_045_candidate_c_joint_dominance(&bc_from_shared), Path045Relation::Greater);
+    assert_eq!(
+        path_045_candidate_c_joint_dominance(&ac_from_shared),
+        Path045Relation::Greater,
+        "A > B and B > C in every world of ONE shared 3-way admissible model implies A > C in \
+         that same model, by ordinary pointwise real-number transitivity -- no cycle is possible \
+         when all pairwise verdicts are derived from a single shared joint model. All-worlds \
+         dominance therefore forms a transitive partial order ONLY over comparisons that share a \
+         genuine joint admissible-world model; naively composing separately-derived pairwise \
+         verdicts (as above) does not inherit that guarantee and can cycle."
+    );
+}
+
+#[test]
+fn path_045_n_deterministic_tie_breaking_is_not_a_production_concept_here() {
+    // N/A, documented executably: `allocate_contribution_pool` never
+    // sorts or compares contributors by value -- output order is input
+    // order. Constructing events in DECREASING value order and checking
+    // the output preserves that same (non-value-sorted) order proves no
+    // implicit ranking/tie-break influences allocation.
+    use distribution_machine::contribution::{ContributionEvent, ContributionFactors, ContributionWeights};
+    use distribution_machine::distribution::allocate_contribution_pool;
+
+    let weights = ContributionWeights { responsibility: 0.20, criticality: 0.30, deal_impact: 0.25, dependency_reach: 0.25 };
+    let factors = |v: f64| ContributionFactors {
+        responsibility: v,
+        criticality: v,
+        deal_impact: v,
+        stewardship: v,
+        dependency_reach: v,
+        evidence_confidence: 1.0,
+    };
+
+    let events = vec![
+        ContributionEvent { contributor_id: "low".into(), contribution_id: "c1".into(), base_work_value: 1.0, factors: factors(0.1) },
+        ContributionEvent { contributor_id: "high".into(), contribution_id: "c2".into(), base_work_value: 1.0, factors: factors(0.9) },
+    ];
+
+    let allocations = allocate_contribution_pool(&events, &weights, 100.0).unwrap();
+
+    assert_eq!(allocations[0].contributor_id, "low", "output preserves INPUT order (low-value contributor listed first)");
+    assert_eq!(allocations[1].contributor_id, "high");
+    assert!(
+        allocations[1].allocated_amount > allocations[0].allocated_amount,
+        "allocation amount reflects value, but LIST ORDER never does -- there is no sort/rank/tie-break to attack"
+    );
+}
+
+#[test]
+fn path_045_o_lossy_compression_counterexample() {
+    let (set1, set2) = path_045_same_marginals_different_correlation();
+
+    let a_vals1: Vec<f64> = set1.iter().map(|(a, _)| *a).collect();
+    let b_vals1: Vec<f64> = set1.iter().map(|(_, b)| *b).collect();
+    let a_vals2: Vec<f64> = set2.iter().map(|(a, _)| *a).collect();
+    let b_vals2: Vec<f64> = set2.iter().map(|(_, b)| *b).collect();
+
+    let a1 = Measured045::from_values(&a_vals1, Path045State::Unresolved);
+    let b1 = Measured045::from_values(&b_vals1, Path045State::Unresolved);
+    let a2 = Measured045::from_values(&a_vals2, Path045State::Unresolved);
+    let b2 = Measured045::from_values(&b_vals2, Path045State::Unresolved);
+
+    // Identical A scalar range, identical B scalar range, identical
+    // epistemic state for both A and B, across both sets.
+    assert_eq!((a1.lower, a1.upper), (a2.lower, a2.upper), "A's compressed range is identical across both sets");
+    assert_eq!((b1.lower, b1.upper), (b2.lower, b2.upper), "B's compressed range is identical across both sets");
+    assert_eq!(a1.state, a2.state);
+    assert_eq!(b1.state, b2.state);
+
+    let verdict1 = path_045_candidate_c_joint_dominance(&set1);
+    let verdict2 = path_045_candidate_c_joint_dominance(&set2);
+
+    assert_ne!(
+        verdict1, verdict2,
+        "PROOF: individual Measured values for A and B (range AND epistemic state) are byte-\
+         identical across both joint admissible-state sets, yet the honest pairwise ranking \
+         verdict differs (Greater vs Incomparable) -- per-side Measured values are NOT sufficient \
+         for honest pairwise ranking; the joint/correlated admissible-state set itself must be \
+         consulted"
+    );
+}
+
+#[test]
+fn path_045_p_allocation_boundary_precondition() {
+    // No money formula -- only the precondition table for whether a
+    // ranking result may be consumed as an ORDERING FACT by a future
+    // allocation layer.
+    assert!(path_045_permits_allocation_ordering_assumption(Path045Relation::Greater), "1. strict dominance: proven across every jointly admissible world -- safe to consume");
+    assert!(path_045_permits_allocation_ordering_assumption(Path045Relation::Equal), "2. exact equality: proven across every jointly admissible world -- safe to consume");
+    assert!(!path_045_permits_allocation_ordering_assumption(Path045Relation::Unresolved), "3. unresolved ordering: insufficient evidence -- MUST NOT be consumed as an ordering fact");
+    assert!(!path_045_permits_allocation_ordering_assumption(Path045Relation::Incomparable), "4. incomparable: admissible states PROVE no order holds -- MUST NOT be treated as any kind of order, including a tie");
+    assert!(!path_045_permits_allocation_ordering_assumption(Path045Relation::Conflicted), "5. conflict: MUST NOT be consumed by any downstream ordering logic until resolved");
+    assert!(path_045_permits_allocation_ordering_assumption(Path045Relation::Less));
+
+    // This repository's ACTUAL allocation (`allocate_*_pool`) does not
+    // consume an ordering fact at all -- it consumes a scalar VALUE
+    // directly (proportional-share normalization, PATH-045-N). This
+    // boundary is therefore prospective guidance for any FUTURE
+    // ranking-consuming layer, not a description of, or change to,
+    // existing behavior.
+}
