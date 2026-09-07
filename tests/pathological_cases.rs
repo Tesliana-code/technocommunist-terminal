@@ -11758,3 +11758,763 @@ fn path_045_p_allocation_boundary_precondition() {
     // ranking-consuming layer, not a description of, or change to,
     // existing behavior.
 }
+
+// =====================================================================
+// PATH-046 -- NORMALIZATION / ALLOCATION ELIGIBILITY UNDER EPISTEMIC
+// UNCERTAINTY (H17)
+//
+// Disposable experimental machinery only, EXCEPT where noted tests call
+// the real production `allocate_contribution_pool` /
+// `ContributionEvent::calculate` directly to observe actual behavior.
+// No production code was modified.
+//
+// PRODUCTION ALLOCATION INVENTORY (read before designing anything):
+//
+// `allocate_contribution_pool(events, weights, pool) -> Result<Vec<
+// ContributionAllocation>, &'static str>` (distribution.rs):
+// - `ContributionEvent::calculate` computes `evidence_adjusted_value =
+//   base_work_value * weighted_factors * evidence_confidence`, where
+//   `weighted_factors` is a weighted sum of 4 factors (weights sum to
+//   1.0, each factor validated to [0,1]) and `evidence_confidence` is
+//   also validated to [0,1]. `base_work_value < 0.0` is REJECTED
+//   (Err) -- so a NEGATIVE contribution cannot reach normalization
+//   through this validated path (PATH-046-M: impossible by
+//   construction, confirmed).
+// - `total_contribution = sum(evidence_adjusted_value)`.
+// - Zero-total handling: `total_contribution <= 0.0` -> if
+//   `contribution_pool == 0.0`, returns `Ok(Vec::new())` (an EMPTY
+//   vector, not one zero-amount entry per input event); otherwise
+//   `Err("cannot allocate a positive contribution pool with zero
+//   verified contribution")`. Normalization is UNDEFINED (rejected, not
+//   silently zeroed) whenever total contribution is zero and the pool
+//   is positive.
+// - Normalization formula: `normalized_share = value / total`,
+//   `allocated_amount = pool * normalized_share` -- exactly the
+//   `share_i = value_i / sum_j(value_j)` shape the mission asked to
+//   verify, confirmed by direct inspection, not assumed.
+// - NO deduplication of any kind exists for `ContributionEvent` --
+//   `distribution.rs`/`contribution.rs` contain no structural-key/
+//   content dedup analogous to `deduplicate_structural_dependencies`
+//   (FIND-007). This is a REAL, CONFIRMED GAP relative to FIND-007's
+//   principle at this specific production boundary -- see
+//   PATH-046-J, which demonstrates it directly against the real
+//   function rather than test-local machinery.
+// - NO rounding, cents, or currency-unit logic exists anywhere in this
+//   pipeline -- pure `f64` arithmetic throughout. Conservation is only
+//   ever tested (existing tests included) with an epsilon tolerance,
+//   never asserted bit-exact.
+// - Numeric domain gaps: `base_work_value < 0.0` does NOT catch `NaN`
+//   (IEEE-754 comparisons against NaN are always `false`), and there is
+//   no upper bound check at all -- so `NaN` and `f64::INFINITY` both
+//   pass validation. `total_contribution <= 0.0` likewise does not
+//   catch `NaN`. A single `NaN` (or `INFINITY`, in the multi-
+//   contributor infinity/infinity case) contributor input silently
+//   POISONS EVERY contributor's `normalized_share` with `NaN`, inside
+//   an `Ok(...)` result, not an `Err`. Confirmed directly against
+//   production in PATH-046-M -- not fixed, only reported, per this
+//   mission's explicit "do not modify production allocation behavior."
+// - Normalization is POPULATION-RELATIVE: the denominator is the sum
+//   over EVERY event actually passed to the function. Adding or
+//   removing a contributor changes every other contributor's
+//   `normalized_share` without changing their own raw
+//   `contribution_value` at all (PATH-046-P). This is a direct,
+//   confirmed CONTRAST with FIND-021/PATH-044-G, where Criticality had
+//   NO population-relative normalization anywhere in its pipeline.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path046State {
+    Supported,
+    Unresolved,
+    Conflicted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Measured046 {
+    lower: f64,
+    upper: f64,
+    state: Path046State,
+}
+
+impl Measured046 {
+    fn from_values(values: &[f64], ambient_state: Path046State) -> Self {
+        let lower = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let upper = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let state = if (upper - lower).abs() < 1e-9 { Path046State::Supported } else { ambient_state };
+        Measured046 { lower, upper, state }
+    }
+
+    fn is_exact(&self) -> bool {
+        (self.upper - self.lower).abs() < 1e-9
+    }
+}
+
+fn path_046_weights() -> distribution_machine::contribution::ContributionWeights {
+    distribution_machine::contribution::ContributionWeights {
+        responsibility: 0.20,
+        criticality: 0.30,
+        deal_impact: 0.25,
+        dependency_reach: 0.25,
+    }
+}
+
+/// Neutral factors (all 1.0) make `evidence_adjusted_value ==
+/// base_work_value` exactly, so raw input numbers can be used directly
+/// as contribution values without extra arithmetic obscuring the tests.
+fn path_046_events(values: &[(&str, f64)]) -> Vec<distribution_machine::contribution::ContributionEvent> {
+    values
+        .iter()
+        .map(|(id, v)| distribution_machine::contribution::ContributionEvent {
+            contributor_id: (*id).to_string(),
+            contribution_id: format!("{id}-c"),
+            base_work_value: *v,
+            factors: distribution_machine::contribution::ContributionFactors {
+                responsibility: 1.0,
+                criticality: 1.0,
+                deal_impact: 1.0,
+                stewardship: 1.0,
+                dependency_reach: 1.0,
+                evidence_confidence: 1.0,
+            },
+        })
+        .collect()
+}
+
+fn path_046_allocate(
+    values: &[(&str, f64)],
+    pool: f64,
+) -> Result<Vec<distribution_machine::distribution::ContributionAllocation>, &'static str> {
+    distribution_machine::distribution::allocate_contribution_pool(&path_046_events(values), &path_046_weights(), pool)
+}
+
+fn path_046_share_of(allocations: &[distribution_machine::distribution::ContributionAllocation], id: &str) -> f64 {
+    allocations.iter().find(|a| a.contributor_id == id).unwrap().normalized_share
+}
+
+// ---------------------------------------------------------------------
+// Candidate A -- normalize midpoints. Attacked in PATH-046's own "J"
+// analogue is not required by name here, but the mechanism is the same
+// one already killed in PATH-045-J; Candidate A is attacked directly in
+// PATH-046-D/G, where the midpoint-of-marginals world is shown to be
+// just one of several equally-admissible joint vectors, not a supported
+// unique result.
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Candidate B -- normalize marginal endpoints independently. Sound
+// enclosure (proven, not merely claimed) but potentially loose: for
+// contributor i with marginal range [lo_i, hi_i], its share is
+// minimized when i is at its own minimum AND every other contributor is
+// simultaneously at ITS OWN maximum (maximizing the denominator while
+// minimizing the numerator), and maximized under the mirror-image
+// combination. Both extremes are evaluated over the full independent
+// Cartesian product, a SUPERSET of the true jointly admissible set, so
+// the resulting bound always CONTAINS the true achievable share range
+// -- sound, never false -- but is tight only when the true joint set
+// actually achieves those specific cross-extrema combinations
+// (PATH-046-E).
+// ---------------------------------------------------------------------
+fn path_046_candidate_b_marginal_share_bounds(marginal_ranges: &[(&str, f64, f64)]) -> Vec<(String, f64, f64)> {
+    marginal_ranges
+        .iter()
+        .map(|(id, lo, hi)| {
+            let others_hi_sum: f64 = marginal_ranges.iter().filter(|(oid, _, _)| oid != id).map(|(_, _, h)| *h).sum();
+            let others_lo_sum: f64 = marginal_ranges.iter().filter(|(oid, _, _)| oid != id).map(|(_, l, _)| *l).sum();
+            let share_lo = lo / (lo + others_hi_sum);
+            let share_hi = hi / (hi + others_lo_sum);
+            (id.to_string(), share_lo, share_hi)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// Candidate C -- normalize every joint admissible world via the REAL
+// production formula. This is the reference semantics for this
+// experiment.
+// ---------------------------------------------------------------------
+fn path_046_joint_results(
+    worlds: &[Vec<(&str, f64)>],
+    pool: f64,
+) -> Vec<Result<Vec<distribution_machine::distribution::ContributionAllocation>, &'static str>> {
+    worlds.iter().map(|w| path_046_allocate(w, pool)).collect()
+}
+
+// ---------------------------------------------------------------------
+// Candidate D -- per-contributor share bounds + state, computed from
+// the TRUE joint admissible set (only over worlds that actually
+// normalize) rather than independently-derived marginal extrema.
+// ---------------------------------------------------------------------
+fn path_046_candidate_d_bounds(
+    worlds: &[Vec<(&str, f64)>],
+    pool: f64,
+    contributor_id: &str,
+    ambient_state: Path046State,
+) -> Measured046 {
+    let shares: Vec<f64> = worlds
+        .iter()
+        .filter_map(|w| path_046_allocate(w, pool).ok())
+        .map(|allocs| path_046_share_of(&allocs, contributor_id))
+        .collect();
+    Measured046::from_values(&shares, ambient_state)
+}
+
+// ---------------------------------------------------------------------
+// Candidate E -- joint allocation state, including a prospective
+// settlement-eligibility category. Fields derived from counterexamples
+// (F, G, L) rather than assumed up front.
+// ---------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path046Eligibility {
+    /// The joint admissible set is fully enumerated, every world
+    /// normalizes, and the resulting normalized vector is IDENTICAL
+    /// across every world -- regardless of whether the RAW inputs were
+    /// also identical (PATH-046-C/Q collapse into this same category;
+    /// see DERIVED).
+    Final,
+    /// The joint set is known and every world normalizes, but the
+    /// normalized vector genuinely varies -- OR only per-contributor
+    /// bounds are available without the retained joint vector set
+    /// (PATH-046-F/G's "bounds are not an allocation").
+    InformationalBounded,
+    BlockedUnresolved,
+    BlockedConflicted,
+    BlockedNonNormalizable,
+}
+
+fn path_046_settlement_eligibility(
+    world_results: &[Result<Vec<distribution_machine::distribution::ContributionAllocation>, &'static str>],
+    has_joint_vectors: bool,
+    conflicted: bool,
+    unresolved_missing_evidence: bool,
+) -> Path046Eligibility {
+    if conflicted {
+        return Path046Eligibility::BlockedConflicted;
+    }
+    if world_results.iter().any(|r| r.is_err()) {
+        return Path046Eligibility::BlockedNonNormalizable;
+    }
+    if unresolved_missing_evidence {
+        return Path046Eligibility::BlockedUnresolved;
+    }
+    if !has_joint_vectors {
+        return Path046Eligibility::InformationalBounded;
+    }
+    let oks: Vec<&Vec<distribution_machine::distribution::ContributionAllocation>> =
+        world_results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    let all_identical = oks.windows(2).all(|w| {
+        w[0].len() == w[1].len()
+            && w[0]
+                .iter()
+                .zip(w[1].iter())
+                .all(|(a, b)| a.contributor_id == b.contributor_id && (a.normalized_share - b.normalized_share).abs() < 1e-9)
+    });
+    if all_identical { Path046Eligibility::Final } else { Path046Eligibility::InformationalBounded }
+}
+
+// =====================================================================
+// PATH-046-A through R -- required pathological cases.
+// =====================================================================
+
+#[test]
+fn path_046_a_exact_control() {
+    let allocations = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 100.0).unwrap();
+
+    assert!((path_046_share_of(&allocations, "A") - 0.4).abs() < 1e-9);
+    assert!((path_046_share_of(&allocations, "B") - 0.3).abs() < 1e-9);
+    assert!((path_046_share_of(&allocations, "C") - 0.3).abs() < 1e-9);
+
+    let total: f64 = allocations.iter().map(|a| a.allocated_amount).sum();
+    assert!((total - 100.0).abs() < 1e-9, "conservation: allocated amounts sum to the pool");
+
+    let worlds = vec![vec![("A", 40.0), ("B", 30.0), ("C", 30.0)]];
+    let eligibility = path_046_settlement_eligibility(&path_046_joint_results(&worlds, 100.0), true, false, false);
+    assert_eq!(eligibility, Path046Eligibility::Final);
+}
+
+#[test]
+fn path_046_b_exact_numerator_uncertain_denominator() {
+    let worlds = vec![vec![("A", 40.0), ("B", 20.0)], vec![("A", 40.0), ("B", 60.0)]];
+
+    // A's raw value is exact (a single point) in every admissible world.
+    let a_raw = Measured046::from_values(&[40.0, 40.0], Path046State::Unresolved);
+    assert!(a_raw.is_exact());
+
+    let a_share = path_046_candidate_d_bounds(&worlds, 100.0, "A", Path046State::Unresolved);
+    assert!(
+        !a_share.is_exact(),
+        "A's raw contribution is exact (40 in both worlds), but its normalized share ({}..{}) \
+         still varies because the DENOMINATOR does -- exact numerator does not imply exact \
+         allocation share",
+        a_share.lower,
+        a_share.upper
+    );
+    assert!((a_share.lower - 40.0 / 100.0).abs() < 1e-9);
+    assert!((a_share.upper - 40.0 / 60.0).abs() < 1e-9);
+}
+
+#[test]
+fn path_046_c_uncertain_raw_values_invariant_share() {
+    let worlds = vec![vec![("A", 20.0), ("B", 10.0)], vec![("A", 40.0), ("B", 20.0)]];
+
+    let a_raw = Measured046::from_values(&[20.0, 40.0], Path046State::Unresolved);
+    assert!(!a_raw.is_exact(), "A's raw value genuinely varies (20 vs 40)");
+
+    let a_share = path_046_candidate_d_bounds(&worlds, 100.0, "A", Path046State::Unresolved);
+    assert!(
+        a_share.is_exact(),
+        "A's raw value is uncertain, but the ratio A:B (2:1) is preserved by proportional \
+         scaling in every admissible world -- the normalized share may legitimately be exact \
+         Supported ({}) despite uncertain raw input",
+        a_share.lower
+    );
+    assert!((a_share.lower - 2.0 / 3.0).abs() < 1e-9);
+    assert_eq!(a_share.state, Path046State::Supported);
+}
+
+/// Shared construction for D and E: identical marginal raw ranges for A
+/// (2 values {0.4,0.6}) and B (2 values {0.3,0.5}), monotone-paired
+/// (correlated) in set1 vs. crossed-paired in set2 -- the exact same
+/// device as PATH-045-C, now applied one layer closer to money.
+fn path_046_same_marginals_different_correlation() -> (Vec<Vec<(&'static str, f64)>>, Vec<Vec<(&'static str, f64)>>) {
+    let set1 = vec![vec![("A", 0.4), ("B", 0.3)], vec![("A", 0.6), ("B", 0.5)]];
+    let set2 = vec![vec![("A", 0.4), ("B", 0.5)], vec![("A", 0.6), ("B", 0.3)]];
+    (set1, set2)
+}
+
+#[test]
+fn path_046_d_identical_marginal_ranges_different_joint_allocation_possibilities() {
+    let (set1, set2) = path_046_same_marginals_different_correlation();
+
+    let marginal = |worlds: &[Vec<(&str, f64)>], id: &str| -> (f64, f64) {
+        let vals: Vec<f64> = worlds.iter().map(|w| w.iter().find(|(i, _)| *i == id).unwrap().1).collect();
+        (vals.iter().cloned().fold(f64::INFINITY, f64::min), vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max))
+    };
+    assert_eq!(marginal(&set1, "A"), marginal(&set2, "A"));
+    assert_eq!(marginal(&set1, "B"), marginal(&set2, "B"));
+
+    let a_share_set1 = path_046_candidate_d_bounds(&set1, 1.0, "A", Path046State::Unresolved);
+    let a_share_set2 = path_046_candidate_d_bounds(&set2, 1.0, "A", Path046State::Unresolved);
+
+    assert!(
+        (a_share_set1.lower - a_share_set2.lower).abs() > 1e-6 || (a_share_set1.upper - a_share_set2.upper).abs() > 1e-6,
+        "byte-identical marginal raw ranges for A and B, but the two joint pairings produce \
+         DIFFERENT admissible normalized-share ranges for A: set1={:?} set2={:?}",
+        a_share_set1,
+        a_share_set2
+    );
+}
+
+#[test]
+fn path_046_e_cartesian_fabrication_is_sound_but_loose() {
+    let (set1, _set2) = path_046_same_marginals_different_correlation();
+
+    let true_bound = path_046_candidate_d_bounds(&set1, 1.0, "A", Path046State::Unresolved);
+    let fabricated = path_046_candidate_b_marginal_share_bounds(&[("A", 0.4, 0.6), ("B", 0.3, 0.5)]);
+    let (_, fab_lo, fab_hi) = fabricated.iter().find(|(id, _, _)| id == "A").unwrap();
+
+    // SOUND: the independently-derived bound always contains the truth.
+    assert!(*fab_lo <= true_bound.lower + 1e-9);
+    assert!(*fab_hi >= true_bound.upper - 1e-9);
+
+    // LOOSE: for the correlated (monotone-paired) set, it is strictly
+    // wider than necessary.
+    assert!(
+        *fab_lo < true_bound.lower - 1e-6 || *fab_hi > true_bound.upper + 1e-6,
+        "Candidate B's independently-derived bound [{fab_lo}, {fab_hi}] must be strictly looser \
+         than the true correlated range [{}, {}] -- sound, but not tight",
+        true_bound.lower,
+        true_bound.upper
+    );
+}
+
+#[test]
+fn path_046_f_per_contributor_bounds_do_not_form_an_allocation() {
+    let bounds = path_046_candidate_b_marginal_share_bounds(&[("A", 0.4, 0.6), ("B", 0.3, 0.5)]);
+    let (_, _, a_hi) = bounds.iter().find(|(id, _, _)| id == "A").unwrap();
+    let (_, _, b_hi) = bounds.iter().find(|(id, _, _)| id == "B").unwrap();
+
+    let sum_of_independently_chosen_uppers = a_hi + b_hi;
+    assert!(
+        sum_of_independently_chosen_uppers > 1.0 + 1e-9,
+        "picking each contributor's OWN independently-sound upper bound and summing them gives \
+         {sum_of_independently_chosen_uppers} > 1.0 (100%) -- each individual bound is a sound \
+         projection of the true admissible set, but the COLLECTION of marginal bounds is not \
+         itself a valid joint allocation vector; no single admissible world need achieve every \
+         contributor's own extreme simultaneously"
+    );
+}
+
+#[test]
+fn path_046_g_same_share_bounds_different_joint_vector_set() {
+    // set1: two worlds, A and B trade off, C fixed. set2: the same two
+    // worlds PLUS a third "balanced" world -- identical per-contributor
+    // min/max for A, B, and C, but a genuinely different admissible
+    // joint vector set.
+    let set1 = vec![vec![("A", 50.0), ("B", 30.0), ("C", 20.0)], vec![("A", 30.0), ("B", 50.0), ("C", 20.0)]];
+    let set2 = vec![
+        vec![("A", 50.0), ("B", 30.0), ("C", 20.0)],
+        vec![("A", 40.0), ("B", 40.0), ("C", 20.0)],
+        vec![("A", 30.0), ("B", 50.0), ("C", 20.0)],
+    ];
+
+    for id in ["A", "B", "C"] {
+        let b1 = path_046_candidate_d_bounds(&set1, 1.0, id, Path046State::Unresolved);
+        let b2 = path_046_candidate_d_bounds(&set2, 1.0, id, Path046State::Unresolved);
+        assert!((b1.lower - b2.lower).abs() < 1e-9 && (b1.upper - b2.upper).abs() < 1e-9, "per-contributor share bounds for {id} must be identical across both sets");
+    }
+
+    // Legitimate downstream query: can A and B simultaneously both
+    // receive at least 0.35?
+    let query = |worlds: &[Vec<(&str, f64)>]| -> bool {
+        worlds.iter().any(|w| {
+            let allocs = path_046_allocate(w, 1.0).unwrap();
+            path_046_share_of(&allocs, "A") >= 0.35 && path_046_share_of(&allocs, "B") >= 0.35
+        })
+    };
+
+    let set1_answer = query(&set1);
+    let set2_answer = query(&set2);
+
+    assert!(!set1_answer, "set 1 has no admissible world where A and B are both >= 0.35 (they always trade off)");
+    assert!(set2_answer, "set 2's balanced world (0.4, 0.4, 0.2) explicitly admits exactly that");
+    assert_ne!(
+        set1_answer, set2_answer,
+        "PROOF: byte-identical per-contributor share bounds and epistemic states, yet a \
+         legitimate downstream joint query answers differently -- per-contributor allocation \
+         bounds are NOT an allocation"
+    );
+}
+
+#[test]
+fn path_046_h_conflicted_contributor_propagates_through_the_shared_denominator() {
+    // A has Conflicted evidence: two grounded, disagreeing origins put
+    // A at 20 or 40. B and C are fixed/exact.
+    let world_low = vec![("A", 20.0), ("B", 30.0), ("C", 30.0)];
+    let world_high = vec![("A", 40.0), ("B", 30.0), ("C", 30.0)];
+
+    let b_share = path_046_candidate_d_bounds(&[world_low.clone(), world_high.clone()], 1.0, "B", Path046State::Conflicted);
+    assert!(
+        !b_share.is_exact(),
+        "B's OWN raw value never changes, but its share still varies (denominator swings with \
+         A's conflicting value) -- B's share is NOT structurally quarantined from A's conflict"
+    );
+    assert_eq!(
+        b_share.state,
+        Path046State::Conflicted,
+        "because B's share is causally affected by A's Conflicted value, B's share must inherit \
+         Conflicted too, not silently downgrade to Unresolved or Supported -- this is NOT global \
+         contamination by assumption, it is a DEMONSTRATED numeric dependency through the shared \
+         denominator"
+    );
+
+    // Escape hatch: relevance CAN occasionally narrow, but only by
+    // numeric coincidence (an invariant ratio), never by structural
+    // guarantee -- reusing PATH-046-C's mechanism with A now Conflicted.
+    let coincidental_worlds = vec![vec![("A", 20.0), ("B", 10.0)], vec![("A", 40.0), ("B", 20.0)]];
+    let b_share_coincidental = path_046_candidate_d_bounds(&coincidental_worlds, 1.0, "B", Path046State::Conflicted);
+    assert!(
+        b_share_coincidental.is_exact(),
+        "when B's raw value happens to scale proportionally with A's conflicting swing, B's \
+         share stays exact DESPITE A being Conflicted -- but note the state field still exists \
+         to be set: this exactness is a numeric coincidence specific to these values, not a \
+         structural quarantine like PATH-043/044's disconnected-subgraph irrelevance"
+    );
+}
+
+#[test]
+fn path_046_i_missing_evidence_is_not_treated_as_zero() {
+    // It is UNRESOLVED whether A contributed at all -- not proven zero.
+    let world_a_absent = path_046_allocate(&[("B", 30.0), ("C", 30.0)], 1.0).unwrap();
+    let naive_missing_as_zero = path_046_share_of(&world_a_absent, "B");
+    assert!((naive_missing_as_zero - 0.5).abs() < 1e-9, "the naive shortcut silently commits to the 'A contributed nothing' world");
+
+    let world_a_present = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 1.0).unwrap();
+    let b_if_a_present = path_046_share_of(&world_a_present, "B");
+
+    let b_share = Measured046::from_values(&[naive_missing_as_zero, b_if_a_present], Path046State::Unresolved);
+    assert!(
+        !b_share.is_exact(),
+        "the TRUE admissible range for B's share must include BOTH possibilities (A absent and \
+         A present with real evidence) -- {:?} -- not collapse to the naive shortcut's single \
+         falsely-precise value {naive_missing_as_zero}",
+        b_share
+    );
+}
+
+#[test]
+fn path_046_j_duplicate_replay_evidence_currently_inflates_production_contribution() {
+    // REAL production behavior, not test-local machinery: distribution.rs
+    // has NO deduplication of ContributionEvents at all.
+    let baseline = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 1.0).unwrap();
+    let baseline_b = path_046_share_of(&baseline, "B");
+
+    // Literal duplicate (same contribution_id, re-serialized).
+    let mut events_literal_duplicate = path_046_events(&[("A", 40.0), ("B", 30.0), ("C", 30.0)]);
+    events_literal_duplicate.push(events_literal_duplicate[0].clone()); // exact clone of A's event
+    let duplicated = distribution_machine::distribution::allocate_contribution_pool(&events_literal_duplicate, &path_046_weights(), 1.0).unwrap();
+    let duplicated_b = path_046_share_of(&duplicated, "B");
+
+    // Replay under a fresh contribution_id.
+    let mut events_replayed = path_046_events(&[("A", 40.0), ("B", 30.0), ("C", 30.0)]);
+    events_replayed.push(distribution_machine::contribution::ContributionEvent {
+        contributor_id: "A".into(),
+        contribution_id: "A-replayed-under-a-new-id".into(),
+        base_work_value: 40.0,
+        factors: events_replayed[0].factors,
+    });
+    let replayed = distribution_machine::distribution::allocate_contribution_pool(&events_replayed, &path_046_weights(), 1.0).unwrap();
+    let replayed_b = path_046_share_of(&replayed, "B");
+
+    assert!(
+        duplicated_b < baseline_b - 1e-9,
+        "CONFIRMED PRODUCTION GAP: `allocate_contribution_pool` has no dedup at all -- a literal \
+         duplicate ContributionEvent for A measurably shrinks B's share ({baseline_b} -> \
+         {duplicated_b}), contradicting FIND-007's principle at this specific production \
+         boundary. Not fixed here (out of scope: 'do not modify production allocation \
+         behavior') -- reported as an OBSERVED, currently-real gap."
+    );
+    assert!(
+        replayed_b < baseline_b - 1e-9,
+        "the SAME gap applies to replay under a fresh contribution_id ({baseline_b} -> {replayed_b}) -- there is no content-addressed key at all to dedup against"
+    );
+}
+
+#[test]
+fn path_046_k_representation_depth_leaves_allocation_invariant() {
+    use distribution_machine::measurement::{CapabilityId, DependencyEdge, canonicalize_pure_relays, reachable_capabilities};
+
+    let source = CapabilityId("source".into());
+    let protected = vec![CapabilityId("source".into()), CapabilityId("x".into())];
+
+    let value_from_reach = |edges: &[DependencyEdge]| -> f64 {
+        let (canonical, _) = canonicalize_pure_relays(&source, &protected, edges);
+        reachable_capabilities(&source, &canonical).len() as f64 * 10.0
+    };
+
+    let bare = vec![DependencyEdge::new("source", "x")];
+    let padded = vec![DependencyEdge::new("source", "relay1"), DependencyEdge::new("relay1", "x")];
+
+    let a_bare = path_046_allocate(&[("A", value_from_reach(&bare)), ("B", 30.0)], 1.0).unwrap();
+    let a_padded = path_046_allocate(&[("A", value_from_reach(&padded)), ("B", 30.0)], 1.0).unwrap();
+
+    assert!((path_046_share_of(&a_bare, "A") - path_046_share_of(&a_padded, "A")).abs() < 1e-9);
+}
+
+#[test]
+fn path_046_l_zero_total_worlds_are_handled_explicitly_not_invented() {
+    // (a) all-zero + positive pool -> Err, exact production message.
+    let all_zero_positive_pool = path_046_allocate(&[("A", 0.0), ("B", 0.0)], 100.0);
+    assert_eq!(all_zero_positive_pool, Err("cannot allocate a positive contribution pool with zero verified contribution"));
+
+    // (b) all-zero + zero pool -> Ok(empty vec), NOT one zero-amount
+    // entry per input event.
+    let all_zero_zero_pool = path_046_allocate(&[("A", 0.0), ("B", 0.0)], 0.0).unwrap();
+    assert!(all_zero_zero_pool.is_empty(), "production returns an EMPTY vec here, not 2 zero-amount entries");
+
+    // (c) a joint set containing BOTH a normalizable and a
+    // non-normalizable world cannot receive one unconditional verdict.
+    let worlds = vec![vec![("A", 40.0), ("B", 30.0)], vec![("A", 0.0), ("B", 0.0)]];
+    let results = path_046_joint_results(&worlds, 100.0);
+    assert!(results[0].is_ok() && results[1].is_err(), "one admissible world normalizes, the other does not");
+
+    let eligibility = path_046_settlement_eligibility(&results, true, false, false);
+    assert_eq!(
+        eligibility,
+        Path046Eligibility::BlockedNonNormalizable,
+        "a joint set spanning both a normalizable and a non-normalizable world must be flagged \
+         as blocked, distinct from ordinary Unresolved -- normalization is not even DEFINED in \
+         every admissible world, so no single allocation verdict (exact or bounded) may be \
+         reported"
+    );
+}
+
+#[test]
+fn path_046_m_negative_and_nan_infinity_domain_behavior() {
+    // Negative: rejected by construction (validated).
+    let negative = path_046_allocate(&[("A", -5.0), ("B", 10.0)], 100.0);
+    assert_eq!(negative, Err("base work value cannot be negative"), "negative contribution is impossible by construction -- rejected before normalization");
+
+    // NaN: NOT caught by `base_work_value < 0.0` (NaN comparisons are
+    // always false in IEEE-754) -- confirmed against REAL production.
+    let nan_result = path_046_allocate(&[("A", f64::NAN), ("B", 10.0)], 100.0);
+    assert!(nan_result.is_ok(), "production does NOT reject NaN input -- this is a confirmed gap, not an assumption");
+    let nan_allocations = nan_result.unwrap();
+    assert!(
+        nan_allocations.iter().all(|a| a.normalized_share.is_nan()),
+        "a single NaN contributor POISONS EVERY contributor's normalized_share with NaN, inside \
+         an Ok(...) result rather than surfacing as an error -- B's share becomes NaN too, even \
+         though B's own input was perfectly valid"
+    );
+
+    // Infinity: also not rejected (no upper bound check at all).
+    let inf_result = path_046_allocate(&[("A", f64::INFINITY), ("B", 10.0)], 100.0);
+    assert!(inf_result.is_ok());
+    let inf_allocations = inf_result.unwrap();
+    assert!(
+        path_046_share_of(&inf_allocations, "A").is_nan(),
+        "infinity/infinity for the infinite contributor's own share is NaN"
+    );
+    assert_eq!(path_046_share_of(&inf_allocations, "B"), 0.0, "a finite contributor's share against an infinite total silently becomes exactly 0.0, not an error");
+}
+
+#[test]
+fn path_046_n_conservation_is_machine_approximate_not_bit_exact_by_construction() {
+    // No rounding/cents/currency-unit logic exists anywhere in this
+    // pipeline (confirmed by inspection) -- pure f64 arithmetic.
+    let values: Vec<(&str, f64)> =
+        vec![("a", 1.0), ("b", 3.0), ("c", 7.0), ("d", 11.0), ("e", 13.0), ("f", 17.0), ("g", 19.0)];
+    let pool = 987_654.321;
+    let allocations = path_046_allocate(&values, pool).unwrap();
+
+    let total: f64 = allocations.iter().map(|a| a.allocated_amount).sum();
+
+    // Mathematical conservation (exact in real-number arithmetic) is
+    // only approximated by machine-representation conservation here --
+    // tested with an epsilon, exactly like every existing production
+    // test for this function already does (never asserted bit-exact).
+    assert!((total - pool).abs() < 1e-6, "machine-representation conservation holds within floating-point epsilon");
+
+    let shares_sum: f64 = allocations.iter().map(|a| a.normalized_share).sum();
+    assert!((shares_sum - 1.0).abs() < 1e-9);
+
+    // No money-unit (cents/dinars) rounding exists to test -- explicitly
+    // not invented here, per this mission's instructions.
+}
+
+#[test]
+fn path_046_o_scale_invariance() {
+    let base = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 100.0).unwrap();
+    let k = 3.7;
+    let scaled = path_046_allocate(&[("A", 40.0 * k), ("B", 30.0 * k), ("C", 30.0 * k)], 100.0).unwrap();
+
+    for id in ["A", "B", "C"] {
+        assert!(
+            (path_046_share_of(&base, id) - path_046_share_of(&scaled, id)).abs() < 1e-9,
+            "common positive scaling of every raw contribution must not change normalized shares"
+        );
+    }
+}
+
+#[test]
+fn path_046_p_contributor_set_change_is_population_relative() {
+    let just_ab = path_046_allocate(&[("A", 40.0), ("B", 30.0)], 1.0).unwrap();
+    let a_share_before = path_046_share_of(&just_ab, "A");
+    let b_share_before = path_046_share_of(&just_ab, "B");
+
+    let with_c = path_046_allocate(&[("A", 40.0), ("B", 30.0), ("C", 30.0)], 1.0).unwrap();
+    let a_share_after = path_046_share_of(&with_c, "A");
+    let b_share_after = path_046_share_of(&with_c, "B");
+
+    assert_ne!(a_share_before, a_share_after, "A's raw value never changed, but its SHARE changed purely because the population changed");
+    assert_ne!(b_share_before, b_share_after);
+
+    // Uncertain C population membership makes A/B's shares a genuine
+    // range, even though A and B's own evidence is exact.
+    let worlds = vec![vec![("A", 40.0), ("B", 30.0)], vec![("A", 40.0), ("B", 30.0), ("C", 30.0)]];
+    let a_bounds = path_046_candidate_d_bounds(&worlds, 1.0, "A", Path046State::Unresolved);
+    assert!(!a_bounds.is_exact(), "A's own evidence is exact, but whether C exists at all is uncertain -- A's share is genuinely a range");
+
+    // Direct contrast with FIND-021/PATH-044-G: Criticality had NO
+    // population-relative normalization anywhere in its pipeline.
+    // Allocation, by contrast, is population-relative by CONSTRUCTION
+    // (the denominator is literally `sum` over every event passed in).
+}
+
+#[test]
+fn path_046_q_exact_individual_share_can_coexist_with_a_nonexact_joint_vector() {
+    // A's share is exactly invariant (always half the total) across two
+    // worlds where A's OWN raw value changes; B and C individually vary
+    // against each other while their COMBINED share (the other half)
+    // stays fixed.
+    let worlds = vec![vec![("A", 50.0), ("B", 30.0), ("C", 20.0)], vec![("A", 100.0), ("B", 40.0), ("C", 60.0)]];
+
+    let a_bounds = path_046_candidate_d_bounds(&worlds, 1.0, "A", Path046State::Unresolved);
+    let b_bounds = path_046_candidate_d_bounds(&worlds, 1.0, "B", Path046State::Unresolved);
+    let c_bounds = path_046_candidate_d_bounds(&worlds, 1.0, "C", Path046State::Unresolved);
+
+    assert!(a_bounds.is_exact(), "A's share stays exactly 0.5 in every admissible world");
+    assert!((a_bounds.lower - 0.5).abs() < 1e-9);
+    assert!(!b_bounds.is_exact(), "B's share genuinely varies");
+    assert!(!c_bounds.is_exact(), "C's share genuinely varies");
+
+    assert_eq!(
+        a_bounds.state,
+        Path046State::Supported,
+        "A may legitimately be reported Supported/exact even though the OVERALL joint allocation \
+         vector remains epistemically non-exact (B and C are not) -- relevance sensitivity \
+         extends to the allocation layer: A's own share is simply unaffected by how B/C's \
+         internal trade-off resolves"
+    );
+}
+
+#[test]
+fn path_046_r_settlement_eligibility_boundary() {
+    // 1. One exact supported joint allocation vector.
+    let worlds1 = vec![vec![("A", 40.0), ("B", 60.0)]];
+    assert_eq!(path_046_settlement_eligibility(&path_046_joint_results(&worlds1, 1.0), true, false, false), Path046Eligibility::Final);
+
+    // 2. Multiple raw worlds, one invariant normalized vector -- SAME
+    // category as 1 (see DERIVED: eligibility cares about output
+    // exactness, not raw-input exactness).
+    let worlds2 = vec![vec![("A", 20.0), ("B", 10.0)], vec![("A", 40.0), ("B", 20.0)]];
+    assert_eq!(path_046_settlement_eligibility(&path_046_joint_results(&worlds2, 1.0), true, false, false), Path046Eligibility::Final);
+
+    // 3. Multiple normalized vectors, bounded shares.
+    let worlds3 = vec![vec![("A", 40.0), ("B", 20.0)], vec![("A", 40.0), ("B", 60.0)]];
+    assert_eq!(path_046_settlement_eligibility(&path_046_joint_results(&worlds3, 1.0), true, false, false), Path046Eligibility::InformationalBounded);
+
+    // 4. Unresolved joint state (missing evidence).
+    assert_eq!(path_046_settlement_eligibility(&[], true, false, true), Path046Eligibility::BlockedUnresolved);
+
+    // 5. Conflicted contribution evidence.
+    assert_eq!(path_046_settlement_eligibility(&path_046_joint_results(&worlds3, 1.0), true, true, false), Path046Eligibility::BlockedConflicted);
+
+    // 6. A non-normalizable admissible world.
+    let worlds6 = vec![vec![("A", 40.0), ("B", 60.0)], vec![("A", 0.0), ("B", 0.0)]];
+    assert_eq!(path_046_settlement_eligibility(&path_046_joint_results(&worlds6, 1.0), true, false, false), Path046Eligibility::BlockedNonNormalizable);
+
+    // 7. Exact per-contributor bounds but lost joint correlation --
+    // without the retained joint vector set, never Final, regardless of
+    // how tight the bounds look.
+    assert_eq!(
+        path_046_settlement_eligibility(&[], false, false, false),
+        Path046Eligibility::InformationalBounded,
+        "per-contributor bounds alone, without the joint vector set, can never be promoted to \
+         Final -- same category as case 3, per PATH-046-F/G"
+    );
+
+    // Downstream consumption rule: only `Final` permits a downstream
+    // consumer to treat allocation shares as final economic facts.
+    // `InformationalBounded` permits informational/bounded reporting
+    // only. `BlockedUnresolved`/`BlockedConflicted`/
+    // `BlockedNonNormalizable` must block settlement entirely. No
+    // escrow, guaranteed-minimum, reserve-holding, or partial-
+    // settlement policy is defined here -- explicitly out of scope.
+}
+
+#[test]
+fn path_046_compositional_question_separately_derived_bounds_do_not_compose_into_an_allocation() {
+    // Mirrors PATH-045-M: per-contributor allocation results derived
+    // SEPARATELY (from non-reconciled evidence) cannot be safely
+    // recombined into one allocation without checking joint
+    // compatibility -- reusing PATH-046-F's mechanism as the direct
+    // proof, framed explicitly as the compositional question's answer.
+    let a_bounds_from_one_source = path_046_candidate_b_marginal_share_bounds(&[("A", 0.4, 0.6), ("B", 0.3, 0.5)])
+        .into_iter()
+        .find(|(id, _, _)| id == "A")
+        .unwrap();
+    let b_bounds_from_a_different_source = path_046_candidate_b_marginal_share_bounds(&[("A", 0.4, 0.6), ("B", 0.3, 0.5)])
+        .into_iter()
+        .find(|(id, _, _)| id == "B")
+        .unwrap();
+
+    let naive_composed_upper = a_bounds_from_one_source.2 + b_bounds_from_a_different_source.2;
+    assert!(
+        naive_composed_upper > 1.0 + 1e-9,
+        "composing each contributor's independently-derived upper bound ({naive_composed_upper}) \
+         exceeds 100% -- confirming H16's PATH-045-M finding generalizes to allocation: separate \
+         per-contributor results are safe to compose into ONE allocation only when they share a \
+         joint compatibility relation (the actual joint admissible vector set); without it, \
+         composition is REJECTED, not merely unproven"
+    );
+}
