@@ -10145,3 +10145,947 @@ fn path_043_l_composition_never_becomes_more_precise_than_its_inputs_justify() {
     assert_eq!(composed_exact.state, Path043State::Supported);
     assert_eq!(composed_exact.lower, 12);
 }
+
+// =====================================================================
+// PATH-044 -- CAN BOUNDED EPISTEMIC MEASUREMENT SURVIVE MULTI-DIMENSIONAL
+// CRITICALITY? (H15)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::measurement` or wired into any production/
+// allocation path. Builds on FIND-020 (PATH-043): the smallest surviving
+// representation for a SINGLE count-like observable was
+// `Measured { lower, upper, state }`. PATH-044 asks whether that
+// generalizes once Criticality depends on FOUR interacting observables
+// (`CriticalityObservables`) rather than one.
+//
+// PRODUCTION INVENTORY (read before designing anything below):
+//
+// `CriticalityObservables { qualified_dependency_weight: f64 [0,1],
+// blocking_paths: u32, failure_blast_radius: u32, substitutability:
+// Substitutability }` -> `measure_criticality(observables, weights) ->
+// CriticalityMeasurement { ..., score: f64 }`. `score` is a WEIGHTED
+// LINEAR SUM of four independently-normalized terms:
+// `qualified_dependency_weight` (used as-is, already in [0,1]),
+// `saturating_count(blocking_paths, 5)`, `saturating_count
+// (failure_blast_radius, 5)`, `substitutability_score(substitutability)`
+// (a fixed 4-level map: Easy=0.00, Moderate=0.33, Difficult=0.67,
+// None=1.00). Every term is a function of exactly ONE observable (no
+// cross terms) and every term is monotonic non-decreasing in that one
+// observable -- `measure_criticality` is a SEPARABLE MONOTONIC function.
+// This is the single fact this entire experiment turns on.
+//
+// `qualified_dependency_weight` itself has a real production derivation
+// pipeline, upstream of `CriticalityObservables`:
+// `qualify_dependency(DependencyEvidence, weights) -> QualifiedDependency
+// { ..., score }` (also a separable monotonic weighted linear sum) ->
+// `aggregate_dependency_weight_with_model(&[QualifiedDependency], model)`,
+// which has THREE real production models: `Complementary` (`1 -
+// prod(1-score_i)`, monotonic, continuous), `Thresholded` (drops any
+// dependency with `score < 0.20` before the same complementary
+// accumulation -- FIND-006's confirmed real discontinuity, still
+// monotonic but NOT continuous), and `RankedDecay` (sorts scores
+// descending, weights by `0.5^rank`, sums, clamps to 1.0 -- provably
+// monotonic per-input too: raising one dependency's score can only ever
+// move it to an EQUAL-OR-BETTER rank, and every adjacent rank swap this
+// triggers strictly increases the total, since the swap only ever
+// happens between a rising score and a smaller one it has just
+// overtaken; see `path_044_ranked_decay_is_monotonic_probe`).
+// `deduplicate_structural_dependencies`/`aggregate_structural_
+// dependencies_with_model` (FIND-007) sit one layer above that,
+// deduping `DependencyRecord`s by structural key before aggregation.
+//
+// NO population-relative normalization was found anywhere in this
+// pipeline (`grep`ped for population/percentile/z-score/rank-relative:
+// zero hits outside `RankedDecay`'s own internal, single-capability
+// rank, which never looks outside the slice passed to it) -- see
+// PATH-044-G, explicit N/A.
+//
+// `Substitutability`'s evidence-to-category derivation remains
+// unspecified in production (FIND-011, unchanged) -- there is no
+// `Evidence -> Substitutability` constructor to attack, only the fixed
+// four-level score map, which this experiment treats as a plain
+// (already-categorical) observable, exactly like `blocking_paths` and
+// `failure_blast_radius` (which also have no production derivation from
+// a graph -- FIND-012 -- and are supplied as literal inputs at every
+// call site, in production and in this experiment alike).
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path044State {
+    Supported,
+    Unresolved,
+    Conflicted,
+}
+
+fn path_044_worst_state(states: &[Path044State]) -> Path044State {
+    if states.iter().any(|s| *s == Path044State::Conflicted) {
+        Path044State::Conflicted
+    } else if states.iter().any(|s| *s == Path044State::Unresolved) {
+        Path044State::Unresolved
+    } else {
+        Path044State::Supported
+    }
+}
+
+/// Candidate A / the FIND-020 shape, reused for `f64` scores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Measured044 {
+    lower: f64,
+    upper: f64,
+    state: Path044State,
+}
+
+impl Measured044 {
+    fn from_values(values: &[f64], ambient_state: Path044State) -> Self {
+        let lower = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let upper = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let state = if (upper - lower).abs() < 1e-9 { Path044State::Supported } else { ambient_state };
+        Measured044 { lower, upper, state }
+    }
+
+    fn is_exact(&self) -> bool {
+        (self.upper - self.lower).abs() < 1e-9
+    }
+
+    fn contains(&self, other: &Measured044) -> bool {
+        self.lower <= other.lower + 1e-9 && self.upper >= other.upper - 1e-9
+    }
+}
+
+fn path_044_weights() -> distribution_machine::measurement::CriticalityMeasurementWeights {
+    distribution_machine::measurement::CriticalityMeasurementWeights {
+        qualified_dependency_weight: 0.30,
+        blocking_paths: 0.30,
+        failure_blast_radius: 0.25,
+        substitutability: 0.15,
+    }
+}
+
+fn path_044_world(
+    qdw: f64,
+    blocking: u32,
+    blast: u32,
+    sub: distribution_machine::measurement::Substitutability,
+) -> distribution_machine::measurement::CriticalityObservables {
+    distribution_machine::measurement::CriticalityObservables {
+        qualified_dependency_weight: qdw,
+        blocking_paths: blocking,
+        failure_blast_radius: blast,
+        substitutability: sub,
+    }
+}
+
+fn path_044_score(o: distribution_machine::measurement::CriticalityObservables) -> f64 {
+    distribution_machine::measurement::measure_criticality(o, path_044_weights()).unwrap().score
+}
+
+// ---------------------------------------------------------------------
+// Candidate A -- score each admissible world, then take min/max.
+// ---------------------------------------------------------------------
+fn path_044_candidate_a_score_each_world(
+    worlds: &[distribution_machine::measurement::CriticalityObservables],
+    ambient_state: Path044State,
+) -> Measured044 {
+    let scores: Vec<f64> = worlds.iter().copied().map(path_044_score).collect();
+    Measured044::from_values(&scores, ambient_state)
+}
+
+// ---------------------------------------------------------------------
+// Candidate B -- bound each observable independently, then score the
+// corners. Generates the full 2^4 corner set (deduplicating a dimension
+// down to a single value when every world agrees on it) so the corner
+// LIST itself, not just its min/max, is inspectable (PATH-044-C/N).
+// ---------------------------------------------------------------------
+fn path_044_generate_corners(
+    worlds: &[distribution_machine::measurement::CriticalityObservables],
+) -> Vec<distribution_machine::measurement::CriticalityObservables> {
+    use distribution_machine::measurement::Substitutability;
+
+    let qdw_lo = worlds.iter().map(|o| o.qualified_dependency_weight).fold(f64::INFINITY, f64::min);
+    let qdw_hi =
+        worlds.iter().map(|o| o.qualified_dependency_weight).fold(f64::NEG_INFINITY, f64::max);
+    let bp_lo = worlds.iter().map(|o| o.blocking_paths).min().unwrap();
+    let bp_hi = worlds.iter().map(|o| o.blocking_paths).max().unwrap();
+    let fbr_lo = worlds.iter().map(|o| o.failure_blast_radius).min().unwrap();
+    let fbr_hi = worlds.iter().map(|o| o.failure_blast_radius).max().unwrap();
+
+    let sub_rank = |s: Substitutability| -> u8 {
+        match s {
+            Substitutability::Easy => 0,
+            Substitutability::Moderate => 1,
+            Substitutability::Difficult => 2,
+            Substitutability::None => 3,
+        }
+    };
+    let sub_lo = worlds.iter().map(|o| o.substitutability).min_by_key(|s| sub_rank(*s)).unwrap();
+    let sub_hi = worlds.iter().map(|o| o.substitutability).max_by_key(|s| sub_rank(*s)).unwrap();
+
+    let mut qdws = vec![qdw_lo];
+    if (qdw_hi - qdw_lo).abs() > 1e-12 {
+        qdws.push(qdw_hi);
+    }
+    let mut bps = vec![bp_lo];
+    if bp_hi != bp_lo {
+        bps.push(bp_hi);
+    }
+    let mut fbrs = vec![fbr_lo];
+    if fbr_hi != fbr_lo {
+        fbrs.push(fbr_hi);
+    }
+    let mut subs = vec![sub_lo];
+    if sub_hi != sub_lo {
+        subs.push(sub_hi);
+    }
+
+    let mut corners = Vec::new();
+    for &qdw in &qdws {
+        for &bp in &bps {
+            for &fbr in &fbrs {
+                for &sub in &subs {
+                    corners.push(path_044_world(qdw, bp, fbr, sub));
+                }
+            }
+        }
+    }
+    corners
+}
+
+fn path_044_candidate_b_corner_scores(
+    worlds: &[distribution_machine::measurement::CriticalityObservables],
+    ambient_state: Path044State,
+) -> Measured044 {
+    let scores: Vec<f64> = path_044_generate_corners(worlds).into_iter().map(path_044_score).collect();
+    Measured044::from_values(&scores, ambient_state)
+}
+
+// ---------------------------------------------------------------------
+// Candidate C -- vector of independently bounded observables. Produces
+// no scalar; each dimension collapses to `Supported`/exact on its own,
+// independent of the others (relevance-sensitivity, per-dimension).
+// ---------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bound<T> {
+    lower: T,
+    upper: T,
+    state: Path044State,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeasuredCriticalityObservables {
+    qualified_dependency_weight: Bound<f64>,
+    blocking_paths: Bound<u32>,
+    failure_blast_radius: Bound<u32>,
+    substitutability: Bound<distribution_machine::measurement::Substitutability>,
+}
+
+fn path_044_candidate_c_per_dimension_bounds(
+    worlds: &[distribution_machine::measurement::CriticalityObservables],
+    ambient_state: Path044State,
+) -> MeasuredCriticalityObservables {
+    use distribution_machine::measurement::Substitutability;
+
+    let qdw_vals: Vec<f64> = worlds.iter().map(|o| o.qualified_dependency_weight).collect();
+    let qdw = Measured044::from_values(&qdw_vals, ambient_state);
+
+    let bp_lo = worlds.iter().map(|o| o.blocking_paths).min().unwrap();
+    let bp_hi = worlds.iter().map(|o| o.blocking_paths).max().unwrap();
+    let bp_state = if bp_lo == bp_hi { Path044State::Supported } else { ambient_state };
+
+    let fbr_lo = worlds.iter().map(|o| o.failure_blast_radius).min().unwrap();
+    let fbr_hi = worlds.iter().map(|o| o.failure_blast_radius).max().unwrap();
+    let fbr_state = if fbr_lo == fbr_hi { Path044State::Supported } else { ambient_state };
+
+    let sub_rank = |s: Substitutability| -> u8 {
+        match s {
+            Substitutability::Easy => 0,
+            Substitutability::Moderate => 1,
+            Substitutability::Difficult => 2,
+            Substitutability::None => 3,
+        }
+    };
+    let sub_lo = worlds.iter().map(|o| o.substitutability).min_by_key(|s| sub_rank(*s)).unwrap();
+    let sub_hi = worlds.iter().map(|o| o.substitutability).max_by_key(|s| sub_rank(*s)).unwrap();
+    let sub_state = if sub_lo == sub_hi { Path044State::Supported } else { ambient_state };
+
+    MeasuredCriticalityObservables {
+        qualified_dependency_weight: Bound { lower: qdw.lower, upper: qdw.upper, state: qdw.state },
+        blocking_paths: Bound { lower: bp_lo, upper: bp_hi, state: bp_state },
+        failure_blast_radius: Bound { lower: fbr_lo, upper: fbr_hi, state: fbr_state },
+        substitutability: Bound { lower: sub_lo, upper: sub_hi, state: sub_state },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate D -- retain the actual enumerated admissible states. The
+// scalar range is DERIVED from them (identical to Candidate A), but the
+// states themselves remain available for queries a compressed
+// representation cannot answer (PATH-044-O).
+// ---------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+struct AdmissibleCriticalityStates {
+    states: Vec<distribution_machine::measurement::CriticalityObservables>,
+    epistemic_state: Path044State,
+}
+
+impl AdmissibleCriticalityStates {
+    fn scalar_range(&self) -> Measured044 {
+        path_044_candidate_a_score_each_world(&self.states, self.epistemic_state)
+    }
+
+    fn admits(
+        &self,
+        predicate: impl Fn(&distribution_machine::measurement::CriticalityObservables) -> bool,
+    ) -> bool {
+        self.states.iter().any(predicate)
+    }
+}
+
+/// The central distinction this experiment exists to test: a SCALAR can
+/// be exact while the OBSERVABLE VECTOR explaining it remains unresolved
+/// (PATH-044-E/I). These are two independent epistemic axes -- FIND-020's
+/// single `state` field, generalized naively, would conflate them.
+#[derive(Debug, Clone, PartialEq)]
+struct Path044CriticalityResult {
+    scalar: Measured044,
+    explanation_state: Path044State,
+    admissible_states: Vec<distribution_machine::measurement::CriticalityObservables>,
+}
+
+fn path_044_build_result(
+    worlds: &[distribution_machine::measurement::CriticalityObservables],
+    ambient_state: Path044State,
+) -> Path044CriticalityResult {
+    let scalar = path_044_candidate_a_score_each_world(worlds, ambient_state);
+    let all_vectors_equal = worlds.windows(2).all(|w| w[0] == w[1]);
+    let explanation_state = if all_vectors_equal { Path044State::Supported } else { ambient_state };
+    Path044CriticalityResult {
+        scalar,
+        explanation_state,
+        admissible_states: worlds.to_vec(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path044Ranking {
+    DefinitelyGreater,
+    DefinitelyLess,
+    Overlapping,
+}
+
+fn path_044_compare(a: Measured044, b: Measured044) -> Path044Ranking {
+    if a.lower > b.upper {
+        Path044Ranking::DefinitelyGreater
+    } else if b.lower > a.upper {
+        Path044Ranking::DefinitelyLess
+    } else {
+        Path044Ranking::Overlapping
+    }
+}
+
+fn path_044_compose_sum(a: Measured044, b: Measured044) -> Measured044 {
+    let lower = a.lower + b.lower;
+    let upper = a.upper + b.upper;
+    let worst = path_044_worst_state(&[a.state, b.state]);
+    let state = if (upper - lower).abs() < 1e-9 { Path044State::Supported } else { worst };
+    Measured044 { lower, upper, state }
+}
+
+fn path_044_dep(score: f64) -> distribution_machine::measurement::QualifiedDependency {
+    distribution_machine::measurement::QualifiedDependency {
+        blocking_relevance: score,
+        failure_propagation: score,
+        operational_reliance: score,
+        business_path_relevance: score,
+        score,
+    }
+}
+
+fn path_044_dep_record(
+    dep_id: &str,
+    path_id: &str,
+    domain_id: &str,
+    source: &str,
+    target: &str,
+    score: f64,
+) -> distribution_machine::measurement::DependencyRecord {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyId, DependencyPathId, DependencyRelationshipType, FailureDomainId,
+    };
+
+    distribution_machine::measurement::DependencyRecord {
+        dependency_id: DependencyId(dep_id.into()),
+        dependency_path_id: DependencyPathId(path_id.into()),
+        failure_domain_id: FailureDomainId(domain_id.into()),
+        source_capability: CapabilityId(source.into()),
+        target_capability: CapabilityId(target.into()),
+        relationship_type: DependencyRelationshipType::Runtime,
+        qualified: path_044_dep(score),
+    }
+}
+
+// =====================================================================
+// Candidate attacks
+// =====================================================================
+
+#[test]
+fn path_044_candidate_a_range_is_correct_but_needs_an_enumerable_world_set() {
+    // Sanity/control for Candidate A: it is exactly as good as the
+    // admissible world set handed to it -- attacked properly by D/O
+    // below (an incomplete or over-broad world set silently changes the
+    // answer). No separate assertion beyond confirming it reproduces
+    // `measure_criticality` exactly for a single world (see PATH-044-A).
+    let world = path_044_world(0.6, 2, 2, distribution_machine::measurement::Substitutability::Moderate);
+    let measured = path_044_candidate_a_score_each_world(&[world], Path044State::Unresolved);
+    assert!(measured.is_exact());
+    assert_eq!(measured.lower, path_044_score(world));
+}
+
+#[test]
+fn path_044_ranked_decay_is_monotonic_probe() {
+    use distribution_machine::measurement::{DependencyAggregationModel, aggregate_dependency_weight_with_model};
+
+    // Empirical probe backing the inventory's monotonicity claim for
+    // RankedDecay: raising one dependency's own score, holding every
+    // other dependency's score fixed, never decreases the aggregate --
+    // even when the raised dependency jumps over several others in rank,
+    // displacing each of their decay weights downward.
+    let mut deps = vec![path_044_dep(0.90), path_044_dep(0.80), path_044_dep(0.70), path_044_dep(0.60)];
+    deps.push(path_044_dep(0.05)); // the one we will raise
+
+    let before = aggregate_dependency_weight_with_model(&deps, DependencyAggregationModel::RankedDecay);
+
+    deps[4] = path_044_dep(0.95); // now outranks all four others
+    let after = aggregate_dependency_weight_with_model(&deps, DependencyAggregationModel::RankedDecay);
+
+    assert!(
+        after >= before - 1e-9,
+        "RankedDecay must not be non-monotonic: raising dep[4] from 0.05 to 0.95 (jumping over 4 \
+         higher-ranked deps, displacing each of their decay weights down by one rank) still \
+         produced {after} >= {before}"
+    );
+}
+
+// =====================================================================
+// PATH-044-A through O -- required pathological cases.
+// =====================================================================
+
+#[test]
+fn path_044_a_fully_supported_exact_control() {
+    use distribution_machine::measurement::Substitutability;
+
+    let world = path_044_world(0.6, 2, 2, Substitutability::Moderate);
+    let measured = path_044_candidate_a_score_each_world(&[world], Path044State::Unresolved);
+
+    assert!(measured.is_exact());
+    assert_eq!(measured.state, Path044State::Supported);
+    assert!((measured.lower - path_044_score(world)).abs() < 1e-9);
+}
+
+#[test]
+fn path_044_b_one_uncertain_dimension_matches_simple_scalar_bounds() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Only dependency reach (qualified_dependency_weight) varies; the
+    // aggregation is separable and monotonic in this dimension alone, so
+    // Candidate A and Candidate B must agree exactly.
+    let low = path_044_world(0.4, 2, 2, Substitutability::Moderate);
+    let high = path_044_world(0.6, 2, 2, Substitutability::Moderate);
+
+    let a = path_044_candidate_a_score_each_world(&[low, high], Path044State::Unresolved);
+    let b = path_044_candidate_b_corner_scores(&[low, high], Path044State::Unresolved);
+
+    assert!((a.lower - b.lower).abs() < 1e-9);
+    assert!((a.upper - b.upper).abs() < 1e-9);
+    assert_eq!(a.state, b.state);
+    assert!(!a.is_exact(), "the dimension genuinely varies -- this must not collapse to exact");
+}
+
+#[test]
+fn path_044_c_correlated_dimensions_do_not_widen_the_scalar_range_but_do_fabricate_corner_states() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Correlated pair: only "all easy" and "all hard" are admissible --
+    // no mixed world.
+    let world_low = path_044_world(0.2, 1, 1, Substitutability::Easy);
+    let world_high = path_044_world(0.9, 5, 5, Substitutability::None);
+
+    let a = path_044_candidate_a_score_each_world(&[world_low, world_high], Path044State::Unresolved);
+    let b = path_044_candidate_b_corner_scores(&[world_low, world_high], Path044State::Unresolved);
+
+    // Because `measure_criticality` is separable+monotonic, the box's
+    // own extreme corners ARE `world_low`/`world_high` -- the scalar
+    // range is not widened by independent bounding in this specific
+    // (extremes-are-admissible) case.
+    assert!((a.lower - b.lower).abs() < 1e-9);
+    assert!((a.upper - b.upper).abs() < 1e-9);
+
+    // But the corner GENERATOR still fabricates mixed, non-admissible
+    // observable vectors as part of computing that range.
+    let corners = path_044_generate_corners(&[world_low, world_high]);
+    let fabricated = corners
+        .iter()
+        .filter(|c| **c != world_low && **c != world_high)
+        .count();
+    assert!(
+        fabricated > 0,
+        "independent per-dimension bounding still manufactures observable-vector combinations \
+         (e.g. high reach paired with Easy substitutability) that were never admissible, even \
+         though they happen not to distort THIS scalar range"
+    );
+}
+
+#[test]
+fn path_044_d_anticorrelated_dimensions_make_independent_bounds_strictly_looser() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Anti-correlated: reach is high while everything else is easy/
+    // contained, or reach is low while everything else is maxed out --
+    // the two admissible worlds sit INSIDE the independent-bounds box,
+    // not at its corners.
+    let world_hi_lo = path_044_world(0.9, 1, 1, Substitutability::Easy);
+    let world_lo_hi = path_044_world(0.2, 5, 5, Substitutability::None);
+
+    let a = path_044_candidate_a_score_each_world(&[world_hi_lo, world_lo_hi], Path044State::Unresolved);
+    let b = path_044_candidate_b_corner_scores(&[world_hi_lo, world_lo_hi], Path044State::Unresolved);
+
+    assert!(
+        b.lower < a.lower - 1e-9,
+        "Candidate B's independently-bounded lower ({}) must be strictly below the true \
+         admissible minimum ({}) -- the box's all-low corner (reach low AND everything easy) is \
+         not an admissible world, but it still gets evaluated",
+        b.lower,
+        a.lower
+    );
+    assert!(
+        b.upper > a.upper + 1e-9,
+        "Candidate B's independently-bounded upper ({}) must be strictly above the true \
+         admissible maximum ({})",
+        b.upper,
+        a.upper
+    );
+    assert!(a.contains(&a) && b.contains(&a), "B must still soundly CONTAIN the true range -- it is loose, never wrong");
+}
+
+/// Shared construction for E and I: two observable vectors that trade
+/// dependency reach against substitutability ease and land on the
+/// EXACT same scalar score, using real production semantics (the same
+/// separable weighted sum `measure_criticality` actually computes).
+fn path_044_two_worlds_same_score()
+-> (distribution_machine::measurement::CriticalityObservables, distribution_machine::measurement::CriticalityObservables)
+{
+    use distribution_machine::measurement::Substitutability;
+
+    let weights = path_044_weights();
+    let world_x = path_044_world(0.5, 2, 2, Substitutability::Moderate);
+
+    // Solve for the qdw that makes world_y (Easy substitutability,
+    // same blocking/blast) land on the identical score as world_x.
+    let sub_x = 0.33;
+    let sub_y = 0.0;
+    let qdw_y = (0.5 * weights.qualified_dependency_weight + sub_x * weights.substitutability
+        - sub_y * weights.substitutability)
+        / weights.qualified_dependency_weight;
+    let world_y = path_044_world(qdw_y, 2, 2, Substitutability::Easy);
+
+    (world_x, world_y)
+}
+
+#[test]
+fn path_044_e_same_scalar_different_structure_is_not_semantic_equivalence() {
+    let (world_x, world_y) = path_044_two_worlds_same_score();
+    assert_ne!(world_x, world_y, "the two worlds must genuinely differ in composition");
+
+    let score_x = path_044_score(world_x);
+    let score_y = path_044_score(world_y);
+    assert!(
+        (score_x - score_y).abs() < 1e-9,
+        "constructed to have identical scalar Criticality despite different composition: {score_x} vs {score_y}"
+    );
+
+    // A caller looking ONLY at the scalar would (correctly) see one
+    // exact number and (incorrectly, if they stop there) conclude the
+    // operational situation is fully known. It is not: high-reach-but-
+    // easily-substituted and moderate-reach-with-moderate-substitution
+    // are materially different postures that happen to net the same
+    // score.
+}
+
+#[test]
+fn path_044_i_exact_scalar_can_coexist_with_an_unresolved_explanation() {
+    let (world_x, world_y) = path_044_two_worlds_same_score();
+    let result = path_044_build_result(&[world_x, world_y], Path044State::Unresolved);
+
+    assert!(result.scalar.is_exact(), "the score is invariant across both admissible worlds");
+    assert_eq!(
+        result.scalar.state,
+        Path044State::Supported,
+        "the SCALAR is Supported -- every admissible world agrees on the number"
+    );
+    assert_eq!(
+        result.explanation_state,
+        Path044State::Unresolved,
+        "the OBSERVABLE VECTOR explaining that number remains Unresolved -- which world is real \
+         is still not known, even though it doesn't matter for this particular query. A single \
+         shared `state` field (FIND-020's original shape) cannot represent this split; scalar \
+         epistemic state and explanation epistemic state are two independent axes."
+    );
+}
+
+#[test]
+fn path_044_f_threshold_cliff_is_not_reported_as_smooth() {
+    use distribution_machine::measurement::{DependencyAggregationModel, aggregate_dependency_weight_with_model};
+
+    // FIND-006's real production cliff: DependencyAggregationModel::
+    // Thresholded drops any dependency scoring below 0.20 entirely.
+    let just_below = aggregate_dependency_weight_with_model(
+        &[path_044_dep(0.199)],
+        DependencyAggregationModel::Thresholded,
+    );
+    let just_above = aggregate_dependency_weight_with_model(
+        &[path_044_dep(0.201)],
+        DependencyAggregationModel::Thresholded,
+    );
+    let cliff_delta = (just_above - just_below).abs();
+
+    // Same tiny evidence delta (0.002), Complementary model: no cliff.
+    let smooth_below =
+        aggregate_dependency_weight_with_model(&[path_044_dep(0.199)], DependencyAggregationModel::Complementary);
+    let smooth_above =
+        aggregate_dependency_weight_with_model(&[path_044_dep(0.201)], DependencyAggregationModel::Complementary);
+    let smooth_delta = (smooth_above - smooth_below).abs();
+
+    assert!(
+        cliff_delta > smooth_delta * 50.0,
+        "Thresholded's output jump ({cliff_delta}) for a 0.002 evidence delta must be reported \
+         as an actual discontinuity, not smoothed into a continuous-looking interval -- compare \
+         to the SAME evidence delta under Complementary ({smooth_delta}), which has no cliff"
+    );
+
+    // Propagate through measure_criticality: the resulting Criticality
+    // Measured044 range is a CORRECT bound over the two discrete
+    // evidence points actually enumerated -- but nothing about that
+    // range licenses treating intermediate evidence values (e.g. 0.1999
+    // vs 0.2001) as producing intermediate scores. That would be false
+    // continuity.
+    use distribution_machine::measurement::Substitutability;
+    let world_below = path_044_world(just_below, 2, 2, Substitutability::Moderate);
+    let world_above = path_044_world(just_above, 2, 2, Substitutability::Moderate);
+    let measured = path_044_candidate_a_score_each_world(&[world_below, world_above], Path044State::Unresolved);
+    assert!(!measured.is_exact());
+    assert_eq!(measured.state, Path044State::Unresolved);
+}
+
+#[test]
+fn path_044_g_population_normalization_is_not_a_concept_in_production_criticality() {
+    // N/A, documented with an executable check rather than only prose:
+    // `measure_criticality`, `qualify_dependency`,
+    // `aggregate_dependency_weight_with_model`, and
+    // `aggregate_structural_dependencies_with_model` all take only the
+    // caller's own local inputs -- no population/peer-set parameter
+    // exists in any of their signatures (grep confirmed zero hits for
+    // population/percentile/z-score/relative-rank in `measurement.rs`
+    // outside RankedDecay's own single-capability internal ranking,
+    // which never looks outside the slice passed to it). Concretely:
+    // capability A's score is identical whether or not an unrelated
+    // capability B's data exists anywhere else in the program, because
+    // A's computation never receives it.
+    use distribution_machine::measurement::{DependencyAggregationModel, aggregate_structural_dependencies_with_model};
+
+    let a_records = vec![path_044_dep_record("d1", "p1", "f1", "A", "X", 0.5)];
+    let score_a_alone = aggregate_structural_dependencies_with_model(&a_records, DependencyAggregationModel::Complementary);
+
+    // An unrelated "population" capability B's records exist, but are
+    // never passed into A's computation -- by construction, they cannot
+    // matter, because no function here accepts a population argument.
+    let _b_records_exist_elsewhere = vec![path_044_dep_record("d2", "p2", "f2", "B", "Y", 0.99)];
+    let score_a_with_population_present = aggregate_structural_dependencies_with_model(&a_records, DependencyAggregationModel::Complementary);
+
+    assert_eq!(score_a_alone, score_a_with_population_present, "N/A: no population-relative normalization exists to attack");
+}
+
+#[test]
+fn path_044_h_conflict_in_one_dimension_survives_aggregation() {
+    use distribution_machine::measurement::Substitutability;
+
+    // blocking_paths is Conflicted (two grounded origins disagree);
+    // every other dimension is identical across both worlds (Supported).
+    let world_a = path_044_world(0.5, 1, 3, Substitutability::Moderate);
+    let world_b = path_044_world(0.5, 4, 3, Substitutability::Moderate);
+
+    let per_dim = path_044_candidate_c_per_dimension_bounds(&[world_a, world_b], Path044State::Conflicted);
+    assert_eq!(per_dim.qualified_dependency_weight.state, Path044State::Supported);
+    assert_eq!(per_dim.blocking_paths.state, Path044State::Conflicted);
+    assert_eq!(per_dim.failure_blast_radius.state, Path044State::Supported);
+    assert_eq!(per_dim.substitutability.state, Path044State::Supported);
+
+    let overall_ambient = path_044_worst_state(&[
+        per_dim.qualified_dependency_weight.state,
+        per_dim.blocking_paths.state,
+        per_dim.failure_blast_radius.state,
+        per_dim.substitutability.state,
+    ]);
+    assert_eq!(overall_ambient, Path044State::Conflicted);
+
+    let scalar = path_044_candidate_a_score_each_world(&[world_a, world_b], overall_ambient);
+    assert!(!scalar.is_exact());
+    assert_eq!(
+        scalar.state,
+        Path044State::Conflicted,
+        "conflict in ONE dimension must survive aggregation into the final scalar -- it must not \
+         be silently diluted into Unresolved (or hidden entirely) just because three of four \
+         dimensions are Supported"
+    );
+}
+
+#[test]
+fn path_044_j_duplicate_replay_evidence_does_not_narrow_the_criticality_range() {
+    use distribution_machine::measurement::{DependencyAggregationModel, aggregate_structural_dependencies_with_model};
+
+    // World 1: a single real structural dependency A->X. World 2: a
+    // genuinely different, stronger dependency A->Z (a real second
+    // admissible world, not a duplicate).
+    let world1_records = vec![path_044_dep_record("d1", "p1", "f1", "A", "X", 0.4)];
+    let world2_records = vec![path_044_dep_record("d1", "p1", "f1", "A", "Z", 0.8)];
+
+    let qdw1 = aggregate_structural_dependencies_with_model(&world1_records, DependencyAggregationModel::Complementary);
+    let qdw2 = aggregate_structural_dependencies_with_model(&world2_records, DependencyAggregationModel::Complementary);
+
+    use distribution_machine::measurement::Substitutability;
+    let baseline = path_044_candidate_a_score_each_world(
+        &[
+            path_044_world(qdw1, 2, 2, Substitutability::Moderate),
+            path_044_world(qdw2, 2, 2, Substitutability::Moderate),
+        ],
+        Path044State::Unresolved,
+    );
+
+    // Now replay/duplicate EACH world's own record under fresh
+    // dependency/path/domain ids (FIND-007's structural key still
+    // matches, so production dedup collapses these to the same single
+    // record).
+    let mut world1_replayed = world1_records.clone();
+    let mut world2_replayed = world2_records.clone();
+    for i in 0..9 {
+        world1_replayed.push(path_044_dep_record(&format!("d1-replay-{i}"), &format!("p1-replay-{i}"), &format!("f1-replay-{i}"), "A", "X", 0.4));
+        world2_replayed.push(path_044_dep_record(&format!("d2-replay-{i}"), &format!("p2-replay-{i}"), &format!("f2-replay-{i}"), "A", "Z", 0.8));
+    }
+
+    let qdw1_replayed = aggregate_structural_dependencies_with_model(&world1_replayed, DependencyAggregationModel::Complementary);
+    let qdw2_replayed = aggregate_structural_dependencies_with_model(&world2_replayed, DependencyAggregationModel::Complementary);
+    assert_eq!(qdw1, qdw1_replayed);
+    assert_eq!(qdw2, qdw2_replayed);
+
+    let replayed = path_044_candidate_a_score_each_world(
+        &[
+            path_044_world(qdw1_replayed, 2, 2, Substitutability::Moderate),
+            path_044_world(qdw2_replayed, 2, 2, Substitutability::Moderate),
+        ],
+        Path044State::Unresolved,
+    );
+
+    assert!((baseline.lower - replayed.lower).abs() < 1e-9);
+    assert!((baseline.upper - replayed.upper).abs() < 1e-9);
+    assert_eq!(baseline.state, replayed.state);
+}
+
+#[test]
+fn path_044_k_representation_depth_does_not_change_criticality() {
+    use distribution_machine::measurement::{
+        CapabilityId, DependencyEdge, Substitutability, canonicalize_pure_relays, reachable_capabilities,
+    };
+
+    // Chains PATH-043-J's already-proven graph-level invariant into the
+    // Criticality layer: derive a test-local qualified_dependency_weight
+    // proxy from reach (canonicalized first, per FIND-017/FIND-020),
+    // then confirm Criticality itself is invariant to harmless relay
+    // padding.
+    let source = CapabilityId("source".into());
+    let protected = vec![CapabilityId("source".into()), CapabilityId("x".into()), CapabilityId("y".into())];
+
+    let qdw_from_reach = |edges: &[DependencyEdge]| -> f64 {
+        let (canonical, _) = canonicalize_pure_relays(&source, &protected, edges);
+        (reachable_capabilities(&source, &canonical).len() as f64 / 10.0).min(1.0)
+    };
+
+    let bare = vec![DependencyEdge::new("source", "x"), DependencyEdge::new("source", "y")];
+    let padded = vec![
+        DependencyEdge::new("source", "relay1"),
+        DependencyEdge::new("relay1", "x"),
+        DependencyEdge::new("source", "relay2"),
+        DependencyEdge::new("relay2", "y"),
+    ];
+
+    let bare_world = path_044_world(qdw_from_reach(&bare), 2, 2, Substitutability::Moderate);
+    let padded_world = path_044_world(qdw_from_reach(&padded), 2, 2, Substitutability::Moderate);
+
+    assert_eq!(bare_world, padded_world, "reach-derived qdw must be invariant to relay padding");
+    assert!((path_044_score(bare_world) - path_044_score(padded_world)).abs() < 1e-9);
+}
+
+#[test]
+fn path_044_l_comparison_and_ranking_stay_epistemically_honest() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Case 1: definitely greater -- disjoint ranges.
+    let a = path_044_candidate_a_score_each_world(
+        &[path_044_world(0.9, 5, 5, Substitutability::None)],
+        Path044State::Unresolved,
+    );
+    let b = path_044_candidate_a_score_each_world(
+        &[path_044_world(0.1, 0, 0, Substitutability::Easy)],
+        Path044State::Unresolved,
+    );
+    assert_eq!(path_044_compare(a, b), Path044Ranking::DefinitelyGreater);
+
+    // Case 2: overlapping ranges -- must not manufacture a ranking.
+    let c = path_044_candidate_a_score_each_world(
+        &[
+            path_044_world(0.3, 2, 2, Substitutability::Moderate),
+            path_044_world(0.6, 2, 2, Substitutability::Moderate),
+        ],
+        Path044State::Unresolved,
+    );
+    let d = path_044_candidate_a_score_each_world(
+        &[
+            path_044_world(0.5, 2, 2, Substitutability::Moderate),
+            path_044_world(0.8, 2, 2, Substitutability::Moderate),
+        ],
+        Path044State::Unresolved,
+    );
+    assert_eq!(path_044_compare(c, d), Path044Ranking::Overlapping);
+
+    // Case 3: same scalar range, different admissible structure --
+    // reuses PATH-044-O's two sets. Ranking correctly reports a tie
+    // (Overlapping), but that tie does NOT mean the two situations are
+    // the same.
+    let world_low = path_044_world(0.2, 1, 1, Substitutability::Easy);
+    let world_high = path_044_world(0.9, 5, 5, Substitutability::None);
+    let world_mixed_1 = path_044_world(0.9, 1, 1, Substitutability::Easy);
+    let world_mixed_2 = path_044_world(0.2, 5, 5, Substitutability::None);
+
+    let set_diagonal = AdmissibleCriticalityStates { states: vec![world_low, world_high], epistemic_state: Path044State::Unresolved };
+    let set_all_corners = AdmissibleCriticalityStates {
+        states: vec![world_low, world_high, world_mixed_1, world_mixed_2],
+        epistemic_state: Path044State::Unresolved,
+    };
+
+    let e = set_diagonal.scalar_range();
+    let f = set_all_corners.scalar_range();
+    assert_eq!(path_044_compare(e, f), Path044Ranking::Overlapping);
+    assert!((e.lower - f.lower).abs() < 1e-9 && (e.upper - f.upper).abs() < 1e-9, "ranges are numerically identical");
+    assert_ne!(set_diagonal.states.len(), set_all_corners.states.len(), "but the admissible structures differ -- ranking-by-range correctly cannot see that difference");
+}
+
+#[test]
+fn path_044_m_downstream_aggregation_does_not_manufacture_certainty() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Two capabilities, each uncertain, driven by a SHARED pair of
+    // admissible worlds where their scores anti-correlate.
+    let world_hi_lo = path_044_world(0.9, 1, 1, Substitutability::Easy);
+    let world_lo_hi = path_044_world(0.2, 5, 5, Substitutability::None);
+
+    let cap1_in_world_hi_lo = path_044_score(world_hi_lo);
+    let cap1_in_world_lo_hi = path_044_score(world_lo_hi);
+    let cap1 = Measured044::from_values(&[cap1_in_world_hi_lo, cap1_in_world_lo_hi], Path044State::Unresolved);
+
+    // cap2 is high exactly when cap1 (via world_hi_lo) is low, and vice
+    // versa -- an independently-uncertain second capability with no
+    // shared admissible-world bookkeeping retained by the caller.
+    let cap2_in_world_hi_lo = 0.90;
+    let cap2_in_world_lo_hi = 0.20;
+    let cap2 = Measured044::from_values(&[cap2_in_world_hi_lo, cap2_in_world_lo_hi], Path044State::Unresolved);
+
+    let naive_composed = path_044_compose_sum(cap1, cap2);
+
+    let true_joint_hi_lo = cap1_in_world_hi_lo + cap2_in_world_hi_lo;
+    let true_joint_lo_hi = cap1_in_world_lo_hi + cap2_in_world_lo_hi;
+    let true_joint = Measured044::from_values(&[true_joint_hi_lo, true_joint_lo_hi], Path044State::Unresolved);
+
+    assert!(
+        naive_composed.lower <= true_joint.lower + 1e-9,
+        "composition must never claim a HIGHER minimum than the true joint minimum"
+    );
+    assert!(
+        naive_composed.upper >= true_joint.upper - 1e-9,
+        "composition must never claim a LOWER maximum than the true joint maximum"
+    );
+    assert_eq!(naive_composed.state, Path044State::Unresolved);
+}
+
+#[test]
+fn path_044_n_quantifies_candidate_b_state_space_explosion() {
+    use distribution_machine::measurement::Substitutability;
+
+    let world_hi_lo = path_044_world(0.9, 1, 1, Substitutability::Easy);
+    let world_lo_hi = path_044_world(0.2, 5, 5, Substitutability::None);
+
+    let corners = path_044_generate_corners(&[world_hi_lo, world_lo_hi]);
+    let admissible = vec![world_hi_lo, world_lo_hi];
+
+    let total = corners.len();
+    let admissible_present = corners.iter().filter(|c| admissible.contains(c)).count();
+    let false_states = total - admissible_present;
+    let false_fraction = false_states as f64 / total as f64;
+
+    assert_eq!(total, 16, "4 independently-varying dimensions each with 2 observed levels => 2^4 corners");
+    assert_eq!(admissible_present, 2);
+    assert!(
+        false_fraction > 0.5,
+        "Candidate B's per-dimension independent bounding fabricates {false_states}/{total} \
+         ({:.1}%) non-admissible observable-vector combinations for just 2 real admissible \
+         worlds across 4 dimensions",
+        false_fraction * 100.0
+    );
+}
+
+#[test]
+fn path_044_o_lossy_compression_counterexample() {
+    use distribution_machine::measurement::Substitutability;
+
+    // Two admissible-state SETS that compress to identical per-
+    // dimension bounds, identical scalar min/max, and identical
+    // epistemic state -- but answer a legitimate structural query
+    // ("could high reach co-occur with easy/contained substitutability
+    // and low blocking/blast?") differently.
+    let world_low = path_044_world(0.2, 1, 1, Substitutability::Easy);
+    let world_high = path_044_world(0.9, 5, 5, Substitutability::None);
+    let world_mixed_hi_reach_easy = path_044_world(0.9, 1, 1, Substitutability::Easy);
+    let world_mixed_lo_reach_hard = path_044_world(0.2, 5, 5, Substitutability::None);
+
+    let set1_diagonal = AdmissibleCriticalityStates { states: vec![world_low, world_high], epistemic_state: Path044State::Unresolved };
+    let set2_all_corners = AdmissibleCriticalityStates {
+        states: vec![world_low, world_high, world_mixed_hi_reach_easy, world_mixed_lo_reach_hard],
+        epistemic_state: Path044State::Unresolved,
+    };
+
+    // (a) Per-dimension bounds identical.
+    let c1 = path_044_candidate_c_per_dimension_bounds(&set1_diagonal.states, set1_diagonal.epistemic_state);
+    let c2 = path_044_candidate_c_per_dimension_bounds(&set2_all_corners.states, set2_all_corners.epistemic_state);
+    assert_eq!(c1, c2, "per-dimension bounds compress identically");
+
+    // (b) Scalar min/max identical.
+    let s1 = set1_diagonal.scalar_range();
+    let s2 = set2_all_corners.scalar_range();
+    assert!((s1.lower - s2.lower).abs() < 1e-9 && (s1.upper - s2.upper).abs() < 1e-9, "scalar ranges compress identically");
+
+    // (c) Epistemic state identical.
+    assert_eq!(s1.state, s2.state);
+
+    // (d) A legitimate downstream query answers DIFFERENTLY.
+    let query_high_reach_but_contained = |o: &distribution_machine::measurement::CriticalityObservables| {
+        o.qualified_dependency_weight > 0.5 && o.failure_blast_radius <= 1
+    };
+    let set1_answer = set1_diagonal.admits(query_high_reach_but_contained);
+    let set2_answer = set2_all_corners.admits(query_high_reach_but_contained);
+
+    assert!(!set1_answer, "set 1 has no admissible world where high reach co-occurs with contained blast radius");
+    assert!(set2_answer, "set 2 explicitly admits exactly that world");
+    assert_ne!(
+        set1_answer, set2_answer,
+        "PROOF: identical per-dimension bounds + identical scalar range + identical epistemic \
+         state, yet the two admissible-state sets give different answers to a legitimate \
+         downstream structural query -- bounds+state alone are NOT a complete representation; \
+         only retaining the actual admissible set (Candidate D) answers this correctly"
+    );
+}
