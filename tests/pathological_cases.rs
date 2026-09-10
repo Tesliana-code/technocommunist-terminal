@@ -16084,3 +16084,882 @@ fn path_049_j_claim_acquired_process_stalls_safety_holds_liveness_does_not() {
 // - `pruned_horizon`'s numeric `CallId` value remains unused by any
 //   decision; PATH-049 does not exercise pruning at all and so adds no
 //   evidence either way about its necessity.
+
+
+// =====================================================================
+// PATH-050 -- ECONOMIC EFFECT / SETTLEMENT COMMIT BOUNDARY (H21)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::contribution` or wired into any production
+// path -- no production file is touched by this experiment. Does NOT use
+// the production contribution engine, a database, HTTP, or a queue --
+// the "external economic effect" is a fake, in-process, test-local
+// provider only.
+//
+// QUESTION: after a caller has legitimately acquired `Reserved(K)`
+// (PATH-049's single-winner claim boundary), what is the minimum
+// protocol needed to ensure the economic side effect is neither applied
+// twice nor silently lost, when the following can fail INDEPENDENTLY:
+//   1. execute the economic effect
+//   2. persist effect evidence/receipt
+//   3. write `Settled(K)` locally
+//
+// H21: an atomic occurrence claim is insufficient for exactly-once
+// economic completion when the effect and the durable `Settled`
+// transition do not share one failure domain. If the effect can succeed
+// while `Settled` remains unrecorded, a retry cannot distinguish "effect
+// happened, confirmation was lost" from "effect never happened" unless
+// some additional durable or externally verifiable completion evidence
+// exists.
+//
+// PATH-050 reuses PATH-047/048/049's type vocabulary unmodified --
+// `TrustedSourceContract`, `SourceIdContract`, `Path047CandidateEvent`,
+// `OccurrenceKey`, `SettlementRecord`, `Path048Verdict`, `Path048Ledger`,
+// `path_048_reserve`, `path_048_confirm_settlement`,
+// `path_048_occurrence_key` -- and adds exactly what the effect boundary
+// needs: a fake `EffectProvider` and recovery candidates over it.
+// `EffectOperationId` IS the canonical `OccurrenceKey` (via
+// `path_048_occurrence_key`) -- never a raw `SourceId`, never a payload
+// hash, never `contribution_id`. This gives it, for free, from PATH-047/
+// 048/049: same occurrence -> same operation_id; distinct canonical
+// occurrences -> distinct operation_id (H); aliases -> same operation_id
+// after canonicalization (G). Global uniqueness beyond what PATH-047/048
+// already established for `OccurrenceKey` is not separately claimed.
+//
+// THREE FAILURE DOMAINS THIS EXPERIMENT DOES NOT COLLAPSE:
+//   1. CLAIM COMMIT     -- the occurrence becomes `Reserved` (PATH-049's
+//      subject; assumed already complete and correct here).
+//   2. EFFECT COMMIT     -- the external economic side effect happens
+//      (tracked by `EffectProvider::execution_count` -- REAL executions
+//      only, never incremented on a provider-suppressed duplicate).
+//   3. SETTLEMENT COMMIT -- local durable state becomes `Settled`
+//      (`path_048_confirm_settlement`, PATH-048's own mechanism,
+//      unmodified).
+//
+// CRASH-POINT MATRIX (a compact version also appears in FIND-028).
+// CROSS-REVIEW CORRECTION: GROUND TRUTH is what actually happened in a
+// given world; RECOVERABLE KNOWLEDGE is what the recovery candidate can
+// actually infer from the local evidence it is given. C1 and C2 have
+// DIFFERENT ground truth but IDENTICAL recoverable knowledge -- do not
+// read "yes" in the old "completion knowable?" column as something
+// `Reserved(K)` itself makes identifiable; it does not.
+//
+//   Point | Ground truth                                | Recoverable knowledge from Reserved(K) + surviving evidence alone | This candidate's action
+//   ------|-----------------------------------------------|----------------------------------------------------------------------|-------------------------
+//   C0    | no claim exists yet                            | n/a                                                                    | normal New path (PATH-049), out of PATH-050's scope
+//   C1    | effect did NOT happen                          | UNKNOWN -- observably identical to C2 from local state alone        | blind retry HAPPENS to be correct in this world, but recovery cannot know it is in C1 rather than C2 (PATH-050-C)
+//   C2    | effect DID happen; the PROVIDER's OWN receipt write did not persist | UNKNOWN -- observably identical to C1 from local state alone | blind retry is UNSAFE in this world; NOT independently modeled as its own crash sub-step -- this fake provider's `execute()` performs effect+receipt as one atomic step, so C2 is reasoned about, not separately exercised (see NOT ESTABLISHED in FIND-028)
+//   C3    | effect happened AND a durable provider receipt exists | KNOWN, via query                                              | recover from receipt, no re-execution (PATH-050-I's candidate) -- conditional on the receipt being AUTHENTIC (PATH-050-K/K2)
+//   C4    | `Settled(K)` locally recorded                   | KNOWN                                                                 | `AlreadySettled` (PATH-048, unmodified)
+//
+// The theorem is exactly this: C1 and C2 are indistinguishable IN
+// RECOVERABLE KNOWLEDGE despite opposite ground truth, so no function of
+// `Reserved(K)` + surviving local evidence alone can be correct in both.
+//
+// EXACTLY-ONCE LANGUAGE (deliberately avoided): this experiment does NOT
+// claim generic exactly-once semantics anywhere. Precise claims used
+// instead: safe recovery requires EITHER an authoritative completion
+// witness capable of distinguishing effect-happened from
+// effect-not-happened (a receipt, actually consulted -- I), OR an effect
+// boundary whose retry semantics make repeating the same canonical
+// operation harmless for the tested failure pattern (provider-side
+// idempotency -- D/E/F/G/H). A bare idempotency key/operation_id is
+// NEVER itself evidence that completion occurred -- it is operation
+// IDENTITY only; what survives is the PROVIDER's retry-idempotent
+// semantics plus its own memory keyed by that identity, and that memory
+// is exactly the same `receipts` store a receipt-based recovery would
+// consult. CROSS-REVIEW CORRECTION: because both survivors read the SAME
+// underlying provider memory, receipt AUTHENTICITY is a trust boundary
+// shared by BOTH candidates (A: idempotent `execute()`, B: `query_receipt`)
+// -- NOT unique to query-based recovery. PATH-050-K demonstrates this
+// against candidate B; PATH-050-K2 demonstrates the IDENTICAL forged
+// receipt also defeats candidate A, because `execute()`'s duplicate-
+// suppression check consults the same `receipts` map a forged entry was
+// inserted into.
+// =====================================================================
+
+/// A fake provider's execution outcome for one `(operation_id, payload)`
+/// claim -- three states, never a boolean, because "did this happen
+/// before" and "does it match" are separate questions once idempotency
+/// memory exists.
+#[derive(Debug, Clone, PartialEq)]
+enum EffectExecution {
+    /// A brand-new real effect executed for this operation_id.
+    Executed,
+    /// The provider recognized this operation_id from a PRIOR real
+    /// execution and suppressed a duplicate -- the original payload is
+    /// returned as evidence.
+    SuppressedDuplicate { original_payload: ContributionEvent },
+    /// The provider recognized this operation_id, but the incoming
+    /// payload DISAGREES with what was originally recorded against it.
+    /// No new effect executes; the original record is untouched.
+    PayloadMismatch { original_payload: ContributionEvent },
+}
+
+/// The fake provider's behavior mode. Kept explicit and distinct, per
+/// the mission brief, rather than one flag: `IdempotentByOperationId`
+/// is what makes `execute()` safe to call more than once for the SAME
+/// operation_id; `NonIdempotent` offers no memory at all and is the
+/// losing candidate C. "Receipt-queryable" (mode 3 in the brief) is
+/// modeled as a RECOVERY STRATEGY over the SAME idempotency memory an
+/// `IdempotentByOperationId` provider already maintains
+/// (`query_receipt`, below) rather than a third provider mode -- a
+/// provider capable of answering "did operation_id X complete" must
+/// already be remembering operation ids, which is exactly what
+/// `IdempotentByOperationId` models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectProviderMode {
+    NonIdempotent,
+    IdempotentByOperationId,
+}
+
+/// The smallest fake external effect provider needed. Tracks REAL
+/// effect executions (`execution_count`) and, for the idempotent mode,
+/// a durable receipt per operation_id (`receipts`) -- two independently
+/// writable observables, deliberately, so PATH-050-K can ask whether
+/// anything enforces they agree (nothing does; this is the point).
+#[derive(Debug, Clone)]
+struct EffectProvider {
+    mode: EffectProviderMode,
+    execution_count: u64,
+    receipts: std::collections::HashMap<OccurrenceKey, ContributionEvent>,
+}
+
+impl EffectProvider {
+    fn new(mode: EffectProviderMode) -> Self {
+        EffectProvider { mode, execution_count: 0, receipts: std::collections::HashMap::new() }
+    }
+
+    /// Executes (or suppresses, or flags a mismatch for) the effect for
+    /// `operation_id` with `payload`, per `self.mode`.
+    fn execute(&mut self, operation_id: OccurrenceKey, payload: ContributionEvent) -> EffectExecution {
+        match self.mode {
+            EffectProviderMode::NonIdempotent => {
+                // No memory at all -- ALWAYS a real execution, regardless
+                // of operation_id or prior calls. This is candidate C,
+                // the losing local-only design.
+                self.execution_count += 1;
+                EffectExecution::Executed
+            }
+            EffectProviderMode::IdempotentByOperationId => match self.receipts.get(&operation_id) {
+                None => {
+                    self.execution_count += 1;
+                    self.receipts.insert(operation_id, payload.clone());
+                    EffectExecution::Executed
+                }
+                Some(original) if *original == payload => {
+                    EffectExecution::SuppressedDuplicate { original_payload: original.clone() }
+                }
+                Some(original) => EffectExecution::PayloadMismatch { original_payload: original.clone() },
+            },
+        }
+    }
+
+    /// Query-only: does a durable receipt exist for `operation_id`,
+    /// WITHOUT triggering any effect. Present regardless of mode (a
+    /// `NonIdempotent` provider simply never has anything to find).
+    fn query_receipt(&self, operation_id: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.receipts.get(operation_id).cloned()
+    }
+}
+
+/// The recovery decision, distinct from PATH-048's `Path048Verdict` --
+/// this is about resuming a claim that already owns `Reserved(K)`
+/// across the effect boundary, not about resolving a fresh delivery's
+/// identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path050RecoveryVerdict {
+    /// The occurrence is now known complete (either freshly settled, or
+    /// recovered from trusted external/local evidence). No further
+    /// action needed.
+    AlreadyComplete,
+    /// The effect executed for the FIRST time during this recovery
+    /// attempt, and `Settled` was written as a result.
+    EffectExecutedNowSettled,
+    /// The retry's payload disagrees with either the local `Reserved`
+    /// record or the provider's own receipt. Rejected; nothing is
+    /// executed or overwritten.
+    Conflicted,
+    /// Completion status cannot be determined safely from the evidence
+    /// available. NO action is taken -- no execution, no `Settled`
+    /// write. Reconciliation (outside this candidate) is required.
+    Unresolved,
+}
+
+/// NAIVE LOSING CANDIDATE (never adopted): "if Reserved(K): retry the
+/// economic effect, then write Settled(K)" -- blindly re-executes
+/// without consulting any completion evidence at all. Demonstrates the
+/// duplicate-effect failure mode (PATH-050-A).
+fn path_050_naive_blind_retry_recovery(
+    ledger: &mut Path048Ledger,
+    provider: &mut EffectProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) {
+    if matches!(ledger.records.get(key), Some(SettlementRecord::Reserved { .. })) {
+        provider.execute(key.clone(), event.payload.clone());
+        path_048_confirm_settlement(ledger, key);
+    }
+}
+
+/// SECOND NAIVE LOSER (never adopted): "if Reserved(K): never retry,
+/// remain Reserved forever." A deliberate no-op, included so the
+/// safety-vs-liveness fork this creates can be demonstrated directly
+/// against the SAME starting state as the blind-retry loser
+/// (PATH-050-B).
+fn path_050_naive_never_retry_recovery(_ledger: &mut Path048Ledger, _provider: &mut EffectProvider, _key: &OccurrenceKey) {
+    // Deliberately does nothing.
+}
+
+/// SURVIVING CANDIDATE (execute-based): consults provider-side
+/// idempotency BEFORE trusting an execution to be safe. Under
+/// `NonIdempotent`, correctly refuses to guess (`Unresolved`) rather
+/// than risk a duplicate -- it does NOT distinguish "effect already
+/// happened" from "effect never happened" because a `NonIdempotent`
+/// provider offers no evidence either way. Under
+/// `IdempotentByOperationId`, safe to call unconditionally: a genuine
+/// first execution proceeds, a duplicate is suppressed by the provider
+/// itself, and a payload mismatch is rejected before anything executes.
+fn path_050_recover(
+    ledger: &mut Path048Ledger,
+    provider: &mut EffectProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) -> Path050RecoveryVerdict {
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            if *payload == event.payload { Path050RecoveryVerdict::AlreadyComplete } else { Path050RecoveryVerdict::Conflicted }
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path050RecoveryVerdict::Conflicted;
+            }
+            match provider.mode {
+                EffectProviderMode::NonIdempotent => Path050RecoveryVerdict::Unresolved,
+                EffectProviderMode::IdempotentByOperationId => match provider.execute(key.clone(), event.payload.clone()) {
+                    EffectExecution::Executed => {
+                        path_048_confirm_settlement(ledger, key);
+                        Path050RecoveryVerdict::EffectExecutedNowSettled
+                    }
+                    EffectExecution::SuppressedDuplicate { .. } => {
+                        path_048_confirm_settlement(ledger, key);
+                        Path050RecoveryVerdict::AlreadyComplete
+                    }
+                    EffectExecution::PayloadMismatch { .. } => Path050RecoveryVerdict::Conflicted,
+                },
+            }
+        }
+        None => Path050RecoveryVerdict::Unresolved,
+    }
+}
+
+/// SURVIVING CANDIDATE (query-first): NEVER calls `execute()` -- only
+/// `query_receipt()`. This is the strictly safer of the two surviving
+/// candidates with respect to duplicate risk (it can never itself cause
+/// a real execution), at the cost of never being able to ORIGINATE an
+/// effect -- it can only recover a `Settled` state from evidence that
+/// already exists, or correctly stay `Unresolved`. Vulnerable to
+/// PATH-050-K: it trusts whatever `query_receipt` returns, with no
+/// mechanism to verify the receipt's authenticity.
+fn path_050_recover_via_receipt_query(
+    ledger: &mut Path048Ledger,
+    provider: &EffectProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) -> Path050RecoveryVerdict {
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            if *payload == event.payload { Path050RecoveryVerdict::AlreadyComplete } else { Path050RecoveryVerdict::Conflicted }
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path050RecoveryVerdict::Conflicted;
+            }
+            match provider.query_receipt(key) {
+                Some(receipt_payload) if receipt_payload == event.payload => {
+                    path_048_confirm_settlement(ledger, key);
+                    Path050RecoveryVerdict::AlreadyComplete
+                }
+                Some(_) => Path050RecoveryVerdict::Conflicted,
+                None => Path050RecoveryVerdict::Unresolved,
+            }
+        }
+        None => Path050RecoveryVerdict::Unresolved,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Required cases A-K.
+// ---------------------------------------------------------------------
+
+/// PATH-050-A (PRIMARY DUPLICATE-EFFECT WITNESS): effect succeeds,
+/// Settled write is lost, naive blind retry executes the effect again.
+#[test]
+fn path_050_a_effect_succeeds_settled_write_lost_naive_retry_duplicates() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New, "claim K -> Reserved");
+
+    let mut provider = EffectProvider::new(EffectProviderMode::NonIdempotent);
+    let outcome = provider.execute(key.clone(), payload.clone());
+    assert_eq!(outcome, EffectExecution::Executed, "the external effect DID happen");
+    assert_eq!(provider.execution_count, 1);
+    // Settled write is lost -- `path_048_confirm_settlement` is
+    // deliberately never called. `ledger` still shows Reserved(K).
+
+    path_050_naive_blind_retry_recovery(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(
+        provider.execution_count, 2,
+        "PRIMARY DUPLICATE-EFFECT WITNESS: naive blind retry re-executed a real effect that had \
+         already happened -- effect_count == 2, not 1"
+    );
+}
+
+/// PATH-050-B: effect never happens; the system refuses to blindly
+/// retry a `Reserved` claim it cannot prove is safe.
+#[test]
+fn path_050_b_effect_never_happens_system_refuses_blind_retry() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload);
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New, "claim K -> Reserved");
+    // Crash before the effect -- it never happened at all.
+
+    let mut provider = EffectProvider::new(EffectProviderMode::NonIdempotent);
+    path_050_naive_never_retry_recovery(&mut ledger, &mut provider, &key);
+
+    assert_eq!(provider.execution_count, 0, "the never-retry policy performs no effect");
+    assert!(
+        matches!(ledger.records.get(&key), Some(SettlementRecord::Reserved { .. })),
+        "K remains Reserved forever under this policy -- SAFE (no duplicate is possible) but \
+         permanently incomplete: this is the LIVENESS failure mode the safety-vs-liveness fork \
+         creates"
+    );
+}
+
+/// PATH-050-C (CORE IDENTIFIABILITY RESULT): construct WORLD A (effect
+/// happened, local Settled write lost) and WORLD B (effect never
+/// happened, crash before it) with IDENTICAL state on every ledger
+/// observable this experiment's recovery candidates actually consult
+/// (`.records` -- the ONLY field `path_050_recover`/
+/// `path_050_recover_via_receipt_query` ever read), plus, for extra
+/// rigor, every other `Path048Ledger` field this test can cheaply
+/// compare. CROSS-REVIEW CORRECTION: `Path048Ledger` does not derive
+/// `PartialEq`, and the original executable assertion compared only
+/// `.records` -- this doc comment previously overclaimed "byte-identical
+/// ... every field" without that being separately verified. Both are now
+/// true and separately asserted below; the THEOREM itself depends only
+/// on `.records`, since that is all any candidate here ever reads. The
+/// SAME naive blind-retry procedure, applied to identical local state,
+/// is correct in exactly one world -- proving no function of
+/// `Reserved(K)` alone can be correct in both. The SAFE candidate
+/// (`path_050_recover` under `NonIdempotent`) is then shown to refuse to
+/// guess in either world.
+#[test]
+fn path_050_c_identical_local_state_theorem_same_reserved_opposite_correct_action() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    // WORLD A: the external effect DID happen; only the LOCAL Settled
+    // write was lost.
+    let mut ledger_a = Path048Ledger::new_attested_genesis();
+    let v_a = path_048_reserve(&mut ledger_a, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v_a, Path048Verdict::New);
+    let mut provider_a = EffectProvider::new(EffectProviderMode::NonIdempotent);
+    provider_a.execute(key.clone(), payload.clone());
+    assert_eq!(provider_a.execution_count, 1, "World A: the real effect genuinely happened once");
+
+    // WORLD B: the external effect did NOT happen; crash occurred
+    // strictly before it.
+    let mut ledger_b = Path048Ledger::new_attested_genesis();
+    let v_b = path_048_reserve(&mut ledger_b, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v_b, Path048Verdict::New);
+    let provider_b = EffectProvider::new(EffectProviderMode::NonIdempotent);
+    assert_eq!(provider_b.execution_count, 0, "World B: the real effect never happened");
+
+    // THE THEOREM: identical on every observable the recovery candidates
+    // actually consult -- `.records` is the ONLY field `path_050_recover`
+    // and `path_050_recover_via_receipt_query` ever read.
+    assert_eq!(
+        ledger_a.records, ledger_b.records,
+        "IDENTICAL RECOVERY-RELEVANT LOCAL STATE: both worlds show the exact same Reserved(K) \
+         record -- nothing in the local durable ledger distinguishes them, and this is the ONLY \
+         field any recovery candidate here reads"
+    );
+    // Reinforcing (not load-bearing for the theorem, since no candidate
+    // reads these): the OTHER `Path048Ledger` fields also happen to be
+    // identical, since both worlds were built via the same construction
+    // sequence.
+    assert_eq!(ledger_a.ever_active_namespaces, ledger_b.ever_active_namespaces);
+    assert_eq!(ledger_a.pruned_horizon, ledger_b.pruned_horizon);
+    assert_eq!(ledger_a.label_first_seen_namespace, ledger_b.label_first_seen_namespace);
+    assert_eq!(ledger_a.completeness, ledger_b.completeness);
+    assert_eq!(ledger_a.default_completeness, ledger_b.default_completeness);
+
+    // The SAME naive procedure, applied to this identical local state,
+    // is correct in exactly one world. Applied to INDEPENDENT clones of
+    // the ledger -- `path_050_naive_blind_retry_recovery` mutates the
+    // ledger it is given (confirming Settled), and the SAFE candidate
+    // below must observe each world's ORIGINAL, still-Reserved state,
+    // not whatever the naive demonstration left behind.
+    let mut ledger_a_naive = ledger_a.clone();
+    let mut provider_a_retried = provider_a.clone();
+    path_050_naive_blind_retry_recovery(&mut ledger_a_naive, &mut provider_a_retried, &key, &event);
+    let mut ledger_b_naive = ledger_b.clone();
+    let mut provider_b_retried = provider_b.clone();
+    path_050_naive_blind_retry_recovery(&mut ledger_b_naive, &mut provider_b_retried, &key, &event);
+
+    assert_eq!(provider_a_retried.execution_count, 2, "World A: naive retry DUPLICATES an effect that already happened");
+    assert_eq!(provider_b_retried.execution_count, 1, "World B: naive retry correctly performs the effect for the first time");
+    assert_ne!(
+        provider_a_retried.execution_count, provider_b_retried.execution_count,
+        "TEMPORAL IDENTIFIABILITY, one layer past PATH-048/PATH-049: identical current local \
+         state (Reserved(K), same payload, same trust/completeness state, no additional \
+         completion evidence) requires OPPOSITE correct recovery actions solely because of \
+         differing past state at the effect boundary -- no local recovery function over \
+         Reserved(K) alone can be correct in both worlds"
+    );
+
+    // The SAFE candidate refuses to guess in EITHER world, since it has
+    // no way to tell them apart without additional evidence -- run
+    // against each world's ORIGINAL Reserved state, untouched by the
+    // naive demonstration above.
+    let mut provider_a_safe = provider_a.clone();
+    let verdict_a = path_050_recover(&mut ledger_a, &mut provider_a_safe, &key, &event);
+    let mut provider_b_safe = provider_b.clone();
+    let verdict_b = path_050_recover(&mut ledger_b, &mut provider_b_safe, &key, &event);
+
+    assert_eq!(verdict_a, Path050RecoveryVerdict::Unresolved);
+    assert_eq!(verdict_b, Path050RecoveryVerdict::Unresolved);
+    assert_eq!(provider_a_safe.execution_count, 1, "safe recovery touches nothing -- World A's already-real effect is not duplicated");
+    assert_eq!(provider_b_safe.execution_count, 0, "safe recovery touches nothing -- World B's effect remains correctly un-executed, not silently lost either");
+}
+
+/// PATH-050-D: provider-side idempotency survives the tested failure
+/// pattern. Execute once, crash before Settled, retry the SAME
+/// operation_id -- the provider suppresses the duplicate; the real
+/// effect count stays at 1; recovery then writes Settled.
+#[test]
+fn path_050_d_idempotent_provider_suppresses_duplicate_then_settles() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    let first = provider.execute(key.clone(), payload.clone());
+    assert_eq!(first, EffectExecution::Executed);
+    assert_eq!(provider.execution_count, 1);
+    // Crash before Settled -- ledger still shows Reserved(K).
+
+    let verdict = path_050_recover(&mut ledger, &mut provider, &key, &event);
+    assert_eq!(
+        verdict,
+        Path050RecoveryVerdict::AlreadyComplete,
+        "the retry's execute() call is SUPPRESSED by the provider's own idempotency memory"
+    );
+    assert_eq!(provider.execution_count, 1, "real effect_count stays at 1 -- no duplicate");
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Settled { payload: settled_payload, .. } => assert_eq!(*settled_payload, payload),
+        other => panic!("expected Settled after recovery, got {other:?}"),
+    }
+}
+
+/// PATH-050-E: a retry presents a CHANGED payload against the same
+/// operation_id. Provider-side idempotency must not silently treat this
+/// as a harmless replay -- it is a conflict, preserving PATH-048's
+/// conflict semantics across the effect boundary.
+#[test]
+fn path_050_e_changed_payload_on_same_operation_id_is_conflicted_not_silent() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("alice", "review", 999.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let key = path_048_occurrence_key(&contract, &event_1).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    provider.execute(key.clone(), payload_1.clone());
+    assert_eq!(provider.execution_count, 1);
+
+    // Retry presents a DIFFERENT payload against the SAME operation_id.
+    // The local ledger's own Reserved payload already disagrees, so
+    // `path_050_recover` catches this before ever touching the
+    // provider -- exactly the point: no second effect is even attempted.
+    let event_2 = path_047_candidate("payroll-system", "evt-1", payload_2);
+    let verdict = path_050_recover(&mut ledger, &mut provider, &key, &event_2);
+
+    assert_eq!(verdict, Path050RecoveryVerdict::Conflicted, "a changed payload must be Conflicted, never a silent replay");
+    assert_eq!(provider.execution_count, 1, "no second effect executes");
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Reserved { payload, .. } => {
+            assert_eq!(*payload, payload_1, "the original Reserved payload is untouched")
+        }
+        other => panic!("expected Reserved (unchanged), got {other:?}"),
+    }
+    assert_eq!(
+        provider.query_receipt(&key),
+        Some(payload_1),
+        "the provider's own original receipt association is also untouched"
+    );
+}
+
+/// PATH-050-F: distinct occurrences must both execute -- guards against
+/// over-coalescing at the effect boundary.
+#[test]
+fn path_050_f_distinct_occurrences_both_execute_independently() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let event_2 = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 25.0));
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+    assert_ne!(key_1, key_2, "operation_id(K1) != operation_id(K2)");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_2);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    let v1 = path_050_recover(&mut ledger, &mut provider, &key_1, &event_1);
+    let v2 = path_050_recover(&mut ledger, &mut provider, &key_2, &event_2);
+
+    assert_eq!(v1, Path050RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(v2, Path050RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(provider.execution_count, 2, "each distinct occurrence's real effect executes exactly once");
+}
+
+/// PATH-050-G: alias convergence at the effect boundary. Two raw
+/// `SourceId`s resolving to the SAME canonical namespace produce the
+/// SAME operation_id -- only one real economic effect under the
+/// idempotent provider, proving the idempotency domain follows
+/// canonical occurrence identity, not the raw delivery label.
+#[test]
+fn path_050_g_alias_convergence_yields_one_real_effect() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "AUTHORITY canonicalizes both raw labels to the SAME operation_id");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_a);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    let v1 = path_050_recover(&mut ledger, &mut provider, &key_a, &event_a);
+    assert_eq!(v1, Path050RecoveryVerdict::EffectExecutedNowSettled);
+
+    // A "retry" delivered under the OTHER alias, same canonical key.
+    let v2 = path_050_recover(&mut ledger, &mut provider, &key_b, &event_b);
+    assert_eq!(v2, Path050RecoveryVerdict::AlreadyComplete);
+
+    assert_eq!(provider.execution_count, 1, "only ONE real economic effect despite two different raw source labels");
+}
+
+/// PATH-050-H: different namespaces, same event_id string -- distinct
+/// operation ids, both effects may execute. Preserves namespace-scoped
+/// identity at the effect boundary.
+#[test]
+fn path_050_h_different_namespaces_same_event_id_both_execute() {
+    let contract = TrustedSourceContract::trusting(&[
+        ("payroll-system", SourceIdContract::both_guaranteed()),
+        ("timesheet-system", SourceIdContract::both_guaranteed()),
+    ]);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+    let event_2 = path_047_candidate("timesheet-system", "evt-1", path_047_payload("alice", "review", 40.0));
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+    assert_ne!(key_1, key_2, "identical event_id string, but distinct operation ids across namespaces");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_2);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    path_050_recover(&mut ledger, &mut provider, &key_1, &event_1);
+    path_050_recover(&mut ledger, &mut provider, &key_2, &event_2);
+
+    assert_eq!(provider.execution_count, 2, "both effects execute -- event_id is namespace-scoped, never globally unique");
+}
+
+/// PATH-050-I: receipt-queryable provider recovery. The original
+/// execution happened and left a durable receipt; the LOCAL Settled
+/// write was lost. Recovery queries the provider BEFORE ever
+/// considering execution, finds the receipt, and recovers Settled
+/// WITHOUT re-executing.
+#[test]
+fn path_050_i_receipt_queryable_recovery_does_not_re_execute() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    provider.execute(key.clone(), payload.clone()); // the ORIGINAL execution, before the crash
+    assert_eq!(provider.execution_count, 1);
+    // Local crash: Settled write lost, but the provider's receipt
+    // survives (it is external to this local failure domain).
+
+    let verdict = path_050_recover_via_receipt_query(&mut ledger, &provider, &key, &event);
+
+    assert_eq!(verdict, Path050RecoveryVerdict::AlreadyComplete);
+    assert_eq!(provider.execution_count, 1, "recovery via receipt query NEVER re-executes -- effect_count remains 1");
+    assert!(matches!(ledger.records.get(&key), Some(SettlementRecord::Settled { .. })), "local Settled is recovered from external evidence");
+}
+
+/// PATH-050-J: no receipt / unknown external state. `Reserved(K)`, and
+/// the provider cannot prove whether the operation executed. Recovery
+/// must NOT guess -- `Unresolved`, zero new economic executions, `K`
+/// remains `Reserved` for reconciliation.
+#[test]
+fn path_050_j_no_receipt_unknown_external_state_stays_unresolved() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload);
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    // The provider is capable of answering receipt queries in general
+    // (IdempotentByOperationId), but genuinely holds NO receipt for this
+    // operation_id -- the provider itself cannot prove whether the
+    // operation executed (e.g. its own request may still be in flight,
+    // or genuinely never arrived).
+    let provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    assert_eq!(provider.query_receipt(&key), None);
+
+    let verdict = path_050_recover_via_receipt_query(&mut ledger, &provider, &key, &event);
+
+    assert_eq!(
+        verdict,
+        Path050RecoveryVerdict::Unresolved,
+        "epistemic discipline preserved: uncertainty at the effect boundary must not be laundered \
+         into a retry decision either way"
+    );
+    assert_eq!(provider.execution_count, 0, "zero NEW economic executions during recovery");
+    assert!(
+        matches!(ledger.records.get(&key), Some(SettlementRecord::Reserved { .. })),
+        "K remains Reserved -- reconciliation required, not guessed"
+    );
+}
+
+/// PATH-050-K: forged receipt attack, against Candidate B
+/// (`path_050_recover_via_receipt_query`). This experiment's fake
+/// provider naturally exposes a trust gap -- `receipts` and
+/// `execution_count` are two independently writable observables with
+/// nothing enforcing they agree. A receipt inserted WITHOUT a real
+/// execution demonstrates that receipt AUTHENTICITY is an unverifiable
+/// exogenous assumption this candidate cannot audit -- mirroring
+/// FIND-019/FIND-026's axiom-forgery pattern one layer further out, at
+/// the effect-completion boundary. See PATH-050-K2, immediately below,
+/// for the SAME attack against Candidate A -- both surviving candidates
+/// read the identical underlying `receipts` memory, so this is not a
+/// weakness unique to query-based recovery.
+#[test]
+fn path_050_k_forged_receipt_suppresses_a_needed_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    assert_eq!(provider.execution_count, 0, "no real effect has EVER executed");
+    // FORGERY: a receipt is inserted directly, bypassing `execute()`
+    // entirely -- standing in for a compromised, buggy, or merely
+    // untrustworthy receipt source. Nothing in this candidate's model
+    // prevents this from being indistinguishable from a genuine receipt.
+    provider.receipts.insert(key.clone(), payload.clone());
+
+    let verdict = path_050_recover_via_receipt_query(&mut ledger, &provider, &key, &event);
+
+    assert_eq!(
+        verdict,
+        Path050RecoveryVerdict::AlreadyComplete,
+        "AXIOM FORGERY, one layer further out: without an exogenous authenticity guarantee on the \
+         receipt itself, this candidate cannot distinguish a forged completion record from a \
+         genuine one -- it trusts the forged receipt and reports the occurrence complete"
+    );
+    assert_eq!(
+        provider.execution_count, 0,
+        "the NEEDED real effect was suppressed entirely -- a forged receipt caused a legitimate \
+         economic effect to never happen, silently"
+    );
+}
+
+/// PATH-050-K2 (cross-review addition): the IDENTICAL forged receipt
+/// also defeats Candidate A (`path_050_recover`, provider-side
+/// idempotency via `execute()`) -- not only Candidate B. Inspecting
+/// `EffectProvider::execute` under `IdempotentByOperationId` shows it
+/// consults `self.receipts.get(&operation_id)` FIRST, exactly as
+/// `query_receipt` does; a forged entry is indistinguishable from a
+/// genuine one to either code path, because both read the SAME map.
+/// This confirms receipt authenticity is a trust boundary SHARED by
+/// both surviving candidates, not unique to query-based recovery.
+#[test]
+fn path_050_k2_forged_receipt_also_defeats_provider_side_idempotency() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = EffectProvider::new(EffectProviderMode::IdempotentByOperationId);
+    assert_eq!(provider.execution_count, 0, "no real effect has EVER executed");
+    // The SAME forgery as K, now attacking Candidate A's execute()-based
+    // recovery path instead of Candidate B's query-based one.
+    provider.receipts.insert(key.clone(), payload.clone());
+
+    let verdict = path_050_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(
+        verdict,
+        Path050RecoveryVerdict::AlreadyComplete,
+        "Candidate A's execute() consults the SAME receipts map the forged entry was inserted \
+         into -- it returns SuppressedDuplicate for a forged receipt exactly as it would for a \
+         genuine one, and path_050_recover confirms Settled from that signal alone"
+    );
+    assert_eq!(
+        provider.execution_count, 0,
+        "the NEEDED real effect was suppressed entirely -- CONFIRMS receipt authenticity is a \
+         trust boundary shared by BOTH surviving candidates (A and B), because both trust the \
+         same underlying provider memory, not a weakness unique to the query-based recovery path"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+// ---------------------------------------------------------------------
+//
+// STRONGEST CRASH AMBIGUITY WITNESS: PATH-050-C -- WORLD A (effect
+// happened, Settled write lost) and WORLD B (effect never happened,
+// crash before it) produce byte-identical local ledger state
+// (`ledger_a.records == ledger_b.records`), yet the SAME naive recovery
+// procedure applied to that identical state is correct in exactly one
+// world (effect_count 2 vs. 1). No function of `Reserved(K)` alone can
+// be correct in both.
+//
+// H21: CONFIRMED for the constructed failure pattern. An atomic
+// occurrence claim (PATH-049) is demonstrably insufficient for
+// exactly-once economic completion once effect execution and the
+// durable Settled transition can fail independently -- this candidate
+// never claims otherwise, and PATH-050-A/B/C show the ambiguity is real
+// and unresolvable from local state alone. What resolves it, for the
+// FAILURE PATTERN TESTED (Settled write lost, effect provider still
+// reachable), is EITHER an effect boundary whose retry semantics make
+// repeating the same canonical operation harmless (provider-side
+// idempotency keyed by canonical operation_id -- D/E/F/G/H) OR an
+// authoritative completion witness capable of distinguishing
+// effect-happened from effect-not-happened (a queryable durable receipt
+// -- I) -- and K/K2 show the word AUTHORITATIVE there is doing real,
+// unverified work, for BOTH of these candidates, because both read the
+// SAME underlying provider memory.
+//
+// DUPLICATE-EFFECT RESULT (naive blind retry): effect_count == 2 (A, C).
+// LOST-EFFECT/LIVENESS RESULT (naive never-retry / safe-refuse under
+// NonIdempotent): effect_count == 0, permanently stuck Reserved (B, C).
+//
+// IDEMPOTENT-PROVIDER RESULT: retry suppressed, real effect_count stays
+// at 1, Settled written (D). Changed payload on the same operation_id is
+// Conflicted, not a silent replay, no second effect, original receipt
+// untouched (E).
+//
+// QUERYABLE-RECEIPT RESULT: recovery via query alone recovers Settled
+// from existing evidence with ZERO re-execution (I); with no receipt
+// present, correctly stays Unresolved with zero new executions and K
+// left Reserved for reconciliation (J).
+//
+// SAME-OCCURRENCE / DIFFERENT-PAYLOAD: Conflicted, caught before the
+// provider is even touched when the local Reserved record already
+// disagrees (E).
+//
+// ALIAS RESULT: two raw source labels resolving to one canonical
+// namespace produce the SAME operation_id -- exactly one real effect
+// (G).
+//
+// DIFFERENT-OCCURRENCE RESULT: distinct event_ids under one namespace
+// produce distinct operation ids; both effects execute independently,
+// effect_count == 2 total (F).
+//
+// DIFFERENT-NAMESPACE RESULT: identical event_id string, two canonical
+// namespaces -- distinct operation ids, both effects execute (H).
+//
+// UNRESOLVED/RECONCILIATION BEHAVIOR: whenever completion cannot be
+// proven (NonIdempotent with no evidence, C/B; or Idempotent-capable but
+// genuinely no receipt yet, J), this candidate returns `Unresolved`,
+// executes nothing, and leaves `K` `Reserved` rather than guessing in
+// either direction.
+//
+// RECEIPT AUTHENTICITY: became its OWN exogenous trust boundary (K, K2)
+// -- SHARED by BOTH surviving candidates, not unique to query-based
+// recovery. `EffectProvider::execute`'s duplicate-suppression check
+// (candidate A) and `query_receipt` (candidate B) read the identical
+// `receipts` map; a forged entry is indistinguishable from a genuine one
+// to either code path. This candidate propagates whatever that shared
+// memory reports and cannot verify it; a forged or merely-wrong receipt
+// silently suppresses a needed real effect regardless of which surviving
+// candidate is used for recovery. This is FIND-019/FIND-026's
+// axiom-forgery pattern recurring at the effect-completion boundary, not
+// solved here.
+//
+// SMALLEST SURVIVING COMPLETION WITNESS TESTED: a provider-maintained,
+// per-canonical-operation_id receipt -- whether reached via
+// idempotency-on-execute (D) or via an explicit pre-execution query (I).
+// Note precisely what this witness is: the PROVIDER's memory associated
+// with the operation_id (the receipt itself), never the bare
+// operation_id/idempotency key on its own -- a key is only identity, not
+// evidence that anything completed.
+// A bare local `effect_status` bit written in a SEPARATE local durable
+// step, AFTER an independently-failing external effect, by the SAME
+// process that might crash between the effect and that bit write, was
+// NOT tested as a separate candidate: PATH-050-C already shows this
+// reduces to the identical ambiguity one instruction later (a crash
+// between "effect happened" and "bit written" reproduces WORLD A
+// exactly), so it was not built as a distinct candidate -- it is,
+// structurally, candidate C (local-only) with an extra field that does
+// not close the gap. This scope is deliberately narrow: a bit
+// TRANSACTIONALLY COUPLED to the actual effect (i.e. the effect and the
+// bit write share one atomic failure domain, so neither can happen
+// without the other) would rest on a DIFFERENT failure-domain assumption
+// than this experiment tests, and is not evaluated here either way. A
+// receipt is useful specifically because its durability boundary is
+// OUTSIDE the local process's own failure domain; this candidate does
+// not verify that property for any real provider, only asserts it as
+// the reason the fake provider's receipt is presumed durable across the
+// local crash it is tested against.
