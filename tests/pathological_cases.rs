@@ -12801,3 +12801,919 @@ fn path_046_5_distinct_identical_valued_events_both_survive() {
     );
     assert!((bob_share - 0.2).abs() < 1e-9);
 }
+
+
+
+// =====================================================================
+// PATH-047 -- MINIMUM AUTHORITATIVE EVENT IDENTITY (H18)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::contribution` or wired into any production
+// path -- no production file is touched by this experiment. This tests
+// FIND-024's proposed `EventIdentity{source_id, event_id}` shape
+// directly: is a source-scoped key sufficient for replay-safe identity,
+// and under exactly which exogenous conditions?
+//
+// H18 names three exogenous facts about a source: AUTHORITY (H18
+// condition 1), STABILITY (condition 2, same occurrence => same
+// event_id), and SEPARATION (condition 3, distinct occurrences =>
+// distinct event_ids). STABILITY and SEPARATION are independent and
+// license disjoint inferences -- STABILITY licenses "different event_id
+// => distinct occurrence"; SEPARATION licenses "same event_id => same
+// occurrence." Neither substitutes for the other (PATH-047-G/G',
+// PATH-047-J prove this directly).
+//
+// SECOND CROSS-REVIEW CORRECTION -- AUTHORITY boundary (this revision):
+// an earlier version of this file treated "source_id differs" as
+// DEFINITIONAL grounds for `Distinct`, requiring no trust lookup at all.
+// Cross-review found this unjustified: two different self-declared
+// SOURCE_ID STRINGS prove only lexical inequality, never that they
+// denote two different real source namespaces. Without an exogenous
+// fact establishing namespace identity, an attacker (or an innocent
+// relabeling) could split one real source into arbitrarily many string
+// labels and have every pair of them treated as automatically
+// `Distinct` -- exactly the FIND-016/FIND-018 "new IDs disguise the same
+// structural thing" pattern this repository already documents elsewhere
+// (PATH-019, PATH-026), now recurring at the source-authority boundary.
+//
+// AUTHORITY is therefore modeled as binding a raw, self-declared
+// `SourceId` string to a canonical `NamespaceId` -- never the reverse.
+// Two source_id strings are `Distinct` ONLY if BOTH are bound (AUTHORITY
+// present for each) AND their canonical namespaces are established, by
+// the contract, to differ. Two source_id strings bound to the SAME
+// canonical namespace (deliberate aliasing, or literally the same
+// string) are treated identically for identity purposes, regardless of
+// how their labels look (PATH-047-L). A source_id string with NO
+// contract entry has no AUTHORITY at all and contributes nothing --
+// including no claim of distinctness from any other source, trusted or
+// not (PATH-047-F, PATH-047-H, corrected below).
+//
+// Reuses PATH-042/FIND-019's central pattern throughout: the one input
+// this code never derives, verifies, or fabricates from the events
+// themselves is `TrustedSourceContract` -- an explicit, caller-supplied
+// fact about which raw source_id strings are bound to which canonical
+// namespace, and what STABILITY/SEPARATION guarantees that namespace
+// carries.
+//
+// Research questions (re-answered at the bottom, after the adversarial
+// cases, from this corrected model's observed behavior only):
+//   1. Is (source_id, event_id) actually sufficient under the contract?
+//   2. Is global uniqueness necessary? (falsification attempt)
+//   3. What exact assumption is exogenous rather than derived?
+//   4. Does identity resolution belong before economic normalization?
+//   5. What happens if one source cannot provide stable event identity?
+// =====================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceId(String);
+
+/// A canonical, authoritatively-established real-source namespace.
+/// Deliberately a SEPARATE type from `SourceId`: a `SourceId` is a raw,
+/// self-declared, on-the-wire label; a `NamespaceId` is the exogenous
+/// fact of which real system that label denotes, known only via
+/// `TrustedSourceContract`. Two different `SourceId` strings MAY bind to
+/// the same `NamespaceId` (aliases); this type existing separately is
+/// exactly what makes that representable, instead of collapsing
+/// "different label" and "different real source" into one fact.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamespaceId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EventIdentity {
+    source_id: SourceId,
+    event_id: String,
+}
+
+/// A candidate event as it would arrive at the allocation boundary:
+/// FIND-024's proposed `EventIdentity` plus the existing
+/// `ContributionEvent` payload it claims to describe. Identity is
+/// deliberately a SEPARATE field, never derived from the payload --
+/// never `contribution_id`, `contributor_id`, or a payload hash, per
+/// this mission's forbidden-key list.
+#[derive(Debug, Clone, PartialEq)]
+struct Path047CandidateEvent {
+    identity: EventIdentity,
+    payload: ContributionEvent,
+}
+
+/// H18 conditions 2 and 3, as two INDEPENDENT facts about one canonical
+/// NAMESPACE (not about any one label for it) that this experiment can
+/// only ever be TOLD, never derive from events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceIdContract {
+    /// STABILITY (H18 condition 2): one real occurrence always produces
+    /// the SAME event_id across retries/redeliveries from this
+    /// namespace. Licenses: DIFFERENT event_id => DISTINCT occurrence.
+    stable: bool,
+    /// SEPARATION (H18 condition 3): distinct real occurrences always
+    /// produce DIFFERENT event_ids from this namespace. Licenses: SAME
+    /// event_id => SAME occurrence.
+    separating: bool,
+}
+
+impl SourceIdContract {
+    const fn both_guaranteed() -> Self {
+        SourceIdContract { stable: true, separating: true }
+    }
+    const fn stable_only() -> Self {
+        SourceIdContract { stable: true, separating: false }
+    }
+    const fn separating_only() -> Self {
+        SourceIdContract { stable: false, separating: true }
+    }
+    const fn neither_guaranteed() -> Self {
+        SourceIdContract { stable: false, separating: false }
+    }
+}
+
+/// The explicit, caller-supplied representation of AUTHORITY: which raw
+/// `SourceId` strings are bound to which canonical `NamespaceId`, and
+/// what STABILITY/SEPARATION each namespace carries. Never derived,
+/// verified, or fabricated from `Path047CandidateEvent` data anywhere
+/// below. `namespace_of` binding is by EXACT string key only
+/// (PATH-047-H) -- a label merely resembling a bound one gains no
+/// AUTHORITY. `properties` is keyed by `NamespaceId`, not `SourceId`: it
+/// is a fact about the real system, so every `SourceId` alias bound to
+/// one namespace shares exactly one set of properties, by construction
+/// (there is no way to give two aliases of the same namespace
+/// conflicting properties).
+#[derive(Debug, Clone, Default)]
+struct TrustedSourceContract {
+    namespace_of: std::collections::HashMap<SourceId, NamespaceId>,
+    properties: std::collections::HashMap<NamespaceId, SourceIdContract>,
+}
+
+impl TrustedSourceContract {
+    /// Convenience for the common case: each `(source_id, props)` pair
+    /// gets its OWN canonical namespace, named after its source_id
+    /// string purely for test readability -- the STRING plays no role
+    /// in any comparison, only `NamespaceId` equality does. This is what
+    /// makes two entries built this way explicitly, contractually
+    /// distinct namespaces (PATH-047-C), not merely two different map
+    /// keys. Use `trusting_with_aliases` when two source_id strings must
+    /// be bound to the SAME namespace.
+    fn trusting(sources: &[(&str, SourceIdContract)]) -> Self {
+        let mut contract = TrustedSourceContract::default();
+        for (source, props) in sources {
+            let namespace = NamespaceId((*source).to_string());
+            contract.namespace_of.insert(SourceId((*source).to_string()), namespace.clone());
+            contract.properties.insert(namespace, *props);
+        }
+        contract
+    }
+
+    /// Explicit alias binding: every string in `aliases` is bound to ONE
+    /// canonical `namespace`, which owns ONE set of properties. This is
+    /// the mechanism for representing "two (or more) labels, one real
+    /// system" -- namespace identity is the exogenous fact, never
+    /// derived from whether the label strings happen to match.
+    fn trusting_with_aliases(namespace: &str, aliases: &[&str], props: SourceIdContract) -> Self {
+        let mut contract = TrustedSourceContract::default();
+        let namespace = NamespaceId(namespace.to_string());
+        for alias in aliases {
+            contract.namespace_of.insert(SourceId((*alias).to_string()), namespace.clone());
+        }
+        contract.properties.insert(namespace, props);
+        contract
+    }
+
+    /// AUTHORITY lookup: resolves a raw `SourceId` string to its
+    /// canonical namespace and that namespace's properties, or `None` if
+    /// this contract binds no authority to that string at all.
+    fn authority_for(&self, source_id: &SourceId) -> Option<(NamespaceId, SourceIdContract)> {
+        let namespace = self.namespace_of.get(source_id)?.clone();
+        let props = self.properties.get(&namespace).copied()?;
+        Some((namespace, props))
+    }
+}
+
+/// The identity-resolution verdict, with the four states H18 requires --
+/// no boolean anywhere, because "is this the same event?" is not a
+/// yes/no question until AUTHORITY (resolved to a canonical namespace,
+/// not a raw string) and the relevant one of STABILITY/SEPARATION are
+/// all known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path047Verdict {
+    /// Same canonical namespace (AUTHORITY established for both sides,
+    /// namespaces equal); SEPARATION guaranteed; same event_id; same
+    /// payload. Collapses to one economic event.
+    Replay,
+    /// EITHER two different canonical namespaces (AUTHORITY established
+    /// for both sides, namespaces PROVEN to differ by the contract --
+    /// never by string inequality alone), OR the same namespace with a
+    /// different event_id under a STABILITY guarantee. Both events
+    /// survive.
+    Distinct,
+    /// Same canonical namespace, SEPARATION guaranteed, same event_id,
+    /// but DISAGREEING payload. Identity equality says these claims
+    /// concern the same occurrence; the payload disagreement is a
+    /// conflict, not two legitimate events and not a choice between
+    /// them.
+    Conflicted,
+    /// The identifiers alone cannot settle this: either AUTHORITY is
+    /// missing for at least one side (including two different,
+    /// self-declared, uncontracted source_id strings -- lexical
+    /// inequality alone proves nothing about namespace identity), the
+    /// event_ids match but the shared namespace has no SEPARATION
+    /// guarantee (the match could be an id collision between two
+    /// distinct occurrences), or the event_ids differ but the shared
+    /// namespace has no STABILITY guarantee (the difference could be one
+    /// occurrence retried under a fresh id). Never collapsed, never
+    /// split -- surfaced for external resolution.
+    Unresolved,
+}
+
+/// The core primitive: H18's verdict between exactly two identity
+/// claims. Everything else below is built on this.
+fn path_047_verdict(
+    a: &Path047CandidateEvent,
+    b: &Path047CandidateEvent,
+    contract: &TrustedSourceContract,
+) -> Path047Verdict {
+    let auth_a = contract.authority_for(&a.identity.source_id);
+    let auth_b = contract.authority_for(&b.identity.source_id);
+
+    let (namespace_a, props) = match auth_a {
+        None => return Path047Verdict::Unresolved, // no AUTHORITY for `a`'s label at all
+        Some(x) => x,
+    };
+    let (namespace_b, _) = match auth_b {
+        None => return Path047Verdict::Unresolved, // no AUTHORITY for `b`'s label at all
+        Some(x) => x,
+    };
+
+    if namespace_a != namespace_b {
+        // AUTHORITY is established for BOTH sides, and the contract
+        // explicitly assigns them DIFFERENT canonical namespaces -- this
+        // is the exogenous fact doing the work, not the raw source_id
+        // strings differing (PATH-047-C). Two aliases of the SAME
+        // namespace never reach this branch (PATH-047-L).
+        return Path047Verdict::Distinct;
+    }
+
+    // Same canonical namespace from here (whether via identical
+    // source_id strings or deliberate aliasing) -- `props` applies to
+    // both, since properties are keyed by namespace, not by label.
+    if a.identity.event_id == b.identity.event_id {
+        // SAME event_id direction: only SEPARATION licenses "same id =>
+        // same occurrence." STABILITY is irrelevant here -- PATH-047-A
+        // and -E hold with `separating_only()` contracts to prove it.
+        if !props.separating {
+            return Path047Verdict::Unresolved;
+        }
+        if a.payload == b.payload { Path047Verdict::Replay } else { Path047Verdict::Conflicted }
+    } else {
+        // DIFFERENT event_id direction: only STABILITY licenses
+        // "different id => distinct occurrence." SEPARATION is
+        // irrelevant here -- PATH-047-B and -I hold with `stable_only()`
+        // contracts to prove it.
+        if !props.stable {
+            return Path047Verdict::Unresolved;
+        }
+        Path047Verdict::Distinct
+    }
+}
+
+/// Result of resolving an entire batch of candidate events. This is the
+/// "before economic normalization" stage research question 4 asks
+/// about: `survivors` is the only set this candidate considers safe to
+/// hand to something like `allocate_contribution_pool`; `conflicted` and
+/// `unresolved` groups are NOT merged and NOT dropped -- they block
+/// progression until resolved by something outside this experiment
+/// (reject the batch, page a human, etc. -- not this candidate's
+/// decision to make).
+#[derive(Debug, Clone, Default)]
+struct Path047Resolution {
+    survivors: Vec<Path047CandidateEvent>,
+    conflicted: Vec<Vec<Path047CandidateEvent>>,
+    unresolved: Vec<Vec<Path047CandidateEvent>>,
+}
+
+/// Resolves a batch by grouping AUTHORIZED events on their resolved
+/// canonical NAMESPACE (never on the raw `source_id` string) so that:
+/// (a) a namespace lacking STABILITY cannot bypass resolution merely by
+/// having each retry form its own non-colliding singleton group, and (b)
+/// two ALIAS labels bound to the same namespace are resolved together,
+/// not as if they were unrelated sources (PATH-047-L). Events whose
+/// `source_id` carries no AUTHORITY at all are kept in `unresolved`,
+/// grouped by their raw label for traceability -- critically, DIFFERENT
+/// unauthorized labels are never allowed to separately reach
+/// `survivors` just because their strings differ (PATH-047-F,
+/// corrected): lacking AUTHORITY, this resolver cannot trust that two
+/// different self-declared labels denote different real sources any
+/// more than it can trust a single label's own event_id claims.
+///
+/// Within one namespace's events: PHASE 1 clusters by event_id and
+/// applies SEPARATION (same id => same occurrence, if guaranteed) to
+/// collapse or flag each cluster; PHASE 2 then applies STABILITY across
+/// the resulting per-event_id representatives (different id => distinct
+/// occurrence, if guaranteed) before anything is allowed into
+/// `survivors`.
+///
+/// Scope note: a namespace's events that never collide with ANY other
+/// event from that same namespace in the batch (i.e. exactly one
+/// representative survives phase 1) are accepted as a lone survivor even
+/// without a STABILITY guarantee -- with nothing else present to
+/// conflate it with IN THIS BATCH, there is no double-count or
+/// under-count risk to guard against. This is a real, named limitation,
+/// not a general solution: correctness for an unstable namespace still
+/// depends on all of its related deliveries appearing together in one
+/// resolution call. See NOT ESTABLISHED in FIND-025.
+fn path_047_resolve_batch(
+    events: &[Path047CandidateEvent],
+    contract: &TrustedSourceContract,
+) -> Path047Resolution {
+    use std::collections::HashMap;
+
+    let mut by_namespace: HashMap<NamespaceId, Vec<Path047CandidateEvent>> = HashMap::new();
+    let mut unauthorized: HashMap<SourceId, Vec<Path047CandidateEvent>> = HashMap::new();
+
+    for event in events {
+        match contract.authority_for(&event.identity.source_id) {
+            Some((namespace, _props)) => {
+                by_namespace.entry(namespace).or_default().push(event.clone());
+            }
+            None => {
+                unauthorized.entry(event.identity.source_id.clone()).or_default().push(event.clone());
+            }
+        }
+    }
+
+    let mut resolution = Path047Resolution::default();
+
+    // Unauthorized labels: no AUTHORITY, so nothing about these claims
+    // can be trusted -- including whether two DIFFERENT self-declared
+    // labels denote different real sources. Every unauthorized label's
+    // claims stay in `unresolved`; none reach `survivors`, regardless of
+    // how many distinct raw strings are present in the batch.
+    let mut unauthorized_keys: Vec<SourceId> = unauthorized.keys().cloned().collect();
+    unauthorized_keys.sort_by(|x, y| x.0.cmp(&y.0));
+    for key in unauthorized_keys {
+        resolution.unresolved.push(unauthorized.remove(&key).unwrap());
+    }
+
+    // Deterministic iteration order so test assertions are reproducible.
+    let mut namespace_keys: Vec<NamespaceId> = by_namespace.keys().cloned().collect();
+    namespace_keys.sort_by(|x, y| x.0.cmp(&y.0));
+
+    for namespace in namespace_keys {
+        let namespace_events = by_namespace.remove(&namespace).unwrap();
+        let props = contract
+            .properties
+            .get(&namespace)
+            .copied()
+            .expect("namespace reached via authority_for must have a properties entry");
+
+        // PHASE 1 -- cluster by event_id (across ALL aliases bound to
+        // this namespace, deliberately); SEPARATION governs whether a
+        // shared event_id within this namespace may be trusted to mean
+        // "same occurrence."
+        let mut by_event_id: HashMap<String, Vec<Path047CandidateEvent>> = HashMap::new();
+        for event in namespace_events {
+            by_event_id.entry(event.identity.event_id.clone()).or_default().push(event);
+        }
+        let mut event_id_keys: Vec<String> = by_event_id.keys().cloned().collect();
+        event_id_keys.sort();
+
+        let mut representatives: Vec<Path047CandidateEvent> = Vec::new();
+
+        for event_id in event_id_keys {
+            let cluster = by_event_id.remove(&event_id).unwrap();
+            if cluster.len() == 1 {
+                representatives.push(cluster.into_iter().next().unwrap());
+                continue;
+            }
+            if !props.separating {
+                // Matching event_id, but this namespace does not
+                // guarantee distinct occurrences get distinct ids -- the
+                // match cannot be trusted to mean "same occurrence."
+                resolution.unresolved.push(cluster);
+                continue;
+            }
+            let first_payload = cluster[0].payload.clone();
+            if cluster.iter().all(|c| c.payload == first_payload) {
+                representatives.push(cluster[0].clone());
+            } else {
+                resolution.conflicted.push(cluster);
+            }
+        }
+
+        // PHASE 2 -- across the surviving per-event_id representatives,
+        // STABILITY governs whether a DIFFERENT event_id within this
+        // namespace may be trusted to mean "distinct occurrence."
+        if representatives.len() <= 1 || props.stable {
+            resolution.survivors.extend(representatives);
+        } else {
+            // >= 2 differently-labeled representatives from a namespace
+            // that does NOT guarantee stable ids: cannot tell whether
+            // these are N distinct real occurrences or the SAME
+            // occurrence retried under a fresh id each time
+            // (PATH-047-G). Must not become N independent Distinct
+            // survivors.
+            resolution.unresolved.push(representatives);
+        }
+    }
+
+    resolution
+}
+
+fn path_047_neutral_factors() -> ContributionFactors {
+    ContributionFactors {
+        responsibility: 1.0,
+        criticality: 1.0,
+        deal_impact: 1.0,
+        stewardship: 1.0,
+        dependency_reach: 1.0,
+        evidence_confidence: 1.0,
+    }
+}
+
+fn path_047_payload(contributor_id: &str, contribution_id: &str, base_work_value: f64) -> ContributionEvent {
+    ContributionEvent {
+        contributor_id: contributor_id.to_string(),
+        contribution_id: contribution_id.to_string(),
+        base_work_value,
+        factors: path_047_neutral_factors(),
+    }
+}
+
+fn path_047_candidate(source: &str, event_id: &str, payload: ContributionEvent) -> Path047CandidateEvent {
+    Path047CandidateEvent {
+        identity: EventIdentity { source_id: SourceId(source.to_string()), event_id: event_id.to_string() },
+        payload,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Adversarial cases A-L.
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_047_a_same_trusted_source_same_event_id_same_payload_is_replay() {
+    // SEPARATION-only contract: STABILITY is explicitly false here, to
+    // prove it plays no role in this direction.
+    let contract =
+        TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::separating_only())]);
+    let payload = path_047_payload("alice", "review-9", 40.0);
+    let a = path_047_candidate("payroll-system", "evt-9001", payload.clone());
+    let b = path_047_candidate("payroll-system", "evt-9001", payload);
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Replay,
+        "SEPARATION alone is sufficient to license Replay on a matching event_id -- STABILITY is \
+         false in this contract and is not needed"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert_eq!(resolution.survivors.len(), 1, "the duplicate delivery must collapse to ONE economic event");
+    assert!(resolution.conflicted.is_empty());
+    assert!(resolution.unresolved.is_empty());
+}
+
+#[test]
+fn path_047_b_same_trusted_source_different_event_id_is_distinct() {
+    // STABILITY-only contract: SEPARATION is explicitly false here, to
+    // prove it plays no role in this direction.
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::stable_only())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let a = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let b = path_047_candidate("payroll-system", "evt-2", payload);
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Distinct,
+        "STABILITY alone is sufficient to license Distinct on differing event_ids -- SEPARATION is \
+         false in this contract and is not needed"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert_eq!(
+        resolution.survivors.len(),
+        2,
+        "different event_ids -- even with an otherwise identical payload -- must both survive"
+    );
+}
+
+/// CORRECTED (second cross-review): two DIFFERENT trusted source_id
+/// strings are `Distinct` ONLY because the contract explicitly binds
+/// each to its OWN canonical namespace -- not because the raw strings
+/// happen to differ. `trusting(&[(a, ..), (b, ..)])` performs that
+/// explicit binding: each entry gets its own `NamespaceId`. The
+/// assertion on `authority_for(..).0` below pins that this is the
+/// mechanism actually doing the work.
+#[test]
+fn path_047_c_authoritatively_distinct_namespaces_are_distinct() {
+    let contract = TrustedSourceContract::trusting(&[
+        ("payroll-system", SourceIdContract::both_guaranteed()),
+        ("timesheet-system", SourceIdContract::both_guaranteed()),
+    ]);
+
+    let namespace_payroll = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let namespace_timesheet = contract.authority_for(&SourceId("timesheet-system".into())).unwrap().0;
+    assert_ne!(
+        namespace_payroll, namespace_timesheet,
+        "the contract explicitly assigns these two source_id strings to two DIFFERENT canonical \
+         namespaces -- this is the exogenous fact under test, not string inequality"
+    );
+
+    let payload = path_047_payload("alice", "review", 40.0);
+    let a = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let b = path_047_candidate("timesheet-system", "evt-1", payload);
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Distinct,
+        "event_ids are namespace-scoped, not globally scoped -- the SAME event_id string from two \
+         AUTHORITATIVELY DISTINCT namespaces must not establish sameness"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert_eq!(resolution.survivors.len(), 2);
+}
+
+#[test]
+fn path_047_d_untrusted_source_matching_event_id_is_unresolved_not_deduped() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let a = path_047_candidate("scratchpad-import", "evt-1", payload.clone());
+    let b = path_047_candidate("scratchpad-import", "evt-1", payload);
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Unresolved,
+        "the source is absent from the trust contract -- no AUTHORITY, so matching strings alone \
+         must never certify replay, regardless of what STABILITY/SEPARATION it might claim"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert!(resolution.survivors.is_empty(), "an unresolved group must not be silently treated as one survivor");
+    assert_eq!(resolution.unresolved.len(), 1);
+    assert_eq!(resolution.unresolved[0].len(), 2);
+}
+
+#[test]
+fn path_047_e_same_trusted_identity_changed_payload_is_conflicted_not_a_choice() {
+    // SEPARATION-only contract: STABILITY is explicitly false, to prove
+    // it plays no role in detecting this conflict either.
+    let contract =
+        TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::separating_only())]);
+    let a = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+    let b = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 55.0));
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Conflicted,
+        "identity equality (licensed by SEPARATION alone) says these claims concern the SAME \
+         occurrence; disagreeing payloads are a conflict, not two legitimate events, and not a \
+         first/last choice"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert!(
+        resolution.survivors.is_empty(),
+        "a conflicted group must never silently count as one -- or two -- legitimate events"
+    );
+    assert_eq!(resolution.conflicted.len(), 1);
+    assert_eq!(resolution.conflicted[0].len(), 2);
+}
+
+/// CORRECTED (second cross-review): two DIFFERENT, UNTRUSTED, self-
+/// declared source_id strings must NOT be called `Distinct` merely
+/// because the strings differ -- with no AUTHORITY for either, this
+/// resolver cannot trust that "unrelated-source-a" and
+/// "unrelated-source-b" denote two different real systems any more than
+/// it can trust either one's own event_id claims. The expected relation
+/// is `Unresolved`.
+#[test]
+fn path_047_f_two_untrusted_source_labels_with_matching_event_id_are_unresolved() {
+    let contract = TrustedSourceContract::default();
+    let a = path_047_candidate("unrelated-source-a", "evt-1", path_047_payload("alice", "x", 10.0));
+    let b = path_047_candidate("unrelated-source-b", "evt-1", path_047_payload("alice", "x", 10.0));
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Unresolved,
+        "neither label carries AUTHORITY -- lexical inequality between two self-declared strings \
+         proves nothing about whether they denote different real sources. This must NOT be called \
+         Distinct merely because the strings differ."
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert!(
+        resolution.survivors.is_empty(),
+        "the batch resolver must not let two different unauthorized labels independently reach \
+         survivors just because their raw strings differ"
+    );
+    assert_eq!(resolution.unresolved.len(), 2, "each unauthorized label is its own unresolved group");
+}
+
+/// PATH-047-G, the fresh-ID/STABILITY-loss case: the SAME real
+/// occurrence, delivered once and then retried under a FRESH event_id,
+/// from a source that does not guarantee STABILITY.
+#[test]
+fn path_047_g_fresh_id_retry_without_stability_guarantee_stays_unresolved() {
+    // SEPARATION-only contract: STABILITY is explicitly false -- this
+    // source is trusted (AUTHORITY holds) and does guarantee distinct
+    // occurrences get distinct ids, but does NOT guarantee one
+    // occurrence keeps the same id across retries.
+    let contract = TrustedSourceContract::trusting(&[("flaky-webhook", SourceIdContract::separating_only())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    // Delivery 1 and its retry: the SAME real occurrence, but the
+    // source re-minted the id on redelivery.
+    let delivery = path_047_candidate("flaky-webhook", "evt-1", payload.clone());
+    let retry = path_047_candidate("flaky-webhook", "evt-2", payload);
+
+    assert_eq!(
+        path_047_verdict(&delivery, &retry, &contract),
+        Path047Verdict::Unresolved,
+        "H18's explicit trust-boundary test: without a STABILITY guarantee, a DIFFERENT event_id \
+         cannot be trusted to mean a DISTINCT occurrence -- it may just be the same occurrence \
+         retried under a fresh id. The identifiers alone leave this Unresolved, not Distinct."
+    );
+
+    let resolution = path_047_resolve_batch(&[delivery, retry], &contract);
+    assert!(
+        resolution.survivors.is_empty(),
+        "two differently-id'd deliveries from a source without a STABILITY guarantee must NOT \
+         become two authoritative Distinct survivors merely because their event_ids differ"
+    );
+    assert_eq!(resolution.unresolved.len(), 1);
+    assert_eq!(resolution.unresolved[0].len(), 2);
+}
+
+/// PATH-047-G': the SAME event_id claimed twice by a source that does
+/// not guarantee SEPARATION (i.e. its ids can collide across genuinely
+/// distinct occurrences).
+#[test]
+fn path_047_g_prime_matching_event_id_without_separation_guarantee_stays_unresolved() {
+    // STABILITY-only contract: SEPARATION is explicitly false, isolating
+    // it as the missing piece (this source's ids ARE stable under
+    // retry -- that is not what is in question here).
+    let contract = TrustedSourceContract::trusting(&[("weak-id-source", SourceIdContract::stable_only())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let a = path_047_candidate("weak-id-source", "evt-1", payload.clone());
+    let b = path_047_candidate("weak-id-source", "evt-1", payload);
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Unresolved,
+        "without a SEPARATION guarantee, a MATCHING event_id cannot be trusted to mean the SAME \
+         occurrence -- it may be an id collision between two distinct occurrences. STABILITY does \
+         not help here: it licenses the opposite direction."
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert!(resolution.survivors.is_empty());
+    assert_eq!(resolution.unresolved.len(), 1);
+    assert_eq!(resolution.unresolved[0].len(), 2);
+}
+
+/// CORRECTED (second cross-review): an uncontracted, alias-LOOKING
+/// source_id compared against a genuinely trusted one must NOT become
+/// `Distinct` merely from string inequality. Unless the contract itself
+/// establishes a namespace relation for the spoofed label, the expected
+/// result is `Unresolved` -- the spoof gains no AUTHORITY, and no
+/// AUTHORITY means this resolver cannot even vouch for the spoof being a
+/// genuinely SEPARATE source, only that it is not a RECOGNIZED one.
+#[test]
+fn path_047_h_source_label_spoofing_gains_no_authority_and_no_distinctness() {
+    let contract = TrustedSourceContract::trusting(&[("hr-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    // Two self-declared deliveries under a label chosen to LOOK like the
+    // trusted "hr-system" namespace -- but it is not the literal string
+    // present in the contract, so it carries no AUTHORITY regardless of
+    // what STABILITY/SEPARATION it might claim for itself.
+    let spoof_a = path_047_candidate("hr-system-eu", "evt-1", payload.clone());
+    let spoof_b = path_047_candidate("hr-system-eu", "evt-1", payload.clone());
+    assert_eq!(
+        path_047_verdict(&spoof_a, &spoof_b, &contract),
+        Path047Verdict::Unresolved,
+        "a source label that merely resembles a trusted name gains no AUTHORITY -- only an EXACT \
+         entry in the explicit trust contract does, so even a matching (source_id, event_id) \
+         pair under the spoofed label stays Unresolved rather than Replay"
+    );
+
+    // Nor may the spoofed label be declared `Distinct` from a genuinely
+    // trusted delivery merely because its string differs from
+    // "hr-system" -- AUTHORITY is missing for the spoof, so NOTHING can
+    // be concluded about its relationship to the genuine namespace,
+    // including that it is a different one.
+    let genuine = path_047_candidate("hr-system", "evt-1", payload);
+    assert_eq!(
+        path_047_verdict(&spoof_a, &genuine, &contract),
+        Path047Verdict::Unresolved,
+        "the spoofed label has no AUTHORITY at all -- lexical inequality from the genuine, \
+         trusted source_id string does not establish Distinct; that would smuggle namespace \
+         distinctness in through string comparison, exactly the defect this correction removes"
+    );
+}
+
+#[test]
+fn path_047_i_legitimate_identical_valued_events_both_survive() {
+    // STABILITY-only contract: SEPARATION is explicitly false, to prove
+    // (again, at the end-to-end economic-integration level) that it
+    // plays no role in the different-event_id direction.
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::stable_only())]);
+    let a = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let b = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 40.0));
+
+    assert_eq!(
+        path_047_verdict(&a, &b, &contract),
+        Path047Verdict::Distinct,
+        "FIND-024 regression property: same contributor, same source, same value, but DIFFERENT \
+         authoritative event ids -- both must survive"
+    );
+
+    let resolution = path_047_resolve_batch(&[a, b], &contract);
+    assert_eq!(resolution.survivors.len(), 2);
+
+    // Feed the survivors through the actual production allocation
+    // function, exactly like PATH-046.5's own regression guard, to
+    // confirm the economic effect rather than just the verdict.
+    let mut events: Vec<ContributionEvent> = resolution.survivors.into_iter().map(|c| c.payload).collect();
+    events.push(path_047_payload("bob", "bob-work", 20.0));
+    let allocations = allocate_contribution_pool(&events, &weights(), 100.0).unwrap();
+    let alice_share: f64 =
+        allocations.iter().filter(|x| x.contributor_id == "alice").map(|x| x.normalized_share).sum();
+    assert!((alice_share - 0.8).abs() < 1e-9, "both legitimate 40-value events must count -- 80 of 100 total");
+}
+
+/// Direction-independence, made explicit in one place: a
+/// SEPARATION-only contract resolves the same-event_id direction
+/// correctly but leaves the different-event_id direction Unresolved, and
+/// a STABILITY-only contract does the exact mirror image. Neither
+/// property is a substitute for the other in either direction.
+#[test]
+fn path_047_j_stability_and_separation_license_disjoint_directions() {
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("alice", "review", 40.0);
+    assert_eq!(payload_1, payload_2);
+
+    let separating_only =
+        TrustedSourceContract::trusting(&[("source-x", SourceIdContract::separating_only())]);
+    let stable_only = TrustedSourceContract::trusting(&[("source-x", SourceIdContract::stable_only())]);
+
+    let same_id_a = path_047_candidate("source-x", "evt-1", payload_1.clone());
+    let same_id_b = path_047_candidate("source-x", "evt-1", payload_2.clone());
+    let diff_id_a = path_047_candidate("source-x", "evt-1", payload_1);
+    let diff_id_b = path_047_candidate("source-x", "evt-2", payload_2);
+
+    assert_eq!(
+        path_047_verdict(&same_id_a, &same_id_b, &separating_only),
+        Path047Verdict::Replay,
+        "SEPARATION-only: same-id direction resolves"
+    );
+    assert_eq!(
+        path_047_verdict(&diff_id_a, &diff_id_b, &separating_only),
+        Path047Verdict::Unresolved,
+        "SEPARATION-only: different-id direction stays Unresolved -- SEPARATION does not license it"
+    );
+
+    assert_eq!(
+        path_047_verdict(&same_id_a, &same_id_b, &stable_only),
+        Path047Verdict::Unresolved,
+        "STABILITY-only: same-id direction stays Unresolved -- STABILITY does not license it"
+    );
+    assert_eq!(
+        path_047_verdict(&diff_id_a, &diff_id_b, &stable_only),
+        Path047Verdict::Distinct,
+        "STABILITY-only: different-id direction resolves"
+    );
+}
+
+/// AUTHORITY alone -- a source present in the contract but guaranteeing
+/// NEITHER property -- is exactly as unresolved as no contract entry at
+/// all, in both directions. Closes the loop with PATH-047-D (absence of
+/// AUTHORITY): this shows PRESENCE of AUTHORITY is also not sufficient
+/// by itself.
+#[test]
+fn path_047_k_authority_alone_is_insufficient_without_either_property() {
+    let contract = TrustedSourceContract::trusting(&[("source-y", SourceIdContract::neither_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    let same_id_a = path_047_candidate("source-y", "evt-1", payload.clone());
+    let same_id_b = path_047_candidate("source-y", "evt-1", payload.clone());
+    assert_eq!(path_047_verdict(&same_id_a, &same_id_b, &contract), Path047Verdict::Unresolved);
+
+    let diff_id_a = path_047_candidate("source-y", "evt-1", payload.clone());
+    let diff_id_b = path_047_candidate("source-y", "evt-2", payload);
+    assert_eq!(path_047_verdict(&diff_id_a, &diff_id_b, &contract), Path047Verdict::Unresolved);
+}
+
+/// NEW (second cross-review, required case): two DIFFERENT raw
+/// source_id strings, deliberately bound by the contract to the SAME
+/// canonical namespace (an explicit alias relationship), must NOT
+/// manufacture cross-source `Distinct`-ness. They are resolved exactly
+/// as if they were one literal source: a matching event_id under them
+/// collapses via SEPARATION (still deduplicating a true replay even
+/// though it arrived under two different labels), and a differing
+/// event_id under them still requires STABILITY to be trusted as
+/// distinct.
+#[test]
+fn path_047_l_aliases_of_the_same_canonical_namespace_do_not_manufacture_distinctness() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["payroll-system", "payroll-system-legacy"],
+        SourceIdContract::both_guaranteed(),
+    );
+
+    let namespace_a = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let namespace_b = contract.authority_for(&SourceId("payroll-system-legacy".into())).unwrap().0;
+    assert_eq!(
+        namespace_a, namespace_b,
+        "both raw labels are explicitly bound to the SAME canonical namespace by this contract"
+    );
+
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    // The SAME real occurrence, reported once under each alias with a
+    // matching event_id: must dedupe via SEPARATION, exactly as if both
+    // deliveries had used the identical literal source_id string.
+    let via_alias_1 = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let via_alias_2 = path_047_candidate("payroll-system-legacy", "evt-1", payload.clone());
+    assert_eq!(
+        path_047_verdict(&via_alias_1, &via_alias_2, &contract),
+        Path047Verdict::Replay,
+        "two labels bound to the SAME canonical namespace must be treated as the SAME source for \
+         identity purposes -- a matching event_id across them is still a replay, not a manufactured \
+         Distinct pair"
+    );
+
+    // A genuinely different event_id under the SAME namespace (again
+    // reached via an alias) still resolves as an ordinary distinct
+    // occurrence, gated by STABILITY exactly as it would be for one
+    // literal source_id string.
+    let via_alias_3 = path_047_candidate("payroll-system-legacy", "evt-2", payload);
+    assert_eq!(path_047_verdict(&via_alias_1, &via_alias_3, &contract), Path047Verdict::Distinct);
+
+    let resolution = path_047_resolve_batch(&[via_alias_1, via_alias_2, via_alias_3], &contract);
+    assert_eq!(
+        resolution.survivors.len(),
+        2,
+        "3 input events under 2 aliases of 1 namespace: the matching-event_id pair collapses to 1 \
+         survivor, and the distinct-event_id event survives independently -- 2 total, not 3 and not 1"
+    );
+    assert!(resolution.conflicted.is_empty());
+    assert!(resolution.unresolved.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Research questions -- answered from the corrected model's behavior
+// above, not asserted independently of it.
+// ---------------------------------------------------------------------
+//
+// 1. Is (source_id, event_id) sufficient under the stated contract?
+//    Conditionally, and per-direction: sufficiency for a SAME-event_id
+//    claim requires AUTHORITY (resolved to a canonical namespace) +
+//    SEPARATION (PATH-047-A/E, both proven with STABILITY explicitly
+//    false); sufficiency for a DIFFERENT-event_id claim requires
+//    AUTHORITY + STABILITY (PATH-047-B/I, both proven with SEPARATION
+//    explicitly false). Two DIFFERENT source_id strings are only
+//    sufficient grounds for Distinct when AUTHORITY is established for
+//    BOTH and the contract explicitly assigns them DIFFERENT namespaces
+//    (PATH-047-C) -- never from string inequality alone (PATH-047-F,
+//    -H). The bare key is never sufficient by itself in any case.
+//
+// 2. Is global uniqueness necessary? Falsified by PATH-047-C: two
+//    AUTHORITATIVELY DISTINCT namespaces reusing an identical event_id
+//    string resolve correctly to `Distinct` with no cross-namespace
+//    coordination. But this now depends on an explicit exogenous
+//    namespace-distinctness fact, not on the source_id strings merely
+//    differing (PATH-047-F shows two differing, UNAUTHORIZED strings do
+//    NOT get this for free). Global uniqueness is sufficient but not
+//    necessary; authoritative namespace-scoping is what actually does
+//    the work.
+//
+// 3. What exact assumption is exogenous rather than derived?
+//    Three separate assumptions, now modeled as three separate facts:
+//    AUTHORITY (is a raw source_id string bound to a real namespace at
+//    all -- `TrustedSourceContract::namespace_of`), namespace identity
+//    itself (WHICH namespace a string is bound to, and whether two
+//    strings share one -- this is the fact the second cross-review
+//    added explicit representation for for; it was previously smuggled
+//    in as "string inequality implies namespace inequality," an
+//    unstated and false assumption), and, per namespace, STABILITY and
+//    SEPARATION (`TrustedSourceContract::properties`). None of these are
+//    derived from the events; all are supplied by the contract.
+//
+// 4. Does identity resolution belong before economic normalization?
+//    Yes, and the corrected model adds a step that must ALSO happen
+//    before normalization: resolving each event's raw source_id to a
+//    canonical namespace (or discovering it has none). PATH-047-L shows
+//    this step is not optional bookkeeping -- two aliased labels for one
+//    real source must be merged onto one namespace before SEPARATION/
+//    STABILITY logic runs, or a true replay arriving under two labels
+//    would wrongly survive as two events.
+//
+// 5. What happens if one source cannot provide stable event identity?
+//    Unchanged in kind from the prior revision, restated over
+//    namespaces: PATH-047-G shows two or more differently-labeled
+//    deliveries from one namespace degrade to `Unresolved` as a GROUP --
+//    the same state as an unauthorized label (PATH-047-D/F) or one
+//    missing SEPARATION (PATH-047-G'). The one named exception remains a
+//    namespace's SOLE claim in a given batch; see FIND-025's NOT
+//    ESTABLISHED for why this does not generalize across separate
+//    resolution calls.
