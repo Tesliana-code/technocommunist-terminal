@@ -13717,3 +13717,1690 @@ fn path_047_l_aliases_of_the_same_canonical_namespace_do_not_manufacture_distinc
 //    namespace's SOLE claim in a given batch; see FIND-025's NOT
 //    ESTABLISHED for why this does not generalize across separate
 //    resolution calls.
+
+
+// =====================================================================
+// PATH-048 -- TEMPORAL IDENTITY / CROSS-BATCH REPLAY STATE (H19)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::contribution` or wired into any production
+// path -- no production file is touched by this experiment.
+//
+// QUESTION: what is the minimum durable state required to prevent one
+// real economic occurrence from being counted twice when its deliveries
+// arrive in DIFFERENT resolution calls?
+//
+// H19: pairwise/in-batch identity semantics (PATH-047/FIND-025) are
+// insufficient for durable replay protection. A replay-safe economic
+// boundary requires some durable cross-call identity memory whose
+// retention and authority semantics are explicitly defined.
+//
+// This experiment REUSES PATH-047's type vocabulary without modification
+// -- `SourceId`, `NamespaceId`, `TrustedSourceContract`,
+// `SourceIdContract`, `EventIdentity`, `Path047CandidateEvent`, and the
+// helper constructors -- so `SourceId != NamespaceId` and AUTHORITY/
+// STABILITY/SEPARATION stay exactly as separate as FIND-025 established.
+// PATH-048 adds a NEW layer on top: durable state that survives across
+// separate calls to the resolution logic, which PATH-047's pairwise
+// `path_047_verdict` and single-batch `path_047_resolve_batch` never
+// modeled at all (both take their entire universe of events as one
+// argument, with nothing persisting between calls).
+//
+// REQUIRED DISTINCTIONS -- six separate concepts, six separate types,
+// never collapsed into one "seen IDs" set (a sixth, HISTORICAL
+// COMPLETENESS, was added by a later cross-review correction -- AMNESIA
+// != GENESIS, see the dedicated section and `HistoryCompleteness` type
+// below):
+//   - DELIVERY IDENTITY       -- `EventIdentity{source_id, event_id}`
+//     (PATH-047, unchanged): the raw, on-the-wire key as delivered.
+//   - CANONICAL OCCURRENCE IDENTITY -- `OccurrenceKey{namespace, event_id}`:
+//     `source_id` resolved through AUTHORITY to its `NamespaceId`, so
+//     aliases collapse onto one key (PATH-047-L's property, preserved).
+//   - SETTLEMENT IDENTITY     -- `(OccurrenceKey, SettlementRecord)`: an
+//     occurrence key has no settlement identity until something is
+//     recorded against it, and what's recorded distinguishes `Reserved`
+//     (in flight) from `Settled` (durably complete, with a payload
+//     snapshot for conflict detection).
+//   - TRUST-CONTRACT VERSION  -- `ContractVersion`, stored per settlement
+//     record as metadata. NOTE (cross-review correction): the drift
+//     DECISION (PATH-048-G) is made by a separate, per-label
+//     first-seen-namespace fact (`label_first_seen_namespace`), never by
+//     `ContractVersion` -- `path_048_reserve` never reads
+//     `contract_version` off a stored record to decide anything. This
+//     experiment establishes that a historical AUTHORITY BINDING must
+//     survive current-contract evolution; it does NOT establish that
+//     `ContractVersion` itself is necessary (see NOT ESTABLISHED below
+//     and in FIND-026).
+//   - TEMPORAL RETENTION STATE -- `pruned_horizon` and
+//     `ever_active_namespaces`. NOTE (cross-review correction):
+//     `has_pruned` only consults MAP MEMBERSHIP in `pruned_horizon`, never
+//     the `CallId` value it stores. This experiment establishes the need
+//     for a durable "this namespace's history may be incomplete" fact; it
+//     does NOT establish that a numeric per-call horizon is itself
+//     minimally necessary. `pruned_horizon`'s `CallId` value is retained
+//     as one plausible real-world design (e.g. for a future finer-grained
+//     policy), not as proven-minimal structure. `ever_active_namespaces`
+//     is the durable, much smaller fact -- "this namespace has
+//     settlement history at all" -- that survives pruning of the
+//     detailed records it summarizes.
+//   - HISTORICAL COMPLETENESS -- `HistoryCompleteness` (`AttestedComplete` /
+//     `Unknown`), added by the AMNESIA != GENESIS correction below: an
+//     EXOGENOUS fact about the LEDGER's own provenance, never derived
+//     from `records`/`ever_active_namespaces` being empty. Distinct from
+//     every field above -- `ever_active_namespaces` records what THIS
+//     ledger instance has itself observed; `HistoryCompleteness` records
+//     whether that instance's observations are attested-complete since
+//     true origin. An empty ledger of unknown provenance and a
+//     genuinely-fresh, attested one are identical on every OTHER field.
+//
+// CONSTRAINTS HONORED: no payload-hash dedup (payload comparison below
+// is always direct `ContributionEvent` structural equality, exactly as
+// PATH-046/PATH-047 already did -- never a summarizing digest used AS an
+// identity key); no `contribution_id` heuristic (never inspected); no
+// assumption of infinite retention (`prune_namespace` genuinely deletes
+// records); no assumption of globally unique event ids (all keys are
+// namespace-scoped, per FIND-025); missing historical state (a miss
+// after ANY pruning, or a miss for a STABILITY-lacking namespace with
+// prior history) resolves `Unresolved`, never silently `New`.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CallId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ContractVersion(u64);
+
+/// CANONICAL OCCURRENCE IDENTITY: `source_id` resolved through AUTHORITY
+/// to its `NamespaceId`, paired with the raw `event_id`. This -- never
+/// the raw, unresolved `EventIdentity` -- is what the durable ledger
+/// keys on, so alias rotation (PATH-048-F) is transparent to it and a
+/// raw-delivery-keyed design (PATH-048-D's losing comparison) is not.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OccurrenceKey {
+    namespace: NamespaceId,
+    event_id: String,
+}
+
+/// SETTLEMENT IDENTITY: what, if anything, is durably known about one
+/// `OccurrenceKey`. `Reserved` and `Settled` are deliberately separate
+/// states (not a boolean) -- PATH-048-J needs to distinguish "identity
+/// claimed, economic effect not yet confirmed" from "fully complete."
+#[derive(Debug, Clone, PartialEq)]
+enum SettlementRecord {
+    Reserved { payload: ContributionEvent, contract_version: ContractVersion, call: CallId },
+    Settled { payload: ContributionEvent, contract_version: ContractVersion, call: CallId },
+}
+
+/// The identity-resolution verdict for ONE incoming delivery against
+/// DURABLE cross-call history -- distinct from PATH-047's
+/// `Path047Verdict`, which compares two LIVE events against each other
+/// within one call. No boolean anywhere: "have I seen this before" is
+/// not a yes/no question once retention and in-flight reservations are
+/// real possibilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path048Verdict {
+    /// Genuinely first appearance of this occurrence key, with complete,
+    /// unpruned retained history for its namespace (or this namespace's
+    /// very first-ever activity) -- safe to reserve/settle.
+    New,
+    /// Exact occurrence-key match against a durably `Settled` record
+    /// with an IDENTICAL payload. This delivery is a replay of an
+    /// already-completed settlement; must not be double-counted.
+    AlreadySettled,
+    /// Exact occurrence-key match against a durable record (`Reserved`
+    /// or `Settled`) with a DIFFERENT payload. Reject; never silently
+    /// overwritten, never counted as two legitimate events.
+    Conflicted,
+    /// Exact occurrence-key match against a `Reserved` (not yet
+    /// `Settled`) record with a MATCHING payload. Must not be treated as
+    /// New (risks double settlement once/if the original completes) or
+    /// as AlreadySettled (it never actually was). A `Reserved` match with
+    /// a DIFFERENT payload is `Conflicted` instead (see below) -- an
+    /// earlier revision of this candidate had a real bug here, returning
+    /// `Reserved` unconditionally without comparing payload; fixed and
+    /// regression-guarded by PATH-048-K.
+    Reserved,
+    /// The identifiers and durable state together cannot settle this:
+    /// AUTHORITY missing, a matching key under a SEPARATION-lacking
+    /// namespace, a non-matching key under a STABILITY-lacking namespace
+    /// that already has prior history, retention has pruned any record
+    /// that could confirm or deny history for this key, or the current
+    /// trust contract has rebound this label's namespace since it was
+    /// first observed. Never collapsed into New or AlreadySettled.
+    Unresolved,
+}
+
+/// ABSENCE != NOVELTY -- the general principle AMNESIA != GENESIS is one
+/// instance of (cross-review correction, second pass). A missing
+/// `OccurrenceKey` means only "not found in what this ledger retained,"
+/// never "never happened" -- UNLESS the retained history being searched
+/// is itself attested complete over the relevant identity domain. This
+/// governs every NEGATIVE occurrence-history lookup used to derive
+/// `New`: both a namespace's very first sighting (no records for it at
+/// all) AND a miss on a specific `event_id` within an ALREADY-active
+/// namespace (some records exist, just not this one) are negative
+/// lookups, and both require this same attestation -- the first pass of
+/// this correction fixed only the former case, leaving the latter
+/// (PARTIAL RESTORE WITHIN THE SAME NAMESPACE) still vulnerable; see
+/// `path_048_reserve`'s corrected MISS handling below. `HistoryCompleteness`
+/// is the EXOGENOUS fact (never derived from `records`/
+/// `ever_active_namespaces` being empty, and never derived from restoring
+/// SOME records, or from no pruning marker being present) that resolves
+/// the ambiguity, mirroring PATH-042/FIND-019's original
+/// exogenous-trust-axiom pattern one level up: a fact about the LEDGER's
+/// own provenance, not about any one event or source. EXACT-KEY HITS are
+/// unaffected either way -- a positive record match is usable evidence
+/// regardless of completeness (PATH-048-completeness-C/D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HistoryCompleteness {
+    /// Authoritatively attested: this ledger's retained history for this
+    /// namespace is known-complete over the relevant identity domain --
+    /// e.g. a namespace provisioned strictly after this ledger began
+    /// recording under an attested-genesis deployment, or an explicit,
+    /// trusted migration/import attestation (PATH-048-amnesia-G).
+    /// EXOGENOUS: the resolver propagates this fact faithfully but
+    /// cannot verify its truth -- a false attestation is indistinguishable
+    /// from a true one from inside `path_048_reserve` (PATH-048-amnesia-E,
+    /// the axiom-forgery boundary).
+    AttestedComplete,
+    /// Not attested: whether prior history exists that this ledger's
+    /// retained records do not currently reflect -- captured by some
+    /// earlier, now-lost, never-restored, partially-restored, or
+    /// never-captured record -- is unknown. This is the SAFE DEFAULT.
+    Unknown,
+}
+
+impl Default for HistoryCompleteness {
+    fn default() -> Self {
+        HistoryCompleteness::Unknown
+    }
+}
+
+/// The durable, cross-call ledger under test. TEMPORAL RETENTION STATE
+/// (`pruned_horizon`, `ever_active_namespaces`), the TRUST-CONTRACT-
+/// VERSION-adjacent `label_first_seen_namespace` fact, and HISTORICAL
+/// COMPLETENESS (`completeness`, `default_completeness`) are deliberately
+/// SEPARATE fields from `records` (SETTLEMENT IDENTITY) -- none are
+/// derivable from the others, and each is exercised by a distinct
+/// adversarial case below.
+#[derive(Debug, Clone, Default)]
+struct Path048Ledger {
+    records: std::collections::HashMap<OccurrenceKey, SettlementRecord>,
+    /// Per-namespace retention horizon: the oldest `CallId` for which
+    /// this ledger still guarantees a complete record. Absence means
+    /// nothing has ever been pruned for that namespace. CROSS-REVIEW
+    /// CORRECTION: `has_pruned` below reads only MAP MEMBERSHIP here,
+    /// never the `CallId` value -- this experiment establishes the need
+    /// for a durable "history may be incomplete" fact per namespace, not
+    /// that a numeric per-call horizon is itself minimally necessary.
+    /// The stored `CallId` is kept as one plausible real-world design
+    /// (e.g. for a future finer-grained policy), not proven-minimal
+    /// structure.
+    pruned_horizon: std::collections::HashMap<NamespaceId, CallId>,
+    /// Durable, MUCH smaller than `records`: "this namespace has settled
+    /// or reserved SOMETHING, ever" -- survives pruning of the detailed
+    /// records it summarizes (PATH-048-H's central mechanism).
+    ever_active_namespaces: std::collections::HashSet<NamespaceId>,
+    /// The FIRST canonical namespace each raw `SourceId` label was ever
+    /// observed resolving to, under whatever contract was current at the
+    /// time. A later reservation whose CURRENT contract resolves the
+    /// same label to a DIFFERENT namespace is contract drift
+    /// (PATH-048-G), not an ordinary lookup.
+    label_first_seen_namespace: std::collections::HashMap<SourceId, NamespaceId>,
+    /// Per-namespace override of `default_completeness`. A namespace
+    /// absent here falls back to `default_completeness`.
+    completeness: std::collections::HashMap<NamespaceId, HistoryCompleteness>,
+    /// The completeness assumed for any namespace with no entry in
+    /// `completeness`. Defaults to `Unknown` via `#[derive(Default)]` --
+    /// the safe choice. `Path048Ledger::default()` therefore models a
+    /// ledger whose own provenance is NOT attested (AMNESIA is the
+    /// default assumption, never GENESIS); use
+    /// `Path048Ledger::new_attested_genesis()` to model an explicitly
+    /// attested fresh deployment.
+    default_completeness: HistoryCompleteness,
+}
+
+impl Path048Ledger {
+    /// EXOGENOUS constructor: stands in for an operator/deployment
+    /// process explicitly attesting that this ledger represents a
+    /// genuine, complete history since true system genesis -- e.g. a
+    /// brand-new deployment where no prior ledger, database, or migrated
+    /// history could possibly exist. This fact is supplied by the
+    /// caller, never derived from the ledger's own (empty) contents --
+    /// exactly like `TrustedSourceContract`'s AUTHORITY, this experiment
+    /// does not verify it, only propagates it faithfully (PATH-048-
+    /// amnesia-E shows what happens when it is wrong).
+    fn new_attested_genesis() -> Self {
+        Path048Ledger { default_completeness: HistoryCompleteness::AttestedComplete, ..Default::default() }
+    }
+
+    /// Explicit, per-namespace completeness override -- e.g. a namespace
+    /// migrated in with an attested-complete import (PATH-048-amnesia-G),
+    /// on an otherwise not-fully-attested ledger.
+    fn attest_namespace_history_complete(&mut self, namespace: &NamespaceId) {
+        self.completeness.insert(namespace.clone(), HistoryCompleteness::AttestedComplete);
+    }
+
+    /// Explicit, per-namespace override in the OTHER direction -- e.g. a
+    /// legacy namespace whose own completeness was never itself attested
+    /// during migration, layered onto an otherwise genesis-known ledger
+    /// (PATH-048-amnesia-F).
+    fn attest_namespace_history_unknown(&mut self, namespace: &NamespaceId) {
+        self.completeness.insert(namespace.clone(), HistoryCompleteness::Unknown);
+    }
+
+    fn completeness_for(&self, namespace: &NamespaceId) -> HistoryCompleteness {
+        self.completeness.get(namespace).copied().unwrap_or(self.default_completeness)
+    }
+
+    /// Only MEMBERSHIP is consulted by any decision in this file -- the
+    /// `CallId` value stored in `pruned_horizon` is never read back out.
+    /// See the field-level correction notice above.
+    fn has_pruned(&self, namespace: &NamespaceId) -> bool {
+        self.pruned_horizon.contains_key(namespace)
+    }
+
+    fn record_call(record: &SettlementRecord) -> CallId {
+        match record {
+            SettlementRecord::Reserved { call, .. } | SettlementRecord::Settled { call, .. } => *call,
+        }
+    }
+
+    /// Genuinely forgets any record for `namespace` older than
+    /// `keep_from` -- this experiment does not assume infinite
+    /// retention. The namespace's horizon only ever advances.
+    fn prune_namespace(&mut self, namespace: &NamespaceId, keep_from: CallId) {
+        self.records.retain(|key, record| key.namespace != *namespace || Self::record_call(record) >= keep_from);
+        let entry = self.pruned_horizon.entry(namespace.clone()).or_insert(keep_from);
+        if keep_from > *entry {
+            *entry = keep_from;
+        }
+    }
+}
+
+fn path_048_occurrence_key(contract: &TrustedSourceContract, event: &Path047CandidateEvent) -> Option<OccurrenceKey> {
+    let (namespace, _) = contract.authority_for(&event.identity.source_id)?;
+    Some(OccurrenceKey { namespace, event_id: event.identity.event_id.clone() })
+}
+
+/// PHASE 1 of a two-phase settlement (PATH-048-J): reserve identity for
+/// this occurrence, durably, BEFORE any economic effect is applied. Only
+/// a `New` result licenses proceeding to apply the effect and then call
+/// `path_048_confirm_settlement`.
+///
+/// This is the GUARDED, adopted design -- it includes the label-drift
+/// check (PATH-048-G) and the retention/stability-aware miss handling
+/// (PATH-048-E/H). See `path_048_reserve_naive_current_contract_only`
+/// for the deliberately weaker sibling PATH-048-G contrasts against.
+fn path_048_reserve(
+    ledger: &mut Path048Ledger,
+    contract: &TrustedSourceContract,
+    contract_version: ContractVersion,
+    call: CallId,
+    event: &Path047CandidateEvent,
+) -> Path048Verdict {
+    let (namespace, props) = match contract.authority_for(&event.identity.source_id) {
+        None => return Path048Verdict::Unresolved,
+        Some(x) => x,
+    };
+
+    // Label-drift guard (PATH-048-G): has this exact raw label ever
+    // resolved to a DIFFERENT namespace before? If so, the trust
+    // contract's binding for this label has changed since it was first
+    // observed -- the CURRENT resolution alone cannot be trusted to look
+    // up history correctly.
+    match ledger.label_first_seen_namespace.get(&event.identity.source_id) {
+        Some(first_namespace) if *first_namespace != namespace => return Path048Verdict::Unresolved,
+        Some(_) => {}
+        None => {
+            ledger.label_first_seen_namespace.insert(event.identity.source_id.clone(), namespace.clone());
+        }
+    }
+
+    let key = OccurrenceKey { namespace: namespace.clone(), event_id: event.identity.event_id.clone() };
+
+    match ledger.records.get(&key) {
+        Some(record) => {
+            // Exact canonical-key match against durable history --
+            // SEPARATION licenses trusting this as "same occurrence"
+            // (mirrors PATH-047's same-event_id direction).
+            if !props.separating {
+                return Path048Verdict::Unresolved;
+            }
+            match record {
+                // CROSS-REVIEW FIX: an earlier revision returned
+                // `Reserved` here unconditionally, without comparing
+                // payload -- a real resolver bug (PATH-048-K regression-
+                // guards it). A `Reserved` record with a DIFFERENT
+                // payload is a conflict, exactly like a `Settled` one:
+                // identity equality says these claims concern the same
+                // occurrence, so disagreement must be flagged, never
+                // silently ignored or overwritten.
+                SettlementRecord::Reserved { payload, .. } => {
+                    if *payload == event.payload { Path048Verdict::Reserved } else { Path048Verdict::Conflicted }
+                }
+                SettlementRecord::Settled { payload, .. } => {
+                    if *payload == event.payload { Path048Verdict::AlreadySettled } else { Path048Verdict::Conflicted }
+                }
+            }
+        }
+        None => {
+            if !ledger.ever_active_namespaces.contains(&namespace) {
+                // AMNESIA != GENESIS (cross-review correction): absence
+                // from `ever_active_namespaces` means only "THIS ledger
+                // instance holds no record of prior activity for this
+                // namespace" -- it is NOT, by itself, evidence that no
+                // such activity ever occurred (the ledger's own state
+                // could have been lost, reset, or incompletely restored).
+                // Only an explicit, exogenous completeness attestation
+                // licenses treating a namespace's first observed sighting
+                // as safe to settle.
+                match ledger.completeness_for(&namespace) {
+                    HistoryCompleteness::AttestedComplete => {
+                        ledger.ever_active_namespaces.insert(namespace.clone());
+                        ledger.records.insert(
+                            key,
+                            SettlementRecord::Reserved { payload: event.payload.clone(), contract_version, call },
+                        );
+                        return Path048Verdict::New;
+                    }
+                    HistoryCompleteness::Unknown => {
+                        return Path048Verdict::Unresolved;
+                    }
+                }
+            }
+            // This namespace HAS prior history retained here. A MISS on
+            // this specific event_id is negative evidence -- "not found
+            // in what this ledger retained" -- which is useful only if
+            // the retained history for this namespace is itself known
+            // complete. CROSS-REVIEW CORRECTION II (bug fix): a prior
+            // revision skipped this check entirely for an
+            // already-active namespace, trusting membership in
+            // `ever_active_namespaces` as if it implied complete
+            // retained history for EVERY event_id -- it does not. A
+            // PARTIAL RESTORE WITHIN THE SAME NAMESPACE (some of this
+            // namespace's real settlements restored, others silently
+            // omitted, with no completeness marker surviving the
+            // restore) is indistinguishable, on this branch alone, from
+            // a namespace that genuinely never had the missing event_id
+            // -- exactly ABSENCE != NOVELTY recurring one level down
+            // from where the first pass of this correction caught it.
+            if ledger.completeness_for(&namespace) != HistoryCompleteness::AttestedComplete {
+                return Path048Verdict::Unresolved;
+            }
+            // Independently of completeness: confidently declaring a NEW
+            // event_id "New" ALSO requires trusting "different id =>
+            // distinct occurrence" -- STABILITY (mirrors PATH-047's
+            // different-event_id direction). A pruned namespace
+            // (`has_pruned`, membership only -- see field-level notice
+            // above) independently removes the ability to positively
+            // confirm this isn't a forgotten match. Any of the three
+            // conditions failing blocks confident New (PATH-048-E,
+            // PATH-048-H, PATH-048-completeness-A).
+            if !props.stable || ledger.has_pruned(&namespace) {
+                return Path048Verdict::Unresolved;
+            }
+            ledger.records.insert(
+                key,
+                SettlementRecord::Reserved { payload: event.payload.clone(), contract_version, call },
+            );
+            Path048Verdict::New
+        }
+    }
+}
+
+/// PHASE 2: durably confirm that the economic effect for a previously
+/// `Reserved` occurrence was actually applied. A no-op if `key` is not
+/// currently `Reserved` (e.g. already `Settled`, or absent).
+fn path_048_confirm_settlement(ledger: &mut Path048Ledger, key: &OccurrenceKey) {
+    if let Some(SettlementRecord::Reserved { payload, contract_version, call }) = ledger.records.get(key).cloned() {
+        ledger.records.insert(key.clone(), SettlementRecord::Settled { payload, contract_version, call });
+    }
+}
+
+/// Convenience used by most tests below, which do not care about the
+/// Reserved/Settled distinction itself: reserve, and if `New`,
+/// immediately confirm -- modeling an atomic-in-practice happy path.
+/// PATH-048-J deliberately does NOT use this helper, to model the crash
+/// window between the two phases.
+fn path_048_settle_immediately(
+    ledger: &mut Path048Ledger,
+    contract: &TrustedSourceContract,
+    contract_version: ContractVersion,
+    call: CallId,
+    event: &Path047CandidateEvent,
+) -> Path048Verdict {
+    let verdict = path_048_reserve(ledger, contract, contract_version, call, event);
+    if verdict == Path048Verdict::New {
+        if let Some(key) = path_048_occurrence_key(contract, event) {
+            path_048_confirm_settlement(ledger, &key);
+        }
+    }
+    verdict
+}
+
+/// A deliberately WEAKER variant of `path_048_reserve` that resolves
+/// `source_id` through the CURRENT contract only, with no memory of what
+/// namespace that label resolved to at any PRIOR call -- i.e. it lacks
+/// the label-drift guard. Exists solely so PATH-048-G can demonstrate
+/// its failure mode by direct contrast with the guarded
+/// `path_048_reserve`. Otherwise identical.
+fn path_048_reserve_naive_current_contract_only(
+    ledger: &mut Path048Ledger,
+    contract: &TrustedSourceContract,
+    contract_version: ContractVersion,
+    call: CallId,
+    event: &Path047CandidateEvent,
+) -> Path048Verdict {
+    let (namespace, props) = match contract.authority_for(&event.identity.source_id) {
+        None => return Path048Verdict::Unresolved,
+        Some(x) => x,
+    };
+    let key = OccurrenceKey { namespace: namespace.clone(), event_id: event.identity.event_id.clone() };
+    match ledger.records.get(&key) {
+        Some(record) => {
+            if !props.separating {
+                return Path048Verdict::Unresolved;
+            }
+            match record {
+                // Same fix as `path_048_reserve` -- this sibling copy
+                // shares the payload-comparison logic; it is deliberately
+                // weak only with respect to the label-drift guard, not
+                // this.
+                SettlementRecord::Reserved { payload, .. } => {
+                    if *payload == event.payload { Path048Verdict::Reserved } else { Path048Verdict::Conflicted }
+                }
+                SettlementRecord::Settled { payload, .. } => {
+                    if *payload == event.payload { Path048Verdict::AlreadySettled } else { Path048Verdict::Conflicted }
+                }
+            }
+        }
+        None => {
+            if !ledger.ever_active_namespaces.contains(&namespace) {
+                ledger.ever_active_namespaces.insert(namespace.clone());
+                ledger.records.insert(
+                    key,
+                    SettlementRecord::Reserved { payload: event.payload.clone(), contract_version, call },
+                );
+                return Path048Verdict::New;
+            }
+            if !props.stable || ledger.has_pruned(&namespace) {
+                return Path048Verdict::Unresolved;
+            }
+            ledger.records.insert(
+                key,
+                SettlementRecord::Reserved { payload: event.payload.clone(), contract_version, call },
+            );
+            Path048Verdict::New
+        }
+    }
+}
+
+/// A deliberately WEAK candidate (PATH-048-B): remembers only the LAST
+/// event_id seen per namespace, nothing more.
+#[derive(Debug, Clone, Default)]
+struct Path048LastSeenOnly {
+    last_event_id: std::collections::HashMap<NamespaceId, String>,
+}
+
+impl Path048LastSeenOnly {
+    /// Returns `true` if this delivery "looks new" under this candidate
+    /// (i.e. differs from the single remembered last-seen id).
+    fn check_and_update(&mut self, namespace: &NamespaceId, event_id: &str) -> bool {
+        let looks_new = self.last_event_id.get(namespace).map(|last| last != event_id).unwrap_or(true);
+        self.last_event_id.insert(namespace.clone(), event_id.to_string());
+        looks_new
+    }
+}
+
+/// A deliberately NAIVE candidate (PATH-048-C): a raw set of previously
+/// settled canonical keys, pruned with NO retained memory of what was
+/// forgotten (contrast with `Path048Ledger`'s `ever_active_namespaces` +
+/// `pruned_horizon`, which retain exactly that).
+#[derive(Debug, Clone, Default)]
+struct Path048NaiveKeySet {
+    seen: std::collections::HashMap<OccurrenceKey, CallId>,
+}
+
+impl Path048NaiveKeySet {
+    /// Returns `true` if `key` had never been recorded before (i.e. this
+    /// delivery is treated as New).
+    fn check_and_insert(&mut self, key: OccurrenceKey, call: CallId) -> bool {
+        if self.seen.contains_key(&key) {
+            false
+        } else {
+            self.seen.insert(key, call);
+            true
+        }
+    }
+
+    /// NAIVE prune: entries older than `before` are simply dropped, with
+    /// nothing retained to remember that this happened.
+    fn naive_prune(&mut self, before: CallId) {
+        self.seen.retain(|_, call| *call >= before);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Adversarial cases A-J (H19's ten required attacks), plus the temporal
+// identifiability theorem and an end-to-end integration check.
+// ---------------------------------------------------------------------
+
+/// PATH-048-A: no persistent state at all. Simulated by using two
+/// entirely INDEPENDENT, freshly-attested ledgers for "call 1" and "call
+/// 2" -- i.e. nothing about call 1 is available when call 2 runs. Both
+/// are built with `new_attested_genesis()` deliberately: a "no
+/// persistent state" design in the wild typically does not even KNOW it
+/// lacks history -- it proceeds optimistically. (Using the safe
+/// `Unknown`-by-default constructor here instead would demonstrate a
+/// DIFFERENT, even more degenerate failure -- perpetual `Unresolved`,
+/// never settling anything at all -- which is not this case's point.)
+#[test]
+fn path_048_a_no_persistent_state_allows_independent_settlement_across_calls() {
+    let contract = TrustedSourceContract::trusting(&[("ns-A", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery = path_047_candidate("ns-A", "evt-1", payload.clone());
+    let retry = path_047_candidate("ns-A", "evt-1", payload);
+
+    let mut call_1_state = Path048Ledger::new_attested_genesis();
+    let mut call_2_state = Path048Ledger::new_attested_genesis(); // deliberately NOT the same ledger
+
+    let v1 = path_048_settle_immediately(&mut call_1_state, &contract, ContractVersion(1), CallId(1), &delivery);
+    let v2 = path_048_settle_immediately(&mut call_2_state, &contract, ContractVersion(1), CallId(2), &retry);
+
+    assert_eq!(v1, Path048Verdict::New);
+    assert_eq!(
+        v2,
+        Path048Verdict::New,
+        "ATTACK SUCCEEDS: with NO state shared across calls, the retry settles independently as \
+         New a second time -- H19's premise confirmed directly: pairwise/in-batch semantics alone \
+         (which is all a stateless design can offer) permit double settlement of one real \
+         occurrence the moment its deliveries land in separate calls"
+    );
+}
+
+/// PATH-048-B: remember only the last-seen event_id per namespace.
+/// Attacked with evt-1 -> evt-2 -> replay evt-1.
+#[test]
+fn path_048_b_last_seen_only_memory_fails_against_non_adjacent_replay() {
+    let namespace = NamespaceId("ns-A".to_string());
+    let mut candidate = Path048LastSeenOnly::default();
+
+    assert!(candidate.check_and_update(&namespace, "evt-1"), "first delivery: genuinely new");
+    assert!(candidate.check_and_update(&namespace, "evt-2"), "second delivery: genuinely new");
+    assert!(
+        candidate.check_and_update(&namespace, "evt-1"),
+        "ATTACK SUCCEEDS: replaying evt-1 after evt-2 has become the 'last seen' id looks new \
+         under this candidate, because it only ever compares against the SINGLE most recent id -- \
+         bounded 'last seen' memory is insufficient the moment a replay is not immediately \
+         adjacent to its original delivery"
+    );
+}
+
+/// PATH-048-C: a set of all previously settled authoritative identity
+/// keys. First: exact-key replay across separate calls IS caught. Then:
+/// attack retention/pruning when no memory of what was pruned is kept.
+#[test]
+fn path_048_c_key_only_set_exact_replay_then_naive_pruning_attack() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let key = OccurrenceKey { namespace, event_id: "evt-1".to_string() };
+
+    let mut set = Path048NaiveKeySet::default();
+    assert!(set.check_and_insert(key.clone(), CallId(1)), "call 1: genuinely new");
+    assert!(
+        !set.check_and_insert(key.clone(), CallId(2)),
+        "call 2: exact-key replay across separate calls IS caught by a plain historical key set"
+    );
+
+    // Attack retention: a NAIVE prune with no retained memory of the
+    // forgetting itself.
+    set.naive_prune(CallId(50));
+    assert!(
+        set.check_and_insert(key, CallId(100)),
+        "ATTACK SUCCEEDS: after a naive prune that keeps no memory of what was forgotten, the SAME \
+         key reappearing is silently accepted as New -- exactly the failure `Path048Ledger`'s \
+         `ever_active_namespaces` is built to prevent (contrast with PATH-048-H)"
+    );
+}
+
+/// PATH-048-D: is storing CANONICAL resolved occurrence identity
+/// strictly stronger than storing raw delivery keys? Direct comparison
+/// on identical inputs.
+#[test]
+fn path_048_d_canonical_occurrence_key_is_strictly_stronger_than_raw_delivery_key() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["payroll-system", "payroll-system-legacy"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery_1 = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let delivery_2_via_other_alias = path_047_candidate("payroll-system-legacy", "evt-1", payload.clone());
+
+    // RAW delivery key: `EventIdentity{source_id, event_id}`, pre-resolution.
+    let mut raw_seen: std::collections::HashSet<EventIdentity> = std::collections::HashSet::new();
+    assert!(raw_seen.insert(delivery_1.identity.clone()));
+    assert!(
+        raw_seen.insert(delivery_2_via_other_alias.identity.clone()),
+        "RAW delivery-key memory WRONGLY treats the second delivery as new: the two EventIdentity \
+         values differ (different source_id strings), even though they resolve to the SAME real \
+         occurrence"
+    );
+
+    // CANONICAL occurrence key: `(namespace, event_id)`, post-resolution.
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &delivery_1);
+    let v2 =
+        path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(2), &delivery_2_via_other_alias);
+    assert_eq!(v1, Path048Verdict::New);
+    assert_eq!(
+        v2,
+        Path048Verdict::AlreadySettled,
+        "CANONICAL occurrence-key memory correctly catches the replay delivered via the OTHER \
+         alias -- strictly stronger than raw delivery-key memory, which missed the identical \
+         scenario above"
+    );
+}
+
+/// PATH-048-E: unstable-ID namespace. Same real occurrence, call 1:
+/// evt-1, call 2: evt-2. Can ANY key-only historical set detect this
+/// without additional source semantics or an upstream occurrence
+/// identifier?
+#[test]
+fn path_048_e_unstable_id_namespace_cannot_be_positively_resolved_by_key_only_memory() {
+    let contract = TrustedSourceContract::trusting(&[("flaky-webhook", SourceIdContract::separating_only())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let delivery_call_1 = path_047_candidate("flaky-webhook", "evt-1", payload.clone());
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &delivery_call_1);
+    assert_eq!(v1, Path048Verdict::New, "namespace's first-ever activity: nothing to be inconsistent with yet");
+
+    let retry_call_2 = path_047_candidate("flaky-webhook", "evt-2", payload);
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &retry_call_2);
+
+    assert_eq!(
+        v2,
+        Path048Verdict::Unresolved,
+        "NO key-only historical set -- however complete its retention -- can positively resolve \
+         this: the KEY ITSELF is unstable, so a 'miss' proves nothing about novelty. The ledger \
+         correctly refuses New (would risk double-settling call 1's occurrence) and cannot claim \
+         AlreadySettled either (no matching key exists). It can never make positive progress for \
+         this namespace without regained STABILITY or an independent upstream occurrence \
+         identifier -- neither of which any key-only design can supply."
+    );
+}
+
+/// PATH-048-F: alias rotation. call 1 uses raw label A -> namespace N;
+/// call 2 uses raw label B -> the SAME namespace N. Historical
+/// protection must survive this.
+#[test]
+fn path_048_f_alias_rotation_is_transparently_caught_by_canonical_keying() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "support-canonical",
+        &["support-label-a", "support-label-b"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let call_1 = path_047_candidate("support-label-a", "evt-1", payload.clone());
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &call_1);
+    assert_eq!(v1, Path048Verdict::New);
+
+    let call_2 = path_047_candidate("support-label-b", "evt-1", payload);
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &call_2);
+
+    assert_eq!(
+        v2,
+        Path048Verdict::AlreadySettled,
+        "historical replay protection survives alias rotation: both raw labels resolve to the \
+         SAME canonical namespace, so the ledger's namespace-scoped key correctly recognizes the \
+         second delivery as the already-settled occurrence"
+    );
+}
+
+/// PATH-048-G, naive half: a `SourceId -> NamespaceId` binding changes
+/// over time. Using ONLY the current contract at lookup time, does this
+/// silently defeat replay protection?
+#[test]
+fn path_048_g_naive_current_contract_only_resolution_is_silently_defeated_by_contract_evolution() {
+    let payload = path_047_payload("alice", "review", 40.0);
+    let contract_v1 = TrustedSourceContract::trusting(&[("vendor-x", SourceIdContract::both_guaranteed())]);
+    let delivery = path_047_candidate("vendor-x", "evt-1", payload.clone());
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v1 = path_048_reserve_naive_current_contract_only(&mut ledger, &contract_v1, ContractVersion(1), CallId(1), &delivery);
+    assert_eq!(v1, Path048Verdict::New);
+
+    // The trust contract EVOLVES: "vendor-x" is now bound to a DIFFERENT
+    // canonical namespace (real reassignment, migration, or operational
+    // mistake -- this experiment does not need to know which). The SAME
+    // real occurrence (same event_id, same payload) is delivered again.
+    let contract_v2 =
+        TrustedSourceContract::trusting_with_aliases("vendor-x-reassigned", &["vendor-x"], SourceIdContract::both_guaranteed());
+
+    let v2 = path_048_reserve_naive_current_contract_only(&mut ledger, &contract_v2, ContractVersion(2), CallId(2), &delivery);
+    assert_eq!(
+        v2,
+        Path048Verdict::New,
+        "ATTACK SUCCEEDS against naive current-contract-only resolution: purely because the trust \
+         contract rebound 'vendor-x' to a different namespace, the SAME real occurrence is \
+         silently treated as New a second time -- no adversarial replay attempt was needed"
+    );
+}
+
+/// PATH-048-G, guarded half: does retaining the historical authority
+/// snapshot used at original settlement catch what the naive resolution
+/// above missed?
+#[test]
+fn path_048_g_label_drift_guard_catches_contract_evolution() {
+    let payload = path_047_payload("alice", "review", 40.0);
+    let contract_v1 = TrustedSourceContract::trusting(&[("vendor-x", SourceIdContract::both_guaranteed())]);
+    let delivery = path_047_candidate("vendor-x", "evt-1", payload.clone());
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v1 = path_048_settle_immediately(&mut ledger, &contract_v1, ContractVersion(1), CallId(1), &delivery);
+    assert_eq!(v1, Path048Verdict::New);
+
+    // OBSERVABILITY ONLY, not the detection mechanism: the settlement
+    // record's `contract_version` METADATA reflects the ORIGINAL binding
+    // used. This is retained for forensic purposes, but is NOT what
+    // catches the drift below -- `path_048_reserve` never reads
+    // `contract_version` back out of a stored record to decide anything
+    // (cross-review correction: an earlier revision of this test implied
+    // otherwise). The actual detection mechanism, exercised next, is
+    // `label_first_seen_namespace`.
+    let key = path_048_occurrence_key(&contract_v1, &delivery).unwrap();
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Settled { contract_version, .. } => assert_eq!(*contract_version, ContractVersion(1)),
+        other => panic!("expected Settled, got {other:?}"),
+    }
+
+    let contract_v2 =
+        TrustedSourceContract::trusting_with_aliases("vendor-x-reassigned", &["vendor-x"], SourceIdContract::both_guaranteed());
+    let v2 = path_048_reserve(&mut ledger, &contract_v2, ContractVersion(2), CallId(2), &delivery);
+
+    assert_eq!(
+        v2,
+        Path048Verdict::Unresolved,
+        "the GUARDED reserve function retains, per raw label, the NAMESPACE it FIRST resolved to \
+         (`label_first_seen_namespace`) -- when the CURRENT contract resolves the same label to a \
+         DIFFERENT namespace, that drift is flagged Unresolved rather than silently treated as a \
+         fresh New. This establishes that a historical AUTHORITY BINDING must survive contract \
+         evolution to catch this attack -- it does NOT establish that `ContractVersion` itself \
+         (stored above, unused in this decision) is necessary; that remains NOT ESTABLISHED."
+    );
+}
+
+/// PATH-048-H: an event reappears after the ledger's retention horizon
+/// has pruned it. What EXACTLY is lost?
+#[test]
+fn path_048_h_retention_window_expiry_loses_the_confident_replay_confirmation() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery = path_047_candidate("payroll-system", "evt-1", payload.clone());
+
+    // Baseline, WITHOUT pruning: a replay is confidently caught.
+    let mut ledger_unpruned = Path048Ledger::new_attested_genesis();
+    path_048_settle_immediately(&mut ledger_unpruned, &contract, ContractVersion(1), CallId(1), &delivery);
+    let replay_verdict_unpruned = path_048_reserve(&mut ledger_unpruned, &contract, ContractVersion(1), CallId(100), &delivery);
+    assert_eq!(replay_verdict_unpruned, Path048Verdict::AlreadySettled);
+
+    // Same scenario, but the retention window is exercised before the
+    // replay arrives.
+    let mut ledger_pruned = Path048Ledger::new_attested_genesis();
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    path_048_settle_immediately(&mut ledger_pruned, &contract, ContractVersion(1), CallId(1), &delivery);
+    ledger_pruned.prune_namespace(&namespace, CallId(50));
+    assert!(
+        ledger_pruned.records.is_empty(),
+        "the original settlement record is genuinely gone -- this experiment does not assume \
+         infinite retention"
+    );
+
+    let replay_verdict_pruned = path_048_reserve(&mut ledger_pruned, &contract, ContractVersion(1), CallId(100), &delivery);
+    assert_eq!(
+        replay_verdict_pruned,
+        Path048Verdict::Unresolved,
+        "GUARANTEE LOST when history expires: the ledger can no longer POSITIVELY CONFIRM this is \
+         a replay (AlreadySettled, as in the unpruned baseline above). What is NOT lost: it never \
+         silently falls back to New either -- `ever_active_namespaces` durably remembers this \
+         namespace has settlement history at all, even after the detailed record is pruned, so a \
+         miss here stays honestly Unresolved rather than a confident (and wrong) New"
+    );
+}
+
+/// PATH-048-I: the same authoritative occurrence identity reappears in a
+/// later call with a CHANGED payload. Must be Conflicted, never a second
+/// settlement, never a silent overwrite.
+#[test]
+fn path_048_i_conflict_over_time_is_flagged_not_overwritten() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let original_payload = path_047_payload("alice", "review", 40.0);
+    let changed_payload = path_047_payload("alice", "review", 999.0);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let original = path_047_candidate("payroll-system", "evt-1", original_payload.clone());
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &original);
+    assert_eq!(v1, Path048Verdict::New);
+
+    let conflicting = path_047_candidate("payroll-system", "evt-1", changed_payload);
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &conflicting);
+    assert_eq!(
+        v2,
+        Path048Verdict::Conflicted,
+        "not a second settlement and not a silent overwrite -- disagreement, not replay"
+    );
+
+    let key = path_048_occurrence_key(&contract, &original).unwrap();
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Settled { payload, .. } => {
+            assert_eq!(*payload, original_payload, "the original settled payload must survive the conflicting attempt unchanged")
+        }
+        other => panic!("expected the original Settled record to remain, got {other:?}"),
+    }
+}
+
+/// PATH-048-K (cross-review correction): a REAL resolver bug -- an
+/// earlier revision matched a `Reserved` record unconditionally, without
+/// comparing payload, so a conflicting delivery arriving BEFORE
+/// confirmation would have been misreported as `Reserved` (implying
+/// agreement) rather than `Conflicted`. Same authoritative occurrence key
+/// reserved with payload P1; before it is ever confirmed, the same key
+/// arrives again with a DIFFERENT payload P2. Must be `Conflicted`; must
+/// NOT become `New`, `AlreadySettled`, or silently overwrite the
+/// original `Reserved` record.
+#[test]
+fn path_048_k_conflicting_payload_against_a_reserved_not_yet_settled_record_is_conflicted() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let original_payload = path_047_payload("alice", "review", 40.0);
+    let changed_payload = path_047_payload("alice", "review", 999.0);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let original = path_047_candidate("payroll-system", "evt-1", original_payload.clone());
+    // Reserve only -- deliberately never confirmed, so the record stays
+    // `Reserved` for the remainder of this test.
+    let v1 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &original);
+    assert_eq!(v1, Path048Verdict::New);
+
+    let conflicting = path_047_candidate("payroll-system", "evt-1", changed_payload);
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &conflicting);
+    assert_eq!(
+        v2,
+        Path048Verdict::Conflicted,
+        "a conflicting payload against a Reserved (not yet Settled) record must be Conflicted, \
+         exactly like a conflict against a Settled one -- must NOT become New, must NOT become \
+         AlreadySettled, and must NOT be silently reported as Reserved (which would wrongly imply \
+         agreement)"
+    );
+
+    // The original Reserved record must be completely unchanged -- no
+    // overwrite, no promotion to Settled, no payload substitution.
+    let key = path_048_occurrence_key(&contract, &original).unwrap();
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Reserved { payload, .. } => {
+            assert_eq!(*payload, original_payload, "the original Reserved payload must survive the conflicting attempt unchanged")
+        }
+        other => panic!("expected the original Reserved record to remain Reserved, got {other:?}"),
+    }
+}
+
+/// PATH-048-J, first half: identity is reserved but the economic
+/// settlement is never confirmed (crash between the two phases). Both
+/// calls here run sequentially, single-threaded -- this test establishes
+/// an AT-MOST-ONCE SAFETY property under that modeled sequence, and
+/// separately a LIVENESS observation (stuck, not wrong); it does NOT
+/// execute concurrent/racing reservations and does NOT establish or test
+/// any exactly-once COMPLETION guarantee (nothing here ever resolves the
+/// stuck record).
+#[test]
+fn path_048_j_reserve_without_confirm_blocks_resettlement_but_does_not_progress() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery = path_047_candidate("payroll-system", "evt-1", payload);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    // `path_048_confirm_settlement` is deliberately never called --
+    // modeling a crash after reservation but before settlement.
+    let v1 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &delivery);
+    assert_eq!(v1, Path048Verdict::New);
+
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &delivery);
+    assert_eq!(
+        v2,
+        Path048Verdict::Reserved,
+        "at-most-once safety holds for this modeled sequence: a stuck Reserved record is never \
+         double-settled. Separately, it also never PROGRESSES to Settled on its own -- a LIVENESS \
+         gap for an operator to resolve, not a correctness violation. This test does not model \
+         concurrency and does not by itself establish that the reserve step is atomic under \
+         concurrent access."
+    );
+}
+
+/// PATH-048-J, second half: the reverse failure mode -- an economic
+/// effect is applied WITHOUT a durable reservation preceding it. This
+/// establishes an ORDERING requirement for the at-most-once-safety
+/// boundary this experiment models; it does not execute or prove a
+/// transactional-atomicity property (no concurrency/race scenario is
+/// modeled here).
+#[test]
+fn path_048_j2_settlement_without_durable_reservation_loses_replay_protection() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery = path_047_candidate("payroll-system", "evt-1", payload);
+
+    // No call to `path_048_reserve`/`path_048_confirm_settlement` at all
+    // for this first delivery -- modeling an economic effect applied
+    // (conceptually, out-of-band) without a durable identity write
+    // preceding or accompanying it.
+    let mut ledger = Path048Ledger::new_attested_genesis();
+
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &delivery);
+    assert_eq!(
+        v,
+        Path048Verdict::New,
+        "ATTACK SUCCEEDS: without a durable reservation preceding (or accompanying) the economic \
+         effect, at-most-once safety is lost entirely for that delivery -- a retry is silently \
+         treated as a fresh, legitimate occurrence. Together with PATH-048-J's first half, this \
+         establishes an ORDERING + DURABILITY requirement -- a reservation must exist no later \
+         than the economic effect it protects -- as the boundary these SEQUENTIAL tests actually \
+         exercise. Whether the reservation check-and-set must be ATOMIC under CONCURRENT delivery \
+         is not tested here (no race/concurrency scenario is modeled) and remains a DERIVED, not \
+         demonstrated, requirement; these two tests establish an at-most-once-safety boundary, not \
+         a full exactly-once settlement protocol."
+    );
+}
+
+/// STRONGEST REQUIRED COUNTEREXAMPLE: two histories that produce the
+/// SAME current delivery input but require different correct economic
+/// actions solely because of different past state.
+#[test]
+fn path_048_temporal_identifiability_theorem_same_current_input_different_correct_action() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let delivery = path_047_candidate("payroll-system", "evt-1", payload);
+
+    // HISTORY 1: this exact occurrence was already settled earlier.
+    let mut ledger_with_history = Path048Ledger::new_attested_genesis();
+    let prior = path_048_settle_immediately(&mut ledger_with_history, &contract, ContractVersion(1), CallId(1), &delivery);
+    assert_eq!(prior, Path048Verdict::New);
+
+    // HISTORY 2: nothing has ever happened.
+    let mut ledger_without_history = Path048Ledger::new_attested_genesis();
+
+    // THE SAME CURRENT DELIVERY -- identical namespace, event_id, and
+    // payload -- arrives against both histories.
+    let verdict_with_history = path_048_reserve(&mut ledger_with_history, &contract, ContractVersion(1), CallId(2), &delivery);
+    let verdict_without_history =
+        path_048_reserve(&mut ledger_without_history, &contract, ContractVersion(1), CallId(2), &delivery);
+
+    assert_eq!(verdict_with_history, Path048Verdict::AlreadySettled, "identical current input; correct action is REJECT");
+    assert_eq!(verdict_without_history, Path048Verdict::New, "identical current input; correct action is ACCEPT");
+    assert_ne!(
+        verdict_with_history, verdict_without_history,
+        "TEMPORAL IDENTIFIABILITY THEOREM: current-event data alone (delivery identity + full \
+         payload) is IDENTICAL in both histories, yet the correct economic action differs solely \
+         because of differing PAST state -- historical state is part of the observable required \
+         for correct settlement, not an optional optimization on top of current-event data"
+    );
+}
+
+/// End-to-end integration: across TWO SEPARATE calls, only genuinely new
+/// settlements reach production `allocate_contribution_pool` -- a
+/// replayed delivery must never be double-counted, and a genuinely new
+/// contribution must never be suppressed.
+#[test]
+fn path_048_integration_cross_call_survivors_feed_correctly_into_allocation() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let mut ledger = Path048Ledger::new_attested_genesis();
+
+    let alice_original = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &alice_original);
+    assert_eq!(v1, Path048Verdict::New);
+
+    // CALL 2: a network-level retry re-delivers the SAME occurrence, and
+    // a genuinely NEW, separate contribution from bob also arrives.
+    let alice_retry = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let bob_new = path_047_candidate("payroll-system", "evt-2", path_047_payload("bob", "bob-work", 20.0));
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &alice_retry);
+    let v3 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(2), &bob_new);
+    assert_eq!(v2, Path048Verdict::AlreadySettled);
+    assert_eq!(v3, Path048Verdict::New);
+
+    let settled_payloads: Vec<ContributionEvent> = ledger
+        .records
+        .values()
+        .filter_map(|record| match record {
+            SettlementRecord::Settled { payload, .. } => Some(payload.clone()),
+            SettlementRecord::Reserved { .. } => None,
+        })
+        .collect();
+    assert_eq!(settled_payloads.len(), 2, "the replayed delivery must never reach a second settlement");
+
+    let allocations = allocate_contribution_pool(&settled_payloads, &weights(), 100.0).unwrap();
+    let alice_share: f64 = allocations.iter().filter(|a| a.contributor_id == "alice").map(|a| a.normalized_share).sum();
+    let bob_share: f64 = allocations.iter().filter(|a| a.contributor_id == "bob").map(|a| a.normalized_share).sum();
+    assert!((alice_share - (40.0 / 60.0)).abs() < 1e-9, "alice's ONE real contribution, not two");
+    assert!((bob_share - (20.0 / 60.0)).abs() < 1e-9, "bob's genuinely new contribution must not be suppressed");
+}
+
+// =====================================================================
+// PATH-048 FINAL EPISTEMIC COMPLETENESS ATTACK -- AMNESIA != GENESIS
+//
+// Cross-review found one remaining sufficiency boundary in the candidate
+// above: `path_048_reserve`'s "namespace not in `ever_active_namespaces`"
+// branch treated absence of remembered history as PROOF of true genesis.
+// It is not -- an empty ledger looks IDENTICAL whether a namespace
+// genuinely never had activity before, or had activity that this
+// ledger's own durable state lost, was reset, or restored incompletely.
+// `HistoryCompleteness` (defined above, alongside `Path048Ledger`) is
+// the fix: an EXOGENOUS, per-namespace fact, never derived from
+// `records`/`ever_active_namespaces` being empty, that must be
+// explicitly attested before a first sighting is treated as safely New.
+//
+// CROSS-REVIEW CORRECTION II (NEGATIVE LOOKUP REQUIRES COMPLETE
+// HISTORY): the paragraph above describes only the FIRST pass of this
+// fix, which gated a namespace's very first sighting. A second
+// cross-review pass found the SAME bug still live one branch over: a
+// MISS on a specific `event_id` within an ALREADY-active namespace
+// (`ever_active_namespaces.contains(namespace)` true) skipped the
+// completeness check entirely, trusting namespace-level activity as if
+// it implied COMPLETE retained history for every `event_id` within it.
+// It does not -- PARTIAL RESTORE WITHIN THE SAME NAMESPACE (some of a
+// namespace's real settlements restored, others silently omitted) is
+// indistinguishable, on that branch alone, from a namespace whose
+// missing `event_id` genuinely never existed. The general principle is
+// broader than "AMNESIA != GENESIS": completeness gates EVERY NEGATIVE
+// occurrence-history lookup used to derive `New` -- a namespace's first
+// sighting is only the special case where the entire namespace is the
+// missing history, not the only case. ABSENCE != NOVELTY, at any grain.
+// Exact-key HITS remain unaffected either way: a positive record match
+// is usable evidence regardless of completeness (see `path_048_reserve`
+// below, and PATH-048-completeness-C/D).
+// =====================================================================
+
+/// STRONGEST COUNTEREXAMPLE (AMNESIA != GENESIS): two ledger histories
+/// that produce a BYTE-IDENTICAL current observable state -- on the
+/// fields that existed before this correction -- yet require different
+/// correct settlement actions.
+#[test]
+fn path_048_amnesia_theorem_identical_empty_ledgers_require_different_verdicts() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let k = path_047_candidate("payroll-system", "evt-1", payload.clone());
+
+    // WORLD A -- TRUE GENESIS: this namespace has genuinely never
+    // settled or reserved anything. An operator/deployment process
+    // attests this explicitly (an exogenous fact this experiment does
+    // not derive from the ledger's contents).
+    let world_a = Path048Ledger::new_attested_genesis();
+
+    // WORLD B -- AMNESIA: this namespace previously settled K in a prior
+    // process, but durable history was lost/reset before this test's
+    // ledger came into existence -- modeled by simply never having
+    // recorded it (a `default()` ledger, matching what a genuine total
+    // loss would leave behind: nothing, and no attestation surviving
+    // with it).
+    let world_b = Path048Ledger::default();
+
+    // On the fields that existed BEFORE this correction, the two worlds
+    // are OBSERVABLY IDENTICAL.
+    assert_eq!(world_a.records, world_b.records, "both empty");
+    assert_eq!(
+        world_a.ever_active_namespaces, world_b.ever_active_namespaces,
+        "both empty -- `ever_active_namespaces` ALONE cannot distinguish these two worlds"
+    );
+
+    // The SAME current delivery K arrives against both.
+    let mut world_a = world_a;
+    let mut world_b = world_b;
+    let verdict_a = path_048_reserve(&mut world_a, &contract, ContractVersion(1), CallId(1), &k);
+    let verdict_b = path_048_reserve(&mut world_b, &contract, ContractVersion(1), CallId(1), &k);
+
+    assert_eq!(verdict_a, Path048Verdict::New, "true genesis, explicitly attested: safe to settle");
+    assert_eq!(
+        verdict_b,
+        Path048Verdict::Unresolved,
+        "AMNESIA THEOREM: absence of historical state is NOT authoritative evidence of no history. \
+         World B's ledger is indistinguishable from World A's on every field that existed before \
+         this correction, yet the correct action differs -- K might already be settled. The FIX is \
+         precisely that this candidate no longer treats the two worlds as identical: \
+         `HistoryCompleteness` (attested for World A, left at its safe Unknown default for World B) \
+         is now part of the observable required for a correct verdict. Absent that attestation, the \
+         candidate correctly refuses New rather than guessing."
+    );
+}
+
+/// PATH-048-amnesia-A: clean first bootstrap. An attested-genesis
+/// ledger's first-ever delivery for a namespace is safely New.
+#[test]
+fn path_048_amnesia_a_clean_first_bootstrap() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let k = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &k);
+    assert_eq!(v, Path048Verdict::New, "an explicitly attested fresh deployment's first delivery is safely New");
+}
+
+/// PATH-048-amnesia-B: process restart with the durable ledger preserved
+/// intact (including its completeness attestation). A replay across the
+/// restart is still caught correctly.
+#[test]
+fn path_048_amnesia_b_restart_with_ledger_preserved() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let k = path_047_candidate("payroll-system", "evt-1", payload.clone());
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &k);
+    assert_eq!(v1, Path048Verdict::New);
+
+    // "Restart" -- a full serialize/reload round-trip is modeled by a
+    // clone, standing in for durable storage that preserved everything,
+    // completeness attestation included.
+    let mut restarted = ledger.clone();
+
+    let replay = path_047_candidate("payroll-system", "evt-1", payload);
+    let v2 = path_048_reserve(&mut restarted, &contract, ContractVersion(1), CallId(2), &replay);
+    assert_eq!(
+        v2,
+        Path048Verdict::AlreadySettled,
+        "a durable ledger preserved intact across a restart -- including its completeness \
+         attestation -- continues to protect against replay exactly as before"
+    );
+}
+
+/// PATH-048-amnesia-C: process restart with the ledger LOST. The exact
+/// scenario the strongest counterexample above proves must not be
+/// silently accepted.
+#[test]
+fn path_048_amnesia_c_restart_with_ledger_lost() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let k = path_047_candidate("payroll-system", "evt-1", payload.clone());
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &k);
+    assert_eq!(v1, Path048Verdict::New);
+
+    // Total loss: the process restarts with a BRAND NEW ledger, carrying
+    // NOTHING over -- not the records, not `ever_active_namespaces`, and
+    // NOT the completeness attestation (which is itself part of what was
+    // lost).
+    let mut lost = Path048Ledger::default();
+
+    let replay = path_047_candidate("payroll-system", "evt-1", payload);
+    let v2 = path_048_reserve(&mut lost, &contract, ContractVersion(1), CallId(2), &replay);
+    assert_eq!(
+        v2,
+        Path048Verdict::Unresolved,
+        "a genuinely lost ledger must NOT confidently settle K as New -- it might already be \
+         settled. The safe default (`Unknown` completeness) is exactly what prevents this"
+    );
+}
+
+/// PATH-048-amnesia-D: partial restore -- records and
+/// `ever_active_namespaces` are restored from a backup, but the
+/// completeness attestation is NOT (a realistic partial-restore failure
+/// mode: the "data tables" came back, the "we know this is everything"
+/// fact did not).
+///
+/// AMENDED (cross-review correction II): the original version of this
+/// test used a DIFFERENT, never-touched namespace ("other-system") for
+/// its missing-history assertion, which exercises only the FIRST-
+/// SIGHTING branch (already completeness-gated by the first pass of this
+/// correction) -- it never exercised a miss WITHIN THE SAME,
+/// already-active namespace, which is exactly where the second-pass bug
+/// lived. Supplemented below with that missing scenario directly.
+#[test]
+fn path_048_amnesia_d_partial_restore_without_completeness_marker() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let k = path_047_candidate("payroll-system", "evt-1", payload.clone());
+
+    let mut original = Path048Ledger::new_attested_genesis();
+    path_048_settle_immediately(&mut original, &contract, ContractVersion(1), CallId(1), &k);
+
+    // Restore records + ever_active_namespaces + the label-binding fact
+    // ("the data tables") into a FRESH ledger -- but deliberately leave
+    // its completeness at the safe Unknown default ("the attestation").
+    let mut restored = Path048Ledger::default();
+    restored.records = original.records.clone();
+    restored.ever_active_namespaces = original.ever_active_namespaces.clone();
+    restored.label_first_seen_namespace = original.label_first_seen_namespace.clone();
+
+    // An exact-key replay of the RESTORED occurrence is still caught --
+    // exact-key matches are usable evidence regardless of completeness.
+    let replay = path_047_candidate("payroll-system", "evt-1", payload);
+    let v_replay = path_048_reserve(&mut restored, &contract, ContractVersion(1), CallId(2), &replay);
+    assert_eq!(
+        v_replay,
+        Path048Verdict::AlreadySettled,
+        "restored records alone are sufficient to catch an exact-key replay -- completeness gates \
+         NEGATIVE lookup evidence (a miss), never a positive record hit"
+    );
+
+    // AMENDMENT: a DIFFERENT event_id under the SAME, already-active
+    // namespace that this restore never captured (e.g. a second real
+    // settlement the backup silently omitted) must ALSO stay Unresolved
+    // -- this is the exact PARTIAL RESTORE WITHIN THE SAME NAMESPACE
+    // scenario the second pass of this correction fixed.
+    let omitted = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 25.0));
+    let v_omitted = path_048_reserve(&mut restored, &contract, ContractVersion(1), CallId(2), &omitted);
+    assert_eq!(
+        v_omitted,
+        Path048Verdict::Unresolved,
+        "a miss on a DIFFERENT event_id within the SAME already-active namespace is exactly as \
+         much negative evidence as a namespace's first sighting -- `ever_active_namespaces` \
+         containing this namespace (because evt-1 WAS restored) must not license New for evt-2 \
+         just because completeness happens to be checked elsewhere"
+    );
+
+    // But a namespace this restore never touched at all -- and which the
+    // restore process cannot vouch is free of pre-restore history --
+    // correctly stays Unresolved on its first sighting: restoring DATA
+    // is not the same fact as attesting COMPLETENESS.
+    let other_contract = TrustedSourceContract::trusting(&[("other-system", SourceIdContract::both_guaranteed())]);
+    let other_delivery = path_047_candidate("other-system", "evt-1", path_047_payload("bob", "x", 5.0));
+    let v_other = path_048_reserve(&mut restored, &other_contract, ContractVersion(1), CallId(2), &other_delivery);
+    assert_eq!(
+        v_other,
+        Path048Verdict::Unresolved,
+        "a partial restore of records/ever_active_namespaces does not, by itself, re-establish a \
+         completeness attestation for a namespace it never captured"
+    );
+}
+
+/// PATH-048-amnesia-E: a completeness marker CLAIMS complete, but some
+/// namespace history was actually omitted (a false attestation). Does
+/// this become an exogenous trust assumption the downstream code cannot
+/// verify?
+#[test]
+fn path_048_amnesia_e_false_completeness_attestation_is_an_unverifiable_exogenous_axiom() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    // STIPULATED (by this test's own narrative, not by anything in the
+    // ledger's data): "payroll-system" genuinely settled K in some
+    // earlier, now-fully-lost system this ledger has no trace of. An
+    // operator/migration process nonetheless attests genesis for this
+    // ledger -- an honest mistake, an incomplete audit, or a compromised
+    // attestation source; this experiment does not need to know which.
+    let k = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+
+    let mut ledger = Path048Ledger::new_attested_genesis(); // the FALSE attestation
+
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &k);
+    assert_eq!(
+        v,
+        Path048Verdict::New,
+        "AXIOM FORGERY -- PATH-042/FIND-019's pattern recurring here: a FALSE completeness \
+         attestation produces EXACTLY the same confident New verdict a TRUE one would. This \
+         candidate has no way to distinguish a genuinely complete genesis attestation from an \
+         incorrect one -- completeness/genesis is therefore an EXOGENOUS TRUST ASSUMPTION this \
+         downstream code cannot verify, only faithfully propagate. Getting it wrong silently \
+         reintroduces exactly the double-settlement risk this whole correction exists to prevent."
+    );
+}
+
+/// PATH-048-amnesia-F: a namespace newly introduced after system
+/// genesis, contrasted with an unknown historical namespace layered onto
+/// the SAME otherwise genesis-known ledger.
+#[test]
+fn path_048_amnesia_f_new_namespace_vs_unknown_historical_namespace() {
+    let mut ledger = Path048Ledger::new_attested_genesis();
+
+    // "new-vendor": genuinely introduced AFTER genesis. Under a
+    // genesis-complete ledger, there is no window in which it could have
+    // had un-tracked history -- its first sighting is safely New.
+    let new_vendor_contract = TrustedSourceContract::trusting(&[("new-vendor", SourceIdContract::both_guaranteed())]);
+    let new_vendor_delivery = path_047_candidate("new-vendor", "evt-1", path_047_payload("carol", "onboarding", 15.0));
+    let v_new = path_048_reserve(&mut ledger, &new_vendor_contract, ContractVersion(1), CallId(5), &new_vendor_delivery);
+    assert_eq!(v_new, Path048Verdict::New, "a namespace genuinely introduced after an attested genesis is safely New");
+
+    // "legacy-migrated-system": a DIFFERENT namespace, explicitly
+    // overridden to Unknown on this otherwise genesis-known ledger --
+    // e.g. migrated in from an older system whose own completeness was
+    // never itself attested.
+    let legacy_namespace =
+        NamespaceId("legacy-migrated-system".to_string());
+    ledger.attest_namespace_history_unknown(&legacy_namespace);
+    let legacy_contract =
+        TrustedSourceContract::trusting(&[("legacy-migrated-system", SourceIdContract::both_guaranteed())]);
+    let legacy_delivery = path_047_candidate("legacy-migrated-system", "evt-1", path_047_payload("dave", "carryover", 25.0));
+    let v_legacy = path_048_reserve(&mut ledger, &legacy_contract, ContractVersion(1), CallId(5), &legacy_delivery);
+    assert_eq!(
+        v_legacy,
+        Path048Verdict::Unresolved,
+        "the SAME ledger, otherwise genesis-known, correctly distinguishes a namespace with an \
+         explicit UNKNOWN-history override from one covered by genesis -- 'new to the system' and \
+         'unknown historical namespace' are NOT the same fact and must not share one verdict"
+    );
+}
+
+/// PATH-048-amnesia-G: migration/import from an older system. Does
+/// imported historical completeness need explicit attestation, or does
+/// importing SOME data imply it?
+#[test]
+fn path_048_amnesia_g_migrated_namespace_requires_explicit_completeness_attestation() {
+    let contract = TrustedSourceContract::trusting(&[("migrated-system", SourceIdContract::both_guaranteed())]);
+    let known_migrated = path_047_candidate("migrated-system", "evt-legacy-1", path_047_payload("alice", "legacy-review", 40.0));
+
+    // A migration imports records for the events it actually knows about
+    // -- but, like any real migration, cannot prove a negative (that it
+    // captured EVERYTHING). No explicit completeness attestation is
+    // made.
+    let mut ledger = Path048Ledger::default();
+    let v_unattested = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &known_migrated);
+    assert_eq!(
+        v_unattested,
+        Path048Verdict::Unresolved,
+        "importing data for a namespace's first sighting does not, by itself, attest that the \
+         import is COMPLETE -- the ledger withholds New even for an event the migration DID bring \
+         over, absent an explicit completeness attestation for this namespace"
+    );
+
+    // With an EXPLICIT, deliberate attestation that the migration is
+    // known-complete for this specific namespace, the identical scenario
+    // now correctly proceeds.
+    let namespace = contract.authority_for(&SourceId("migrated-system".into())).unwrap().0;
+    let mut attested = Path048Ledger::default();
+    attested.attest_namespace_history_complete(&namespace);
+    let v_attested = path_048_reserve(&mut attested, &contract, ContractVersion(1), CallId(1), &known_migrated);
+    assert_eq!(
+        v_attested,
+        Path048Verdict::New,
+        "imported historical completeness MUST be attested explicitly -- once it is, first \
+         sightings for that namespace proceed exactly as an attested genesis would"
+    );
+}
+
+// =====================================================================
+// PATH-048 CROSS-REVIEW CORRECTION II -- NEGATIVE LOOKUP REQUIRES
+// COMPLETE HISTORY (the bug fixed in `path_048_reserve` above, and its
+// dedicated regression suite).
+// =====================================================================
+
+/// PATH-048-completeness-A (REQUIRED, reproduces the reported bug):
+/// ACTIVE NAMESPACE + PARTIAL RESTORE. Real history: evt-1 and evt-2
+/// both settled. Restore captures only evt-1; `ever_active_namespaces`
+/// contains the namespace; completeness Unknown; no pruning marker
+/// survived; the source contract has AUTHORITY + STABILITY + SEPARATION.
+/// The current delivery is evt-2 with its ORIGINAL payload. Before the
+/// fix this returned `New` (confirmed by a scratch repro during this
+/// correction); it must be `Unresolved`.
+#[test]
+fn path_048_completeness_a_active_namespace_partial_restore_stays_unresolved() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review-1", 40.0);
+    let payload_2 = path_047_payload("alice", "review-2", 25.0);
+    let e1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let e2 = path_047_candidate("payroll-system", "evt-2", payload_2.clone());
+
+    // REAL HISTORY: both settle.
+    let mut real = Path048Ledger::new_attested_genesis();
+    path_048_settle_immediately(&mut real, &contract, ContractVersion(1), CallId(1), &e1);
+    path_048_settle_immediately(&mut real, &contract, ContractVersion(1), CallId(1), &e2);
+
+    // PARTIAL RESTORE: only evt-1's record carried over; the namespace IS
+    // marked active (because evt-1 was); completeness is left at its safe
+    // Unknown default; nothing pruned.
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let mut restored = Path048Ledger::default();
+    let e1_key = OccurrenceKey { namespace: namespace.clone(), event_id: "evt-1".to_string() };
+    restored.records.insert(e1_key, real.records.get(&OccurrenceKey { namespace, event_id: "evt-1".to_string() }).unwrap().clone());
+    restored.ever_active_namespaces.insert(contract.authority_for(&SourceId("payroll-system".into())).unwrap().0);
+
+    // CURRENT DELIVERY: evt-2, with its ORIGINAL payload -- exactly the
+    // real, already-settled occurrence, just never restored.
+    let v = path_048_reserve(&mut restored, &contract, ContractVersion(1), CallId(2), &e2);
+    assert_eq!(
+        v,
+        Path048Verdict::Unresolved,
+        "BUG FIX REGRESSION GUARD: a MISS within an already-ACTIVE namespace is negative evidence \
+         only if that namespace's retained history is attested complete. `ever_active_namespaces` \
+         containing the namespace (because evt-1 WAS restored) must not, by itself, license New \
+         for evt-2 -- absent an explicit completeness attestation, this must stay Unresolved even \
+         though AUTHORITY, STABILITY, and SEPARATION all hold and nothing was ever pruned"
+    );
+}
+
+/// PATH-048-completeness-B (REQUIRED): ACTIVE NAMESPACE + ATTESTED
+/// COMPLETE HISTORY. evt-1 retained, evt-2 genuinely never existed,
+/// completeness attested complete, STABILITY established. The identical
+/// MISS shape as case A, but with the exogenous fact actually present --
+/// must resolve `New`, confirming the fix is not simply "always
+/// Unresolved on a miss."
+#[test]
+fn path_048_completeness_b_active_namespace_attested_complete_history_permits_new() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let e1 = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let e2 = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 25.0));
+
+    let mut ledger = Path048Ledger::new_attested_genesis(); // completeness ATTESTED throughout
+    let v1 = path_048_settle_immediately(&mut ledger, &contract, ContractVersion(1), CallId(1), &e1);
+    assert_eq!(v1, Path048Verdict::New);
+
+    let v2 = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &e2);
+    assert_eq!(
+        v2,
+        Path048Verdict::New,
+        "with completeness genuinely attested AND STABILITY established, a miss on a genuinely \
+         new event_id within an already-active namespace correctly proceeds -- the fix gates on \
+         completeness, it does not forbid New on a miss altogether"
+    );
+}
+
+/// PATH-048-completeness-C (REQUIRED): EXACT HIT + UNKNOWN COMPLETENESS.
+/// Proves completeness gates NEGATIVE evidence only, never a positive
+/// record hit: even with completeness Unknown throughout, an exact-key
+/// replay is still caught.
+#[test]
+fn path_048_completeness_c_exact_hit_survives_unknown_completeness() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+
+    // Completeness Unknown throughout -- the record is placed directly,
+    // standing in for "restored from a backup with no attestation,"
+    // without ever calling anything that would set completeness.
+    let mut ledger = Path048Ledger::default();
+    ledger.ever_active_namespaces.insert(namespace.clone());
+    ledger.records.insert(
+        OccurrenceKey { namespace, event_id: "evt-1".to_string() },
+        SettlementRecord::Settled { payload: payload.clone(), contract_version: ContractVersion(1), call: CallId(1) },
+    );
+    assert_eq!(ledger.completeness_for(&contract.authority_for(&SourceId("payroll-system".into())).unwrap().0), HistoryCompleteness::Unknown);
+
+    let replay = path_047_candidate("payroll-system", "evt-1", payload);
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &replay);
+    assert_eq!(
+        v,
+        Path048Verdict::AlreadySettled,
+        "an exact-key HIT is usable evidence regardless of completeness -- completeness gates only \
+         NEGATIVE (miss) lookups, never a positive record match"
+    );
+}
+
+/// PATH-048-completeness-D (REQUIRED): EXACT HIT CONFLICT + UNKNOWN
+/// COMPLETENESS. Proves conflict detection ALSO survives incomplete
+/// ambient history -- disagreement on a key the ledger DOES hold is
+/// still detected even when completeness for the surrounding namespace
+/// is Unknown.
+#[test]
+fn path_048_completeness_d_exact_hit_conflict_survives_unknown_completeness() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let original_payload = path_047_payload("alice", "review", 40.0);
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+
+    let mut ledger = Path048Ledger::default(); // Unknown completeness throughout
+    ledger.ever_active_namespaces.insert(namespace.clone());
+    ledger.records.insert(
+        OccurrenceKey { namespace, event_id: "evt-1".to_string() },
+        SettlementRecord::Settled { payload: original_payload.clone(), contract_version: ContractVersion(1), call: CallId(1) },
+    );
+
+    let conflicting = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 999.0));
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(2), &conflicting);
+    assert_eq!(
+        v,
+        Path048Verdict::Conflicted,
+        "conflict detection on an exact-key HIT also survives Unknown ambient completeness -- the \
+         retained record itself is the evidence, and disagreement with it is detected regardless"
+    );
+}
+
+/// Reassessment (required by this correction): after fixing the MISS
+/// branch to consult completeness, is `ever_active_namespaces` still
+/// INDEPENDENT state, or is it fully derivable from `records` and
+/// `pruned_horizon`? Proven here across the three states that matter:
+/// never active, active with unpruned records, and active-then-fully-
+/// pruned. `ever_active_namespaces` is retained in the struct as an O(1)
+/// convenience (avoiding a scan over `records` on every lookup), NOT
+/// because it carries information the other two fields lack.
+#[test]
+fn path_048_completeness_ever_active_namespaces_is_derivable_not_independent() {
+    fn derived_ever_active(ledger: &Path048Ledger, namespace: &NamespaceId) -> bool {
+        ledger.pruned_horizon.contains_key(namespace) || ledger.records.keys().any(|k| &k.namespace == namespace)
+    }
+
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let k = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+
+    // Never active.
+    let fresh = Path048Ledger::new_attested_genesis();
+    assert_eq!(fresh.ever_active_namespaces.contains(&namespace), derived_ever_active(&fresh, &namespace));
+    assert!(!fresh.ever_active_namespaces.contains(&namespace));
+
+    // Active, unpruned.
+    let mut active = Path048Ledger::new_attested_genesis();
+    path_048_settle_immediately(&mut active, &contract, ContractVersion(1), CallId(1), &k);
+    assert_eq!(active.ever_active_namespaces.contains(&namespace), derived_ever_active(&active, &namespace));
+    assert!(active.ever_active_namespaces.contains(&namespace));
+
+    // Active, then fully pruned -- the case `ever_active_namespaces`
+    // exists specifically to still get right.
+    let mut pruned = active.clone();
+    pruned.prune_namespace(&namespace, CallId(50));
+    assert!(pruned.records.is_empty(), "the record itself is genuinely gone");
+    assert_eq!(
+        pruned.ever_active_namespaces.contains(&namespace),
+        derived_ever_active(&pruned, &namespace),
+        "even with records empty, `pruned_horizon` membership alone reconstructs the same fact \
+         `ever_active_namespaces` stores directly -- confirming it adds no INDEPENDENT information \
+         over `records` UNION `pruned_horizon`, only a cheaper lookup"
+    );
+    assert!(pruned.ever_active_namespaces.contains(&namespace), "survives pruning, as designed");
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+// CROSS-REVIEW CORRECTION: this section previously used minimality/
+// sufficiency/necessity language stronger than what was actually
+// established. Revised below to say only what the tests prove.
+// CROSS-REVIEW CORRECTION II: the completeness gate previously applied
+// only to a namespace's first sighting; it is now known to apply to
+// EVERY negative occurrence-history lookup used to derive `New` (see the
+// dedicated section above). Revised again below.
+// ---------------------------------------------------------------------
+//
+// CORE QUESTION (asked as: what is the SMALLEST SURVIVING CANDIDATE
+// TESTED that prevents both double settlement AND accidental
+// suppression?): `Path048Ledger` -- canonical
+// `OccurrenceKey -> SettlementRecord{Reserved|Settled}` plus
+// `ever_active_namespaces` (now known REDUNDANT -- see below) plus
+// `pruned_horizon` (membership only; see the field-level correction
+// notice on `Path048Ledger` -- the `CallId` value it stores is not
+// itself proven necessary) plus `label_first_seen_namespace` plus
+// `HistoryCompleteness` (per-namespace, `AttestedComplete` vs `Unknown`
+// -- now gating BOTH a namespace's first sighting AND any later miss
+// within an already-active namespace). PATH-048-A/B/C show each smaller
+// candidate tried (nothing, last-seen-only, unguarded key set) fails at
+// least one of the two safety properties on the specific attacks
+// constructed here. PATH-048-D/E/F/G/H/I/J/K/amnesia-A..G/completeness-
+// A..D show this candidate degrades to `Unresolved` -- never a wrong
+// `New` or a wrong `AlreadySettled` -- at every boundary this
+// experiment's cases probe, INCLUDING the ledger's own initialization/
+// provenance AND partial restoration within an already-active namespace,
+// neither of which the pre-correction candidate probed. This is
+// sufficiency FOR THE CASES TESTED, under the explicit AUTHORITY/
+// STABILITY/SEPARATION assumptions inherited from FIND-025 -- not a
+// claim of global or formal minimality over every field (see the
+// field-level notices on `pruned_horizon` and `ContractVersion` for two
+// fields specifically NOT proven minimal, and the redundancy result for
+// `ever_active_namespaces` below), and not a claim that no smaller
+// design could pass these same cases some other way.
+//
+// STRONGEST COUNTEREXAMPLE: the AMNESIA theorem test above -- two ledger
+// histories (true genesis vs. lost history) that are OBSERVABLY
+// IDENTICAL on every field that existed before this correction
+// (`records`, `ever_active_namespaces` both empty), fed the identical
+// current delivery, yet require opposite correct verdicts. This
+// supersedes the earlier temporal identifiability theorem (settled vs.
+// never-settled, distinguishable by `records` alone) as the strongest
+// counterexample in this file specifically because the two AMNESIA
+// worlds are indistinguishable on MORE of the pre-correction observable
+// surface -- proving `ledger completeness/initialization state`, not
+// just settlement history, is part of the observable correct settlement
+// requires. Necessity of SOME durable cross-call state follows from
+// both theorems together with PATH-048-A.
+//
+// Whether `ever_active_namespaces` alone was sufficient: NO (the AMNESIA
+// correction) -- it records only what ONE ledger instance has itself
+// observed, never whether that instance's observations are complete
+// since true origin. The two are independent facts: an amnesiac ledger
+// and a genesis ledger both have it empty.
+//
+// Whether `ever_active_namespaces` remains INDEPENDENTLY load-bearing
+// after correction II: NO --
+// `path_048_completeness_ever_active_namespaces_is_derivable_not_independent`
+// proves it equals `pruned_horizon.contains_key(namespace) ||
+// records.keys().any(|k| k.namespace == namespace)` across every ledger
+// state this experiment constructs (never active; active, unpruned;
+// active, fully pruned). Once every MISS unconditionally consults
+// completeness (correction II), the field's remaining job -- deciding
+// whether STABILITY/pruning checks are even relevant -- is fully
+// recoverable from `records` and `pruned_horizon` alone. It is retained
+// in the struct as an O(1) convenience, not because it is independently
+// necessary state.
+//
+// Whether first-ever activity, OR any later miss within an active
+// namespace, can ever be inferred from absence alone: NO, for either --
+// absence from `ever_active_namespaces`/`records` is consistent with
+// true genesis, total historical loss, AND partial restoration within
+// one namespace (PATH-048-completeness-A, the second-pass bug). An
+// EXPLICIT, exogenous completeness attestation (`HistoryCompleteness`)
+// is required before EITHER kind of negative lookup may license `New`;
+// PATH-048-amnesia-E shows this attestation is itself an unverifiable
+// axiom in PATH-042/FIND-019's sense -- a false one produces the
+// identical confident (and wrong) `New` a true one would. Exact-key HITS
+// are unaffected either way (PATH-048-completeness-C/D) -- completeness
+// governs interpretation of a MISS, never a positive record match.
+//
+// Whether key-only memory survives unstable IDs: NO (PATH-048-E) -- the
+// key itself is what's unstable, so no amount of retained key history
+// helps; this requires restored STABILITY or an independent upstream
+// occurrence identifier, neither modeled here.
+//
+// Whether a historical authority BINDING must survive current-contract
+// evolution: YES, for the attack constructed (PATH-048-G) -- demonstrated
+// by direct contrast between the naive (current-contract-only) and
+// guarded (retains first-seen NAMESPACE per label, via
+// `label_first_seen_namespace`) resolvers on the identical
+// contract-evolution scenario. This is narrower than "ContractVersion
+// must be historical": `ContractVersion` is stored per settlement record
+// as metadata only and is never read by any decision in this file: its
+// necessity is NOT ESTABLISHED.
+//
+// Whether settlement and identity reservation require atomicity: these
+// SEQUENTIAL tests (PATH-048-J/K) establish an ORDERING + DURABILITY
+// requirement for AT-MOST-ONCE SAFETY -- a reservation must exist no
+// later than the economic effect it protects -- and separately a
+// LIVENESS observation (an unconfirmed reservation is safe but stuck,
+// not a full exactly-once completion protocol). No concurrency or race
+// scenario is executed here, so "the reservation check-and-set must be
+// ATOMIC" is recorded only as a DERIVED requirement (a reasoned
+// implication of the ordering result), not one this experiment
+// demonstrates by test.
