@@ -15404,3 +15404,683 @@ fn path_048_completeness_ever_active_namespaces_is_derivable_not_independent() {
 // ATOMIC" is recorded only as a DERIVED requirement (a reasoned
 // implication of the ordering result), not one this experiment
 // demonstrates by test.
+
+
+// =====================================================================
+// PATH-049 -- CONCURRENT CLAIM / ATOMIC RESERVATION BOUNDARY (H20)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::contribution` or wired into any production
+// path -- no production file is touched by this experiment.
+//
+// QUESTION: does the replay-safe settlement candidate established by
+// PATH-048 (`Path048Ledger` + `path_048_reserve`) remain safe when TWO
+// resolution calls race concurrently for the SAME canonical economic
+// occurrence?
+//
+// H20: sequential reserve-before-effect ordering (PATH-048's rule) is
+// insufficient for at-most-once settlement under concurrent calls. If
+// "check whether K exists" and "reserve K" are separable operations, two
+// concurrent callers can both observe K absent and both obtain a license
+// to apply the economic effect. A replay-safe concurrent boundary
+// requires some atomic/linearizable occurrence-claim operation over the
+// canonical `OccurrenceKey`.
+//
+// PATH-049 reuses PATH-047/PATH-048's full type vocabulary unmodified --
+// `SourceId`, `NamespaceId`, `TrustedSourceContract`, `SourceIdContract`,
+// `EventIdentity`, `Path047CandidateEvent`, `OccurrenceKey`,
+// `SettlementRecord`, `Path048Verdict`, `Path048Ledger`,
+// `HistoryCompleteness`, `path_048_reserve`, `path_048_confirm_settlement`,
+// `path_048_occurrence_key` -- and adds exactly ONE new thing: a way to
+// make the EXISTING `path_048_reserve` decision execute as one
+// indivisible critical section under concurrent callers
+// (`path_049_atomic_claim`, a thin `Mutex`-guarded wrapper), plus a
+// deliberately naive split check/reserve structure
+// (`Path049NaiveSplitLedger`) to demonstrate the race PATH-048 never
+// tested.
+//
+// THE ADOPTED ATOMIC CANDIDATE: `std::sync::Mutex<Path048Ledger>`,
+// claimed via `path_049_atomic_claim`, which holds the lock for the
+// ENTIRE duration of `path_048_reserve`. What makes the claim transition
+// indivisible is that the `Mutex` EXCLUDES every other thread from
+// entering the protected "does K exist? if not, insert Reserved(K)"
+// section while one holder is inside it -- NOT the absence of explicit
+// yield points in that section's own code. Ordinary synchronous
+// execution can still be preempted by the scheduler at any instruction;
+// preemption inside the critical section is harmless here specifically
+// because no OTHER thread can be concurrently executing that same
+// section while the `Mutex` is held, not because the code happens not to
+// await/yield. The theorem under test is about INDIVISIBILITY of the
+// claim transition, not about `Mutex` specifically -- `Mutex` is simply
+// the smallest mechanism this test-local candidate needed to achieve it
+// (see PATH-049-E, which shows this coarse, whole-ledger lock does NOT
+// impose incorrect cross-key serialization semantics, only execution
+// ordering).
+//
+// LOGICAL LINEARIZATION POINT: the first successful transition of K from
+// absent to `Reserved(K)` inside one locked call to `path_048_reserve`.
+// Candidate property: after that point, no OTHER concurrent caller
+// CONTENDING FOR THE SAME K can still legally receive `New`/Acquired for
+// it. PATH-049-B/C/F are the cases that genuinely contend for the SAME
+// canonical occurrence and test this property directly (exactly one
+// `New` per contested key, regardless of which caller's OS thread
+// happens to win the race); it holds in every one of them. (PATH-049-E/G
+// intentionally exercise DIFFERENT canonical keys -- they show the claim
+// does NOT incorrectly serialize across keys, a related but distinct
+// property; see the adversarial-case scope notes below.)
+//
+// THE THREE CLAIMS THIS EXPERIMENT DOES NOT COLLAPSE (do not conflate):
+//   1. ATOMIC CLAIM -- exactly one caller can acquire the occurrence
+//      identity. THIS is what PATH-049 tests.
+//   2. DURABLE CLAIM -- the acquired reservation survives the relevant
+//      crash boundary. PATH-048 gave SEQUENTIAL evidence about this
+//      ordering (reserve-before-effect); PATH-049 does not add to it.
+//   3. ATOMIC ECONOMIC EFFECT -- the economic side effect and the
+//      settlement state transition complete as one consistent unit.
+//      NOT tested here. PATH-049-J explicitly shows the gap this leaves:
+//      an acquired-but-never-confirmed claim is SAFE (no double license)
+//      but permanently stuck -- this experiment does NOT claim
+//      exactly-once completion, and the gap between "claimed" and
+//      "economic effect durably applied and confirmed" is flagged below
+//      as the likely next PATH, not as something solved here.
+//
+// CONSTRAINTS HONORED: all epistemic prerequisites (AUTHORITY, STABILITY,
+// SEPARATION, `HistoryCompleteness`) are held GOOD in B-G specifically to
+// isolate CONCURRENCY as the one variable under test; H and I
+// deliberately hold completeness Unknown to prove atomicity does not
+// launder missing epistemic warrant into certainty. No payload-hash
+// dedup, no `contribution_id` heuristic, no sleeps used as correctness
+// synchronization (a `Barrier` synchronizes only the START of a race;
+// every assertion below holds regardless of which thread's OS scheduler
+// slot wins).
+// =====================================================================
+
+/// PATH-049-A's presence observation -- deliberately a plain two-state
+/// result, standing in for what a naive, non-atomic "does K exist"
+/// check would return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path049Presence {
+    Absent,
+    Present,
+}
+
+/// A DELIBERATELY naive split check/reserve structure: existence check
+/// and reservation are two SEPARATE, independently observable steps,
+/// with NOTHING enforcing atomicity between them. Exists solely to
+/// demonstrate the TOCTOU race (PATH-049-A); never adopted as a
+/// candidate.
+#[derive(Debug, Clone, Default)]
+struct Path049NaiveSplitLedger {
+    records: std::collections::HashSet<OccurrenceKey>,
+}
+
+impl Path049NaiveSplitLedger {
+    fn check(&self, key: &OccurrenceKey) -> Path049Presence {
+        if self.records.contains(key) { Path049Presence::Present } else { Path049Presence::Absent }
+    }
+
+    fn reserve(&mut self, key: OccurrenceKey) {
+        self.records.insert(key);
+    }
+}
+
+/// The adopted atomic candidate: claims `event`'s canonical occurrence
+/// against `ledger` as one indivisible critical section. Internally this
+/// is nothing more than PATH-048's own `path_048_reserve`, called while
+/// holding the lock for its entire duration -- no new resolution logic
+/// is introduced; only indivisibility is added.
+fn path_049_atomic_claim(
+    ledger: &std::sync::Mutex<Path048Ledger>,
+    contract: &TrustedSourceContract,
+    contract_version: ContractVersion,
+    call: CallId,
+    event: &Path047CandidateEvent,
+) -> Path048Verdict {
+    let mut guard = ledger.lock().expect("PATH-049 test ledger mutex poisoned");
+    path_048_reserve(&mut guard, contract, contract_version, call, event)
+}
+
+/// An "economic license" is exactly the `New` verdict -- the only one
+/// that licenses a caller to apply the economic effect. `Reserved`,
+/// `AlreadySettled`, `Conflicted`, and `Unresolved` are all explicitly
+/// NON-economic outcomes (a hold, a no-op, a rejection, or an admission
+/// of ignorance, respectively).
+fn path_049_is_economic_license(verdict: Path048Verdict) -> bool {
+    matches!(verdict, Path048Verdict::New)
+}
+
+// ---------------------------------------------------------------------
+// Required attacks A-J.
+// ---------------------------------------------------------------------
+
+/// PATH-049-A (PRIMARY BUG WITNESS) -- DETERMINISTIC TOCTOU RACE. No
+/// threads, no scheduler dependence: the losing interleaving is forced
+/// explicitly, one call at a time, in exactly the order specified by the
+/// mission brief.
+#[test]
+fn path_049_a_deterministic_toctou_race_yields_two_economic_licenses() {
+    let key = OccurrenceKey { namespace: NamespaceId("N".to_string()), event_id: "evt-1".to_string() };
+    let mut ledger = Path049NaiveSplitLedger::default();
+
+    let a_saw = ledger.check(&key); // CALL A: check K -> Absent
+    let b_saw = ledger.check(&key); // CALL B: check K -> Absent (before A reserves)
+    assert_eq!(a_saw, Path049Presence::Absent);
+    assert_eq!(b_saw, Path049Presence::Absent);
+
+    ledger.reserve(key.clone()); // CALL A: reserve K
+    let a_license = a_saw == Path049Presence::Absent;
+
+    // CALL B never re-checks -- it proceeds from the STALE Absent result
+    // it already observed, exactly as a real concurrent caller would if
+    // its check executed before A's reservation became visible to it.
+    let b_license = b_saw == Path049Presence::Absent;
+
+    assert!(a_license, "A's own check licensed it to proceed");
+    assert!(
+        b_license,
+        "TOCTOU RACE: B's check ALSO returned Absent (taken before A's reservation), so B ALSO \
+         proceeds to apply the economic effect -- TWO economic licenses for the SAME occurrence \
+         K, even though each caller individually obeyed PATH-048's sequential \
+         reserve-before-effect ordering. At-most-once safety fails the moment check and reserve \
+         are separable, independently observable steps."
+    );
+    assert_eq!(
+        (a_license as u8) + (b_license as u8),
+        2,
+        "PRIMARY BUG WITNESS: two economic licenses issued for one occurrence under a naive split \
+         check/reserve design"
+    );
+}
+
+/// PATH-049-B -- ATOMIC SAME-PAYLOAD CLAIM. Real concurrent threads,
+/// synchronized to start together via a `Barrier` (no sleeps). The
+/// safety property asserted is the NUMBER of economic licenses issued,
+/// never merely the final record count.
+#[test]
+fn path_049_b_atomic_same_payload_claim_yields_exactly_one_license() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::new_attested_genesis()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        let payload = payload.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate("payroll-system", "evt-1", payload);
+            barrier.wait(); // synchronizes only the START of the race
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| path_049_is_economic_license(**v)).count();
+
+    assert_eq!(
+        licenses, 1,
+        "exactly ONE economic license for the SAME (K, payload) under concurrent racing -- the \
+         SAFETY property is one economic license, not merely one surviving ledger row, verdicts: \
+         {verdicts:?}"
+    );
+    assert!(
+        verdicts.iter().any(|v| *v == Path048Verdict::Reserved),
+        "the losing caller observes Reserved (an in-flight, non-economic verdict) -- connects to \
+         PATH-048-J's Reserved-vs-Settled distinction under concurrency, verdicts: {verdicts:?}"
+    );
+}
+
+/// PATH-049-C -- CONCURRENT CONFLICT. Two concurrent callers claim the
+/// SAME K with DIFFERENT payloads. At most one may acquire; the other
+/// must become `Conflicted` once the winning claim is visible -- never
+/// both `New`, never last-write-wins, never a silent overwrite.
+#[test]
+fn path_049_c_concurrent_conflict_at_most_one_acquires() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("alice", "review", 999.0);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::new_attested_genesis()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for payload in [payload_1, payload_2] {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+            barrier.wait();
+            let verdict = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event);
+            (payload, verdict)
+        }));
+    }
+
+    let results: Vec<(ContributionEvent, Path048Verdict)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let new_count = results.iter().filter(|(_, v)| *v == Path048Verdict::New).count();
+    let conflicted_count = results.iter().filter(|(_, v)| *v == Path048Verdict::Conflicted).count();
+
+    assert_eq!(new_count, 1, "at most (exactly) one caller acquires K under a payload conflict");
+    assert_eq!(
+        conflicted_count, 1,
+        "the other caller must observe Conflicted -- never both Acquired, never last-write-wins, \
+         never a silent overwrite"
+    );
+
+    let winner_payload = results.iter().find(|(_, v)| *v == Path048Verdict::New).unwrap().0.clone();
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+    let key = OccurrenceKey { namespace, event_id: "evt-1".to_string() };
+    let guard = ledger.lock().unwrap();
+    match guard.records.get(&key).unwrap() {
+        SettlementRecord::Reserved { payload, .. } => {
+            assert_eq!(*payload, winner_payload, "the winning Reserved payload must remain unchanged")
+        }
+        other => panic!("expected Reserved, got {other:?}"),
+    }
+}
+
+/// PATH-049-D -- RESERVED VS SETTLED INTERLEAVING STATE. This is a
+/// deterministic, SEQUENTIAL interleaving-state model, not a real
+/// concurrent-thread test: it demonstrates the state a concurrently
+/// arriving caller WOULD observe between another caller's claim and its
+/// confirmation, by constructing that exact before/after-confirmation
+/// ordering directly. One caller acquires; before it confirms, a second
+/// identical delivery must NOT obtain an economic license; after
+/// confirmation, a further retry IS a genuine replay. Connects PATH-048's
+/// Reserved-vs-Settled semantics to the concurrent model -- the actual
+/// real-thread concurrency evidence is PATH-049-B/C/E/F/G/H/I.
+#[test]
+fn path_049_d_reserved_vs_settled_race_then_confirm_then_replay() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let ledger = std::sync::Mutex::new(Path048Ledger::new_attested_genesis());
+
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let v1 = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    assert_eq!(v1, Path048Verdict::New, "first caller acquires Reserved(K)");
+
+    let event_2 = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let v2 = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(2), &event_2);
+    assert_eq!(
+        v2,
+        Path048Verdict::Reserved,
+        "a second delivery arriving BEFORE confirmation does NOT obtain an economic license"
+    );
+
+    {
+        let mut guard = ledger.lock().unwrap();
+        let key = path_048_occurrence_key(&contract, &event_1).unwrap();
+        path_048_confirm_settlement(&mut guard, &key);
+    }
+
+    let event_3 = path_047_candidate("payroll-system", "evt-1", payload);
+    let v3 = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(3), &event_3);
+    assert_eq!(v3, Path048Verdict::AlreadySettled, "once confirmed, a further retry is a genuine replay");
+}
+
+/// PATH-049-E -- DIFFERENT KEYS SHOULD NOT SERIALIZE SEMANTICALLY. A
+/// coarse, whole-ledger `Mutex` serializes EXECUTION of two concurrent
+/// claims for DIFFERENT keys, but must not impose any incorrect
+/// SEMANTIC coupling between them -- both must still independently
+/// acquire.
+#[test]
+fn path_049_e_different_keys_do_not_serialize_semantically() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::new_attested_genesis()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for event_id in ["evt-1", "evt-2"] {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate("payroll-system", event_id, path_047_payload("alice", "review", 40.0));
+            barrier.wait();
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        verdicts.iter().all(|v| *v == Path048Verdict::New),
+        "DIFFERENT occurrence keys under one coarse, whole-ledger Mutex must still BOTH acquire \
+         independently -- the mutex serializes EXECUTION, not economic semantics; this is not a \
+         global 'one settlement at a time' rule, verdicts: {verdicts:?}"
+    );
+}
+
+/// PATH-049-F -- ALIAS CONVERGENCE UNDER RACE. Two raw `SourceId`s
+/// resolving, via AUTHORITY, to the SAME canonical `NamespaceId`, same
+/// event_id, same payload, claimed concurrently: only one economic
+/// license. Contrasted directly with a lock/key scoped to the RAW
+/// source_id, which would fail this attack.
+///
+/// SCOPE NOTE (cross-review correction): this test establishes that the
+/// synchronization/claim domain must converge on CANONICAL occurrence
+/// identity, not raw `SourceId` identity -- it does NOT establish that
+/// canonicalization must physically execute while holding the lock.
+/// `contract.authority_for` (the canonicalization step inside
+/// `path_048_reserve`) is a pure, read-only lookup against each thread's
+/// own cloned, immutable `TrustedSourceContract` -- it touches no shared
+/// mutable state, so it would resolve identically whenever it ran,
+/// before or after lock acquisition. In THIS candidate it happens to run
+/// inside the locked call (an implementation detail, not a load-bearing
+/// one); an architecture that canonicalizes outside the lock and then
+/// claims the resulting canonical key would converge on the same
+/// contention domain and pass this same test. What the raw-`SourceId`
+/// contrast below actually demonstrates is narrower: raw-label-scoped
+/// contention can split one economic occurrence into two claim domains.
+#[test]
+fn path_049_f_alias_convergence_under_race_yields_one_license() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::new_attested_genesis()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for label in ["source-A", "source-B"] {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        let payload = payload.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate(label, "evt-1", payload);
+            barrier.wait();
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| path_049_is_economic_license(**v)).count();
+    assert_eq!(
+        licenses, 1,
+        "AUTHORITY canonicalizes source-A and source-B to the SAME NamespaceId BEFORE the atomic \
+         claim step -- only one economic license, even though the two callers used different raw \
+         source labels, verdicts: {verdicts:?}"
+    );
+
+    // Contrast: a naive lock/key scoped to the RAW source_id -- exists
+    // purely to show it would have FAILED this attack.
+    let mut raw_keyed: std::collections::HashSet<EventIdentity> = std::collections::HashSet::new();
+    let a_new = raw_keyed.insert(EventIdentity { source_id: SourceId("source-A".into()), event_id: "evt-1".into() });
+    let b_new = raw_keyed.insert(EventIdentity { source_id: SourceId("source-B".into()), event_id: "evt-1".into() });
+    assert!(
+        a_new && b_new,
+        "a lock/key scoped to the RAW source_id would treat these as two DIFFERENT keys and \
+         WRONGLY grant both an independent slot -- canonicalization must happen before the claim, \
+         not be keyed on the wire label"
+    );
+}
+
+/// PATH-049-G -- DIFFERENT NAMESPACES, SAME EVENT_ID. Guards against
+/// accidentally introducing globally-unique-event_id semantics during
+/// concurrency work: identical event_id strings, but AUTHORITY resolves
+/// them to DIFFERENT canonical namespaces -- distinct `OccurrenceKey`s,
+/// both acquire.
+#[test]
+fn path_049_g_different_namespaces_same_event_id_both_acquire() {
+    let contract = TrustedSourceContract::trusting(&[
+        ("payroll-system", SourceIdContract::both_guaranteed()),
+        ("timesheet-system", SourceIdContract::both_guaranteed()),
+    ]);
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::new_attested_genesis()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for label in ["payroll-system", "timesheet-system"] {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate(label, "evt-1", path_047_payload("alice", "review", 40.0));
+            barrier.wait();
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        verdicts.iter().all(|v| *v == Path048Verdict::New),
+        "identical event_id string, but AUTHORITY resolves to two DIFFERENT namespaces -- distinct \
+         OccurrenceKeys, both acquire independently; event_id is namespace-scoped, never globally \
+         unique, verdicts: {verdicts:?}"
+    );
+}
+
+/// PATH-049-H -- UNKNOWN COMPLETENESS STILL WINS BEFORE ATOMICITY. Even
+/// PERFECT atomicity must not launder a missing epistemic warrant into
+/// certainty: concurrency correctness is downstream of epistemic
+/// admissibility, not a substitute for it.
+#[test]
+fn path_049_h_unknown_completeness_wins_before_atomicity() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    // Unknown completeness throughout -- `default()`, never attested.
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Path048Ledger::default()));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review", 40.0));
+            barrier.wait();
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        verdicts.iter().all(|v| *v == Path048Verdict::Unresolved),
+        "even PERFECT atomicity cannot launder a missing completeness attestation into certainty -- \
+         both concurrent callers correctly observe Unresolved, verdicts: {verdicts:?}"
+    );
+    let licenses = verdicts.iter().filter(|v| path_049_is_economic_license(**v)).count();
+    assert_eq!(licenses, 0, "zero economic licenses");
+
+    let guard = ledger.lock().unwrap();
+    assert!(
+        guard.records.is_empty(),
+        "zero Reserved records created for an Unknown-completeness first sighting, even under a race"
+    );
+}
+
+/// PATH-049-I -- EXACT POSITIVE HIT WITH UNKNOWN COMPLETENESS. Proves
+/// PATH-049 did not accidentally turn completeness into a universal
+/// precondition rather than a MISS precondition: a retained positive
+/// record remains usable exactly as PATH-048 established, even under
+/// concurrent racing and Unknown ambient completeness.
+#[test]
+fn path_049_i_exact_positive_hit_survives_unknown_completeness_under_race() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let namespace = contract.authority_for(&SourceId("payroll-system".into())).unwrap().0;
+
+    // Pre-existing Settled record, completeness Unknown throughout --
+    // built directly, standing in for a partial restore with no
+    // attestation (reuses PATH-048-completeness-C/D's construction).
+    let mut initial = Path048Ledger::default();
+    initial.ever_active_namespaces.insert(namespace.clone());
+    initial.records.insert(
+        OccurrenceKey { namespace, event_id: "evt-1".to_string() },
+        SettlementRecord::Settled { payload: payload.clone(), contract_version: ContractVersion(1), call: CallId(1) },
+    );
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(initial));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let ledger = std::sync::Arc::clone(&ledger);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let contract = contract.clone();
+        let payload = payload.clone();
+        handles.push(std::thread::spawn(move || {
+            let event = path_047_candidate("payroll-system", "evt-1", payload);
+            barrier.wait();
+            path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(2), &event)
+        }));
+    }
+
+    let verdicts: Vec<Path048Verdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        verdicts.iter().all(|v| *v == Path048Verdict::AlreadySettled),
+        "a retained POSITIVE record remains usable exactly as PATH-048 established, regardless of \
+         Unknown ambient completeness and regardless of concurrent racing -- completeness is a MISS \
+         precondition, never a universal one, verdicts: {verdicts:?}"
+    );
+    let licenses = verdicts.iter().filter(|v| path_049_is_economic_license(**v)).count();
+    assert_eq!(licenses, 0, "no NEW economic license -- both callers correctly recognize the replay");
+}
+
+/// PATH-049-J -- CLAIM ACQUIRED, PROCESS STALLS. Another SEQUENTIAL,
+/// deterministic interleaving-state model, not a real concurrent-thread
+/// test -- it constructs the exact state a later caller would observe
+/// after an earlier claim stalls, directly. Preserves PATH-048's safety
+/// != liveness distinction under the atomic candidate: an
+/// acquired-but-never-confirmed claim blocks any further economic
+/// license (safety) but does not itself resolve (liveness remains
+/// unresolved/stuck). Does NOT claim exactly-once completion.
+#[test]
+fn path_049_j_claim_acquired_process_stalls_safety_holds_liveness_does_not() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let ledger = std::sync::Mutex::new(Path048Ledger::new_attested_genesis());
+
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let v_a = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v_a, Path048Verdict::New, "caller A acquires Reserved(K)");
+    // A never confirms -- modeling a stalled/crashed process.
+
+    let retry = path_047_candidate("payroll-system", "evt-1", payload);
+    let v_b = path_049_atomic_claim(&ledger, &contract, ContractVersion(1), CallId(2), &retry);
+    assert_eq!(
+        v_b,
+        Path048Verdict::Reserved,
+        "caller B CANNOT acquire economic permission while A's claim stands -- at-most-once \
+         safety is preserved. B is not told the occurrence is settled (it is not) and is not \
+         granted a fresh license (that would double-claim). This is a SAFETY guarantee, not a \
+         LIVENESS one: K remains stuck Reserved unless something outside this candidate resolves \
+         it -- PATH-048-J's distinction, unchanged under concurrency. This experiment does NOT \
+         claim exactly-once completion."
+    );
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+// ---------------------------------------------------------------------
+//
+// STRONGEST LOSING INTERLEAVING: PATH-049-A -- A checks (Absent), B
+// checks (Absent), A reserves, B proceeds from its stale Absent
+// observation. Two economic licenses for one occurrence, deterministic,
+// no threads or scheduler dependence required to demonstrate it.
+//
+// H20: CONFIRMED for the constructed race, and NARROWED in scope. The
+// naive split design (A) fails exactly as H20 predicts: two callers must
+// not both cross absent -> licensed based on the same pre-claim state.
+// The atomic candidate (a `Mutex`-guarded `path_048_reserve` call)
+// survives every attack constructed (B-J). PREFERRED NECESSITY
+// STATEMENT (narrower than "linearizability is uniquely necessary"): for
+// the constructed claim-before-effect architecture, contenders for the
+// SAME canonical occurrence require a single-winner claim boundary
+// before economic permission is issued. The adopted `Mutex` candidate
+// CAN be described as linearizable, but this experiment does not show
+// linearizability, as a general consistency model, is the unique or
+// minimal way to achieve that boundary -- only that check-then-insert
+// must be indivisible from the perspective of concurrent callers
+// contending for the SAME canonical key. Weaker/non-linearizable
+// coordination models (e.g. a CAS retry loop, a DB uniqueness
+// constraint, actor-style serialization) were NOT constructed or
+// compared, and remain NOT ESTABLISHED as to whether they would preserve
+// the same at-most-once economic-license invariant.
+//
+// LINEARIZATION POINT: the first successful transition of K from absent
+// to `Reserved(K)`, inside one locked `path_048_reserve` call. After
+// that point, no OTHER concurrent caller CONTENDING FOR THE SAME K can
+// still legally receive `New` for it -- confirmed executably by B (same
+// payload: 1 New, 1 Reserved), C (different payload: 1 New, 1
+// Conflicted), and F (aliases: 1 New total across both raw labels), the
+// three cases that genuinely contend for one occurrence; in every one of
+// them, exactly the caller whose claim attempt executes strictly after
+// the linearization point receives a non-`New` verdict. E and G
+// deliberately do NOT test this same-key property -- they exercise
+// DIFFERENT canonical occurrence keys and confirm the converse: the
+// claim mechanism does not incorrectly serialize ACROSS keys. D and J
+// are sequential, deterministic interleaving-state evidence (not
+// executed concurrent-thread tests) connecting PATH-048's
+// Reserved-vs-Settled semantics to the concurrent model -- they show
+// what a caller would observe if it arrived between another's claim and
+// confirmation, run through the SAME atomic candidate, but do not
+// themselves race two threads.
+//
+// ONE-ECONOMIC-LICENSE INVARIANT: held in every genuinely contested
+// SAME-key case constructed (B, C, F -- all via exactly-one-New, counted
+// explicitly). Never merely "one surviving record" -- B/C/F/H/I all
+// explicitly count verdicts, not final map size. (E and G are reported
+// separately below: they intentionally test that DIFFERENT keys each
+// independently acquire, which is a distinct, complementary property,
+// not an instance of the same-key invariant.)
+//
+// SAME-KEY/SAME-PAYLOAD: exactly one `New`, the other `Reserved` (B).
+// SAME-KEY/DIFFERENT-PAYLOAD: exactly one `New`, the other `Conflicted`,
+// winning payload verified unchanged (C).
+// ALIAS RACE: the claim converges on the CANONICAL NamespaceId, not the
+// raw source label -- one license total across two raw labels (F); a
+// raw-source_id-keyed lock is shown directly to fail this same attack.
+// This shows the synchronization/claim DOMAIN must be canonical
+// identity; it does NOT show canonicalization must physically execute
+// while the lock is held (see the scope note on PATH-049-F's own doc
+// comment -- `contract.authority_for` is a pure, per-thread lookup with
+// no shared mutable state, so it would resolve identically regardless of
+// when it ran relative to lock acquisition).
+// DIFFERENT KEYS: both acquire independently under one coarse,
+// whole-ledger Mutex -- execution is serialized, economic semantics are
+// not (E, G).
+// RESERVED-VS-SETTLED TEMPORAL STATE (D, sequential interleaving-state
+// evidence, not a concurrent-thread test): a delivery arriving before
+// confirmation observes `Reserved`, not `New`; after confirmation, a
+// further retry is `AlreadySettled`.
+// UNKNOWN COMPLETENESS INTERACTION: a namespace's first sighting under
+// Unknown completeness stays `Unresolved` for BOTH concurrent callers,
+// with ZERO Reserved records created, even under perfect atomicity (H) --
+// atomicity is downstream of epistemic admissibility, not a substitute
+// for it. A pre-existing POSITIVE record remains usable under Unknown
+// ambient completeness regardless of racing (I) -- completeness gates
+// MISSES only, exactly as PATH-048 established, not universally.
+// SAFETY vs LIVENESS (J, sequential interleaving-state evidence, not a
+// concurrent-thread test): an acquired, unconfirmed claim blocks any
+// further economic license (safety, preserved) but does not itself
+// progress (liveness, unresolved) -- directly extending PATH-048-J
+// through the atomic candidate. Exactly-once COMPLETION is explicitly
+// not claimed.
+//
+// STATE/MINIMALITY REASSESSMENT:
+// - Smallest surviving synchronization candidate tested: a single
+//   `Mutex` wrapping the WHOLE `Path048Ledger`, held for the duration of
+//   one `path_048_reserve` call. Coarser than per-key locking, but E/G
+//   show it produces no incorrect semantic coupling across keys.
+// - Per-ledger vs per-namespace vs per-OccurrenceKey: NOT distinguished
+//   by any test here -- every case uses one whole-ledger `Mutex`; whether
+//   a finer-grained (per-namespace or per-key) lock would behave
+//   identically, or would be necessary at higher contention, is not
+//   tested.
+// - Does this experiment establish a `Mutex` is NECESSARY? NO. It
+//   establishes that an INDIVISIBLE check-then-claim transition is
+//   necessary for the constructed race (PATH-049-A's failure mode); a
+//   `Mutex` is simply the mechanism this candidate used to obtain that
+//   indivisibility, not a claim about the only possible mechanism.
+// - `ever_active_namespaces` remains, per PATH-048's redundancy result,
+//   merely a convenience/cache in every ledger state PATH-049 also
+//   constructs -- no test here makes it decision-authoritative again;
+//   `path_049_atomic_claim` calls the SAME `path_048_reserve` unchanged.
+// - `ContractVersion` remains unread metadata; no PATH-049 test consults
+//   it for any decision.
+// - `pruned_horizon`'s numeric `CallId` value remains unused by any
+//   decision; PATH-049 does not exercise pruning at all and so adds no
+//   evidence either way about its necessity.
