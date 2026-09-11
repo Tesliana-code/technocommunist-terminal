@@ -16963,3 +16963,709 @@ fn path_050_k2_forged_receipt_also_defeats_provider_side_idempotency() {
 // not verify that property for any real provider, only asserts it as
 // the reason the fake provider's receipt is presumed durable across the
 // local crash it is tested against.
+
+
+// =====================================================================
+// PATH-051 -- COMPLETION MEMORY DURABILITY / THE RECEIPT GAP (H22)
+//
+// Disposable experimental machinery only. Nothing below is exported from
+// `distribution_machine::contribution` or wired into any production
+// path -- no production file is touched. No distributed transaction
+// machinery, no real payment provider, no production integration.
+//
+// QUESTION: PATH-050's fake provider modeled "execute the real effect"
+// and "persist completion memory" as ONE atomic step. What happens once
+// they are split into two independently-crashable steps?
+//
+//     execute_real_effect(operation_id, payload)   -- the real effect commits
+//              |
+//              | <-- can a crash happen HERE?
+//              v
+//     persist_completion(operation_id, payload)    -- completion memory commits
+//
+// H22: a provider-side receipt/idempotency store cannot guarantee safe
+// retry if the real effect can commit before the provider's own
+// completion memory commits. If `execute_real_effect(K)` succeeds but
+// `completion_memory[K]` is absent after a crash, a retry is
+// observationally identical to a world in which the effect never
+// happened at all -- so retry semantics that depend only on that
+// (absent) memory can duplicate the real effect. Moving replay memory
+// from the local ledger (PATH-048) to the provider (PATH-050) does not
+// remove the temporal ambiguity; it relocates it to a new boundary this
+// experiment now attacks directly.
+//
+// GROUND TRUTH vs. RECOVERY-VISIBLE (the central methodological
+// discipline of this experiment): `GroundTruthEffectLog` is Horus's
+// omniscient observation window -- it exists ONLY for test assertions.
+// `CompletionMemory` is the ONLY provider state any recovery function
+// below may read. Audited directly: `path_051_recover` and
+// `path_051_retry_idempotent_by_completion_memory` call
+// `.query_completion()` (read), `.execute_real_effect()` (write, its
+// return value is never inspected), and `.persist_completion()` (write)
+// -- neither function references `.ground_truth` anywhere in its body.
+// This is enforced by discipline and grep-verifiable, not by a Rust
+// module boundary (a real system's crash-recovery code physically
+// cannot read its own "what really happened" oracle either -- that
+// asymmetry is exactly what this experiment models).
+//
+// CRASH-POINT MODEL (P0-P3), and their relationship to PATH-050's C0-C4
+// (PATH-050's C1/C2 pair, which PATH-050's atomic provider could not
+// separate, is exactly what P0/P1 below splits open):
+//
+//   Point | What has committed                                  | Recovery-visible?
+//   ------|------------------------------------------------------|-------------------
+//   P0    | nothing -- before the real effect                    | completion lookup -> None
+//   P1    | REAL EFFECT committed; completion memory NOT persisted| completion lookup -> None (IDENTICAL to P0)
+//   P2    | completion memory persisted (local Settled still pending)| completion lookup -> Some(payload)
+//   P3    | local `Settled` persisted (PATH-048, unchanged)       | `AlreadySettled`
+//
+// P0 and P1 are the crucial pair: DIFFERENT ground truth (effect never
+// ran vs. effect genuinely ran), IDENTICAL recovery-visible evidence
+// (`query_completion` returns `None` either way). This is PATH-048's
+// ABSENCE != NOVELTY recurring one boundary further out:
+// ABSENCE OF RECEIPT != ABSENCE OF EFFECT.
+//
+// LANGUAGE DISCIPLINE: no generic exactly-once claim, no distributed
+// atomic commit claim, no consensus necessity claim, no claim about real
+// payment-provider behavior, no claim of global protocol minimality.
+// Precise vocabulary used throughout: "constructed failure pattern,"
+// "tested provider model," "recovery-visible evidence," "false-positive/
+// false-negative completion memory," "at-most-once real effect for
+// tested cases," "ambiguity/Unresolved where warrant is absent."
+// =====================================================================
+
+/// GROUND TRUTH ONLY. Never read by any recovery function below for a
+/// decision -- exists purely so this experiment's own tests can verify
+/// what "really" happened, exactly the way a real crashed process's own
+/// recovery code could not consult an external observer's log of its
+/// own past.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct GroundTruthEffectLog {
+    real_effect_count: u64,
+}
+
+/// RECOVERY-VISIBLE. The provider's own durable completion memory --
+/// the ONLY provider state any recovery function in this file may read.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CompletionMemory {
+    receipts: std::collections::HashMap<OccurrenceKey, ContributionEvent>,
+}
+
+impl CompletionMemory {
+    fn query(&self, operation_id: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.receipts.get(operation_id).cloned()
+    }
+
+    fn persist(&mut self, operation_id: OccurrenceKey, payload: ContributionEvent) {
+        self.receipts.insert(operation_id, payload);
+    }
+}
+
+/// The split provider under test: a real effect log (GROUND TRUTH ONLY)
+/// and a completion memory (RECOVERY-VISIBLE), updated by two SEPARATE,
+/// independently-callable steps -- a test simulates a crash between them
+/// simply by not calling the second step. This is the one new thing
+/// PATH-051 adds over PATH-050's `EffectProvider`, whose `execute()`
+/// updated both in one atomic call by construction.
+#[derive(Debug, Clone, Default)]
+struct Path051SplitProvider {
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+}
+
+impl Path051SplitProvider {
+    /// STEP 1 (P0 -> P1): the real economic effect executes. Touches
+    /// ONLY `ground_truth`. The return value is deliberately `()` -- no
+    /// recovery function has anything to read back and branch on.
+    fn execute_real_effect(&mut self, _operation_id: OccurrenceKey, _payload: ContributionEvent) {
+        self.ground_truth.real_effect_count += 1;
+    }
+
+    /// STEP 2 (P1 -> P2): durably persists completion memory. RECOVERY-
+    /// VISIBLE once this returns.
+    fn persist_completion(&mut self, operation_id: OccurrenceKey, payload: ContributionEvent) {
+        self.completion_memory.persist(operation_id, payload);
+    }
+
+    /// RECOVERY-VISIBLE query -- the only provider-state read any
+    /// recovery function below performs.
+    fn query_completion(&self, operation_id: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.completion_memory.query(operation_id)
+    }
+}
+
+/// The recovery decision. Distinct from PATH-050's `Path050RecoveryVerdict`
+/// -- same shape, new subject (the provider's own persistence gap, not
+/// only the local ledger's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path051RecoveryVerdict {
+    AlreadyComplete,
+    EffectExecutedNowSettled,
+    Conflicted,
+    Unresolved,
+}
+
+/// THE NAIVE-BUT-REASONABLE-LOOKING CANDIDATE under attack: "if
+/// `Reserved(K)` and local payload matches: consult completion memory;
+/// absent -> execute the real effect and persist completion; present and
+/// matching -> already done; present and mismatched -> conflict." This
+/// is PATH-050's candidate A, now correctly modeling `execute_real_effect`
+/// and `persist_completion` as SEPARATE steps rather than one atomic
+/// call. Reads ONLY `ledger.records` and `provider.query_completion` --
+/// never `provider.ground_truth`.
+fn path_051_recover(
+    ledger: &mut Path048Ledger,
+    provider: &mut Path051SplitProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) -> Path051RecoveryVerdict {
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            if *payload == event.payload { Path051RecoveryVerdict::AlreadyComplete } else { Path051RecoveryVerdict::Conflicted }
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                // Local conflict detection (PATH-048) catches this
+                // BEFORE the provider is ever consulted.
+                return Path051RecoveryVerdict::Conflicted;
+            }
+            match provider.query_completion(key) {
+                Some(existing) if existing == event.payload => {
+                    path_048_confirm_settlement(ledger, key);
+                    Path051RecoveryVerdict::AlreadyComplete
+                }
+                Some(_) => Path051RecoveryVerdict::Conflicted,
+                None => {
+                    // Completion memory absent -- indistinguishable, from
+                    // here, between P0 (truly never executed) and P1
+                    // (executed, persistence lost). This candidate
+                    // proceeds anyway (that is exactly the attack).
+                    provider.execute_real_effect(key.clone(), event.payload.clone());
+                    provider.persist_completion(key.clone(), event.payload.clone());
+                    path_048_confirm_settlement(ledger, key);
+                    Path051RecoveryVerdict::EffectExecutedNowSettled
+                }
+            }
+        }
+        None => Path051RecoveryVerdict::Unresolved,
+    }
+}
+
+/// The SAME candidate, exposed at the provider layer alone (no local
+/// ledger), for tests that want to isolate the provider-only question
+/// "does operation_id stability alone protect a retry once completion
+/// memory can be lost" (PATH-051-E) without local `Reserved`/`Settled`
+/// bookkeeping in the way.
+fn path_051_retry_idempotent_by_completion_memory(
+    provider: &mut Path051SplitProvider,
+    key: &OccurrenceKey,
+    payload: &ContributionEvent,
+) -> Path051RecoveryVerdict {
+    match provider.query_completion(key) {
+        Some(existing) if existing == *payload => Path051RecoveryVerdict::AlreadyComplete,
+        Some(_) => Path051RecoveryVerdict::Conflicted,
+        None => {
+            provider.execute_real_effect(key.clone(), payload.clone());
+            provider.persist_completion(key.clone(), payload.clone());
+            Path051RecoveryVerdict::EffectExecutedNowSettled
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Required cases A-J, plus one small secondary concurrent-recovery
+// probe.
+// ---------------------------------------------------------------------
+
+/// PATH-051-A (PRIMARY CONCRETE FAILURE WITNESS): real effect succeeds
+/// (P1 reached), crash before completion memory persists, naive
+/// provider-idempotent retry executes again because the provider does
+/// not remember K.
+#[test]
+fn path_051_a_real_effect_succeeds_completion_memory_lost_naive_retry_duplicates() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload.clone()); // P1 reached
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "the real effect genuinely happened once");
+    // Crash before persist_completion -- completion memory stays empty.
+    assert_eq!(provider.query_completion(&key), None, "after restart: receipt query -> None");
+
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::EffectExecutedNowSettled, "naive retry proceeds -- it has no way to know it is wrong");
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "PRIMARY WITNESS: naive provider-idempotent retry DUPLICATES the real effect once \
+         completion memory persistence is lost -- effect_count == 2, not 1"
+    );
+}
+
+/// PATH-051-B: crash before the real effect ever happens (P0). Recovery
+/// sees the SAME observable state as A (`Reserved(K)`, completion lookup
+/// -> None), but here the retry is CORRECT.
+#[test]
+fn path_051_b_crash_before_effect_retry_is_correct() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload);
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New);
+
+    let mut provider = Path051SplitProvider::default();
+    // P0: nothing has executed yet.
+    assert_eq!(provider.ground_truth.real_effect_count, 0);
+    assert_eq!(provider.query_completion(&key), None, "SAME observable state as PATH-051-A");
+
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 1,
+        "the SAME retry policy is correct here -- it performs the effect for the genuine first \
+         time -- and WRONG in World A, from identical recovery-visible input"
+    );
+}
+
+/// PATH-051-C (PROVIDER TEMPORAL IDENTIFIABILITY THEOREM -- the primary
+/// theorem test): construct independent WORLD A (P1: effect happened,
+/// completion memory lost) and WORLD B (P0: effect never happened).
+/// Every RECOVERY-VISIBLE observable is asserted equal. Recovery never
+/// reads `.ground_truth` (verify by inspection of `path_051_recover`,
+/// above); ground truth is consulted ONLY by this test's own assertions,
+/// after recovery has already run, to grade the outcome.
+#[test]
+fn path_051_c_provider_temporal_identifiability_theorem() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    // WORLD A: real effect DID happen (P1); completion memory lost.
+    let mut ledger_a = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_a, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider_a = Path051SplitProvider::default();
+    provider_a.execute_real_effect(key.clone(), payload.clone());
+    assert_eq!(provider_a.ground_truth.real_effect_count, 1, "World A ground truth: effect happened once");
+
+    // WORLD B: real effect did NOT happen (P0).
+    let mut ledger_b = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_b, &contract, ContractVersion(1), CallId(1), &event);
+    let provider_b = Path051SplitProvider::default();
+    assert_eq!(provider_b.ground_truth.real_effect_count, 0, "World B ground truth: effect never happened");
+
+    // RECOVERY-VISIBLE STATE: identical in both worlds. This is the ONLY
+    // evidence `path_051_recover` may consult.
+    assert_eq!(ledger_a.records, ledger_b.records, "local Reserved(K) identical");
+    assert_eq!(provider_a.query_completion(&key), None);
+    assert_eq!(provider_b.query_completion(&key), None);
+    assert_eq!(
+        provider_a.query_completion(&key), provider_b.query_completion(&key),
+        "IDENTICAL RECOVERY-VISIBLE EVIDENCE: completion lookup is None == None in both worlds"
+    );
+
+    // Apply the SAME recovery procedure to independent clones of each
+    // world's identical observable state.
+    let mut ledger_a_retry = ledger_a.clone();
+    let mut provider_a_retry = provider_a.clone();
+    path_051_recover(&mut ledger_a_retry, &mut provider_a_retry, &key, &event);
+
+    let mut ledger_b_retry = ledger_b.clone();
+    let mut provider_b_retry = provider_b.clone();
+    path_051_recover(&mut ledger_b_retry, &mut provider_b_retry, &key, &event);
+
+    // GROUND TRUTH CHECK -- this test's own grading, never available to
+    // `path_051_recover` itself.
+    assert_eq!(provider_a_retry.ground_truth.real_effect_count, 2, "World A: DUPLICATED");
+    assert_eq!(provider_b_retry.ground_truth.real_effect_count, 1, "World B: correct, first execution");
+    assert_ne!(
+        provider_a_retry.ground_truth.real_effect_count,
+        provider_b_retry.ground_truth.real_effect_count,
+        "PROVIDER TEMPORAL IDENTIFIABILITY: identical recovery-visible evidence (Reserved(K), \
+         completion lookup None, same operation_id, same payload, same trust state) requires \
+         OPPOSITE correct recovery actions solely because of differing, UNOBSERVABLE past \
+         provider state -- no recovery function over recovery-visible evidence alone can be \
+         correct in both worlds. This is ABSENCE OF RECEIPT != ABSENCE OF EFFECT, executed."
+    );
+}
+
+/// PATH-051-D: completion memory persists (P2 reached) before the local
+/// crash (before P3/`Settled`). Preserves PATH-050-C3/I behavior under
+/// the split provider model.
+#[test]
+fn path_051_d_completion_persists_before_local_settled_crash() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload.clone());
+    provider.persist_completion(key.clone(), payload.clone()); // P2 reached
+    // Crash before local Settled (P3 not reached).
+
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::AlreadyComplete, "receipt query finds the authoritative record");
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "no second effect");
+    assert!(matches!(ledger.records.get(&key), Some(SettlementRecord::Settled { .. })), "local settlement is reconstructed from the receipt");
+}
+
+/// PATH-051-E: "provider retry memory is not magic." The SAME
+/// idempotent-by-operation-id retry rule, with a STABLE operation_id
+/// across the original delivery and the retry, still duplicates once
+/// completion memory (not the operation_id) is what goes missing.
+/// Proves operation_id stability is necessary but not sufficient.
+#[test]
+fn path_051_e_stable_operation_id_is_not_sufficient_without_durable_completion_memory() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let original_delivery = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let retry_delivery = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key_original = path_048_occurrence_key(&contract, &original_delivery).unwrap();
+    let key_retry = path_048_occurrence_key(&contract, &retry_delivery).unwrap();
+    assert_eq!(key_original, key_retry, "operation_id IS stable across the original delivery and the retry");
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key_original.clone(), payload.clone()); // real effect happened
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+    // Completion memory persistence lost -- the provider "sees no prior key."
+    assert_eq!(provider.query_completion(&key_retry), None);
+
+    let verdict = path_051_retry_idempotent_by_completion_memory(&mut provider, &key_retry, &payload);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "operation_id stability alone did NOT protect this retry -- completion memory, not \
+         operation_id identity, is what the idempotency check actually depends on, and that \
+         memory was lost"
+    );
+}
+
+/// PATH-051-F: a changed payload arrives after completion memory was
+/// lost. PATH-048's LOCAL stored `Reserved` payload remains valuable
+/// even when the provider's own completion memory is missing -- it
+/// catches the conflict before the provider is ever consulted.
+#[test]
+fn path_051_f_changed_payload_after_lost_completion_memory_is_conflicted_locally() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("alice", "review", 999.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let key = path_048_occurrence_key(&contract, &event_1).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1); // Reserved with P1
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload_1.clone());
+    // Completion memory lost -- provider.query_completion(&key) == None.
+    assert_eq!(provider.query_completion(&key), None);
+
+    let event_2 = path_047_candidate("payroll-system", "evt-1", payload_2);
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event_2);
+
+    assert_eq!(
+        verdict,
+        Path051RecoveryVerdict::Conflicted,
+        "the LOCAL Reserved record (P1) still disagrees with the retry's P2 -- caught before the \
+         provider (whose own completion memory is missing anyway) is even consulted"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "no second effect -- local conflict detection blocks it");
+    match ledger.records.get(&key).unwrap() {
+        SettlementRecord::Reserved { payload, .. } => assert_eq!(*payload, payload_1, "original Reserved payload untouched"),
+        other => panic!("expected Reserved (unchanged), got {other:?}"),
+    }
+}
+
+/// PATH-051-G: alias convergence still holds (same canonical operation_id
+/// via either raw label) -- but this alone does NOT solve the completion
+/// durability gap. If completion memory is absent, naive retry through
+/// the OTHER alias still duplicates.
+#[test]
+fn path_051_g_alias_convergence_does_not_repair_lost_completion_memory() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "both raw labels canonicalize to the SAME operation_id");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_a);
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key_a.clone(), payload.clone()); // effect happened via alias A
+    // Completion memory persistence lost.
+    assert_eq!(provider.query_completion(&key_b), None, "same key, but no completion evidence survives");
+
+    // Retry arrives through the OTHER alias.
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key_b, &event_b);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "CANONICAL IDENTITY IS NECESSARY BUT NOT SUFFICIENT: alias convergence correctly ensured \
+         both deliveries share ONE operation_id, but that alone cannot repair a completion-memory \
+         persistence gap -- a duplicate real effect still occurs"
+    );
+}
+
+/// PATH-051-H: distinct occurrences remain distinct. Completion
+/// persistence succeeds for K1 and fails for K2 -- state and recovery
+/// decisions stay occurrence-scoped; K2's ambiguity does not poison K1.
+#[test]
+fn path_051_h_distinct_occurrences_remain_independently_scoped() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let event_2 = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 25.0));
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+    assert_ne!(key_1, key_2);
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_2);
+
+    let mut provider = Path051SplitProvider::default();
+    // K1: effect + completion persist cleanly (P2 reached).
+    provider.execute_real_effect(key_1.clone(), path_047_payload("alice", "review-1", 40.0));
+    provider.persist_completion(key_1.clone(), path_047_payload("alice", "review-1", 40.0));
+    // K2: effect happens but completion persistence is lost (P1 only).
+    provider.execute_real_effect(key_2.clone(), path_047_payload("alice", "review-2", 25.0));
+
+    let v1 = path_051_recover(&mut ledger, &mut provider, &key_1, &event_1);
+    let v2 = path_051_recover(&mut ledger, &mut provider, &key_2, &event_2);
+
+    assert_eq!(v1, Path051RecoveryVerdict::AlreadyComplete, "K1's clean completion record is unaffected by K2's gap");
+    assert_eq!(v2, Path051RecoveryVerdict::EffectExecutedNowSettled, "K2's own retry proceeds independently (and duplicates K2 specifically)");
+    assert_eq!(provider.ground_truth.real_effect_count, 3, "K1 executed once (no duplicate); K2 executed twice (duplicated) -- no cross-key coalescing or poisoning");
+}
+
+/// PATH-051-I (FALSE POSITIVE completion memory -- preserves
+/// PATH-050-K/K2): a completion record exists but the real effect never
+/// happened. Durability work does not accidentally fix authenticity --
+/// the candidate still suppresses a needed effect.
+#[test]
+fn path_051_i_false_positive_completion_memory_suppresses_needed_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+
+    let mut provider = Path051SplitProvider::default();
+    assert_eq!(provider.ground_truth.real_effect_count, 0, "no real effect has EVER executed");
+    // FORGERY: completion memory inserted directly, bypassing
+    // `execute_real_effect` entirely.
+    provider.completion_memory.persist(key.clone(), payload.clone());
+
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(
+        verdict,
+        Path051RecoveryVerdict::AlreadyComplete,
+        "FALSE POSITIVE: a forged/wrong completion record is trusted exactly as a genuine one \
+         would be -- durability (this experiment's subject) is orthogonal to authenticity \
+         (PATH-050's subject); PATH-051 does not accidentally solve it"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 0, "the NEEDED real effect was suppressed entirely");
+}
+
+/// PATH-051-J (FALSE NEGATIVE completion memory -- the mirror image of I,
+/// and PATH-051's central new result): the real effect happened, but
+/// completion memory says nothing. Retry-idempotent semantics based only
+/// on that (absent) memory execute again.
+#[test]
+fn path_051_j_false_negative_completion_memory_causes_duplicate_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload.clone()); // the real effect GENUINELY happened
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+    assert_eq!(provider.query_completion(&key), None, "completion memory says NOTHING -- the false negative");
+
+    let verdict = path_051_recover(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(verdict, Path051RecoveryVerdict::EffectExecutedNowSettled);
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "FALSE NEGATIVE: retry-idempotent semantics based only on completion memory execute AGAIN \
+         -- the mirror image of I (false positive: memory says yes, effect didn't happen, needed \
+         effect suppressed) is (false negative: memory says nothing, effect DID happen, effect \
+         duplicated). Completion memory must be authoritative in BOTH directions to be trusted \
+         alone; this candidate's memory is authoritative in NEITHER once persistence itself can \
+         fail independently of the effect."
+    );
+}
+
+/// SECONDARY, SMALL PROBE ONLY (not a PATH-049-style concurrency study):
+/// two recovery "workers" race over the SAME stuck `Reserved(K)` with NO
+/// completion memory recorded yet, and neither worker's completion-memory
+/// check is protected by any exclusion mechanism. Forced deterministically
+/// (no threads), mirroring PATH-049-A's TOCTOU interleaving. The obvious
+/// answer -- yes, both can execute -- confirms this is not worth
+/// expanding into a full study here; a Mutex around the
+/// check-then-act sequence (PATH-049's mechanism) would close the
+/// CONCURRENT variant of this specific race, but is orthogonal to
+/// PATH-051's actual subject: a SINGLE worker crashing between
+/// `execute_real_effect` and `persist_completion` is ambiguous with or
+/// without a Mutex, because a Mutex only serializes concurrent access,
+/// it does not make a single crash's two steps atomic with each other.
+#[test]
+fn path_051_concurrent_recovery_probe_two_unsynchronized_workers_both_execute() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let key = OccurrenceKey { namespace: contract.authority_for(&SourceId("payroll-system".into())).unwrap().0, event_id: "evt-1".to_string() };
+
+    let mut provider = Path051SplitProvider::default();
+
+    // WORKER A and WORKER B both check completion memory BEFORE either
+    // acts -- forced deterministically.
+    let worker_a_saw = provider.query_completion(&key);
+    let worker_b_saw = provider.query_completion(&key);
+    assert_eq!(worker_a_saw, None);
+    assert_eq!(worker_b_saw, None);
+
+    // Both proceed from their own (identical, stale-relative-to-each-
+    // other) observation.
+    provider.execute_real_effect(key.clone(), payload.clone());
+    provider.persist_completion(key.clone(), payload.clone());
+    provider.execute_real_effect(key.clone(), payload.clone());
+    provider.persist_completion(key.clone(), payload.clone());
+
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "UNSYNCHRONIZED concurrent recovery workers can both execute the real effect -- obvious, \
+         confirming this does not need a full PATH-049-style study here; flagged as a likely next \
+         PATH if pursued further, not expanded into one in this experiment"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+// ---------------------------------------------------------------------
+//
+// STRONGEST WITNESS: PATH-051-C -- WORLD A (P1: real effect happened,
+// completion memory lost) and WORLD B (P0: effect never happened) are
+// asserted equal on every recovery-visible observable (`ledger.records`,
+// `query_completion`). The SAME recovery procedure, applied to
+// independent clones of that identical evidence, produces OPPOSITE
+// ground-truth outcomes (real_effect_count 2 vs. 1) -- proven with
+// recovery logic that never reads `.ground_truth` anywhere in its body.
+//
+// H22: CONFIRMED for the constructed failure pattern. A provider-side
+// completion store does not, merely by being queryable and durable AFTER
+// persistence, guarantee safe retry -- if the real effect can commit
+// BEFORE the store's own record becomes durable, absence of a completion
+// record does not establish non-execution. ABSENCE OF RECEIPT != ABSENCE
+// OF EFFECT is supported directly by PATH-051-A/C/E/G/J.
+//
+// P0/P1 IDENTIFIABILITY: proven identical in recoverable evidence,
+// opposite in ground truth (C). PATH-050's atomic `EffectProvider` never
+// faced this choice because its `execute()` updated both observables in
+// one call; PATH-051's split model is what exposes the gap PATH-050's
+// design had implicitly (and silently) assumed away.
+//
+// PROVIDER-SIDE IDEMPOTENCY AFTER LOST COMPLETION MEMORY: fails (A, E,
+// G) -- operation_id stability (proven held, E/G) is necessary but NOT
+// sufficient; what the idempotency check actually depends on is
+// completion memory, which can be lost independently of both the effect
+// and the operation_id.
+//
+// FALSE POSITIVE (I, mirrors PATH-050-K/K2): completion record exists,
+// effect didn't happen -- needed effect suppressed. FALSE NEGATIVE (J,
+// PATH-051's central new result): completion record absent, effect DID
+// happen -- effect duplicated. Together: completion memory would need to
+// be authoritative in BOTH directions (soundness of positive evidence,
+// AND coverage of negative evidence) to be trusted alone; this
+// candidate's memory achieves neither once effect and persistence can
+// fail independently. "Coverage" is used deliberately rather than
+// "completeness" here to avoid conflating this with PATH-048's
+// `HistoryCompleteness` type, though the SHAPE of the requirement --an
+// explicit, exogenous, unverified attestation that negative evidence
+// means what recovery assumes it means -- is the same pattern recurring
+// a third time (FIND-019, FIND-026/048, now the effect boundary).
+//
+// CHANGED PAYLOAD: caught locally (PATH-048's stored Reserved payload)
+// before the provider, whose own completion memory is missing anyway, is
+// even consulted (F).
+//
+// ALIAS RESULT: canonical operation_id convergence holds under the split
+// model exactly as PATH-047/048/050 established, but is proven NECESSARY
+// WITHOUT BEING SUFFICIENT -- it does not repair a completion-memory
+// persistence gap (G).
+//
+// DISTINCT-OCCURRENCE RESULT: no cross-key coalescing or poisoning; K1's
+// clean completion and K2's lost completion are resolved entirely
+// independently (H).
+//
+// SURVIVING CANDIDATE DISCUSSION (not all built -- see FIND-029 for the
+// reasoning kept out of this file):
+//   A. effect + completion share one atomic failure domain -- this is
+//      PATH-050's ORIGINAL (unmodified) `EffectProvider::execute()`;
+//      re-validated by reference, not rebuilt here, since PATH-050
+//      already tested it and this experiment changes nothing about it.
+//   B. an intrinsically idempotent external effect (e.g. "set" rather
+//      than "add" semantics) would sidestep this problem BY DEFINITION
+//      of the effect's own outcome, independent of any receipt --
+//      discussed only; modeling it honestly would require simulating
+//      converged application state this experiment does not build.
+//   C. authoritative external reconciliation against the effect
+//      system's OWN source of truth (distinct from `ground_truth`,
+//      which is this experiment's test-only oracle, not a channel a
+//      real recovery process could query) -- discussed only; building
+//      it honestly collapses toward candidate A or requires machinery
+//      out of scope here.
+//   D. a transactional resource committing both together -- the same
+//      shape as A, generalized; not built (no distributed transaction
+//      machinery, per this mission's explicit constraint).
+// P1 is left `Unresolved` for the pure split/receipt-only design tested
+// here. No candidate built in this file closes it without reintroducing
+// atomicity (A) or an external contract this experiment does not model
+// (B/C/D) -- that is treated as a legitimate, strong result, not a
+// failure to find an answer.
+//
+// A LOCAL WRITE-AHEAD RECORD ("persist 'about to execute K', then
+// execute"): reasoned about only, NOT built or executed --
+// `write_ahead_written` before the effect vs. `effect_done` after it are
+// just two MORE independently-crashable steps with the identical shape
+// of ambiguity between them (crash after the marker, before the effect,
+// vs. crash after the effect, before a "done" marker). It does not
+// close the gap; it relocates it. Recorded as DERIVED reasoning, not an
+// OBSERVED executable result.
+//
+// CONCURRENT RECOVERY: one small, deterministic, unsynchronized-race
+// probe (above) confirms the obvious -- two workers can both execute
+// under no exclusion. A full PATH-049-style concurrent-recovery study
+// (real threads, a Mutex around the completion-memory check-then-act
+// sequence, exactly-one-license-style counting) was NOT built here; it
+// is flagged as the most likely next PATH, kept deliberately out of
+// this experiment's scope per the mission brief.
