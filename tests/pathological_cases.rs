@@ -20487,3 +20487,748 @@ fn path_054_r_real_threads_baseline_gap_holds_under_concurrency() {
 //
 // NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, NO CONSENSUS-NECESSITY CLAIM,
 // PRODUCTION UNTOUCHED.
+
+// =====================================================================
+// PATH-055 -- REVOCATION LINEARIZATION / AUTHORITY-CHECK-TO-EFFECT GAP
+// (H26)
+//
+// PATH-054-D2 showed a stale former owner can execute during the
+// persist-to-propagate handoff window because the downstream PROVIDER
+// never consults the authority store directly -- it only trusts its own
+// separately-propagated cache. H26 asks a narrower, adversarial
+// question: even if a candidate closes THAT specific gap by having the
+// effect boundary consult authority directly, is direct consultation
+// enough, or can validation and effect commitment still be split into
+// two independently interleavable steps, reopening an equivalent gap at
+// a different seam?
+//
+//   H26: If epoch validation and external effect commitment can occur
+//   as two independently interleavable steps, a stale owner may
+//   validate while its epoch is current, lose authority, and still
+//   commit the effect afterward. Closing this requires epoch
+//   advancement and validate-and-commit to participate in ONE ordering
+//   domain, not merely making the newest epoch available to be read.
+//
+//   SCOPE NOTE: "external effect commitment" is this hypothesis's own
+//   framing, under test. What both candidates below actually build and
+//   run is TEST-LOCAL MODELED effect commitment (`real_effect_count`
+//   incremented in-process) -- neither candidate demonstrates a
+//   genuinely external provider (a different process, service, or
+//   system) participating in the ordering domain. Whether a real
+//   external boundary CAN is exactly PATH-056's open question, not
+//   answered here.
+//
+// FIVE moments kept separate throughout (never collapsed; step
+// numbering matches this mission's brief, not PATH-054's five things):
+//   1. TOKEN / EPOCH ISSUED
+//   2. EPOCH BECOMES AUTHORITATIVE
+//   3. EFFECT BOUNDARY READS / VALIDATES EPOCH
+//   4. EFFECT BECOMES IRREVERSIBLY COMMITTED
+//   5. COMPLETION EVIDENCE IS PERSISTED
+// PATH-055 concerns 2 <-> 3 <-> 4. Step 5 / FIND-029 is deliberately
+// NOT folded into any solution here (see case O).
+//
+// TWO TEST-LOCAL CANDIDATES, never fused with each other:
+//
+//   CANDIDATE 1 (`Path055DirectAuthorityProvider`) -- the effect
+//   boundary consults `Path054AuthoritativeEpochStore` (reused
+//   unchanged from PATH-054) DIRECTLY, with no propagated cache. This
+//   closes PATH-054-D2's specific "provider had not learned" gap (case
+//   B). But `path_055_validate_token_against_authority` and
+//   `path_055_commit_real_effect` are exposed as two SEPARATE,
+//   independently callable functions -- nothing forces a caller to
+//   invoke them back-to-back without an intervening authority change.
+//   Case C constructs exactly that gap: the TOCTOU witness.
+//
+//   CANDIDATE 2 (`Path055AuthorityAndEffectState`) -- epoch advancement
+//   and validate-and-commit are both `&mut self` methods on the SAME
+//   struct, and `validate_epoch_and_commit_effect` performs the check
+//   and the commit inside ONE function call, with no externally
+//   observable half-state in between. In the real-thread test (case P)
+//   this struct is wrapped in exactly one `std::sync::Mutex`, so the two
+//   operations additionally cannot interleave ACROSS callers. The
+//   concrete `Mutex` is a test-local implementation choice, not the
+//   theorem: what matters is that validate-then-commit is exposed as
+//   ONE function, never as two independently callable steps.
+// =====================================================================
+
+/// CANDIDATE 1 -- direct authority consult. Reuses PATH-054's
+/// `Path054AuthoritativeEpochStore` and `Path054FencingRejection`
+/// unchanged. Unlike `Path054FencedProvider`, this provider carries NO
+/// local `visible_epoch` cache at all -- every validation call reads the
+/// authority store directly, so there is no propagated cache to lag
+/// behind it (this is what closes PATH-054-D2's specific gap in case B).
+#[derive(Debug, Clone, Default)]
+struct Path055DirectAuthorityProvider {
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+}
+
+impl Path055DirectAuthorityProvider {
+    fn persist_completion(&mut self, key: OccurrenceKey, payload: ContributionEvent) {
+        self.completion_memory.persist(key, payload);
+    }
+}
+
+/// STEP 3 for candidate 1 -- validate a token against the authority
+/// store DIRECTLY, with no intervening cache. An unclaimed key (`None`
+/// in the authority store) defaults to "accept anything," the same
+/// permissive default PATH-054 used for an unobserved key -- this
+/// candidate is not artificially stricter for keys authority has never
+/// seen.
+fn path_055_validate_token_against_authority(
+    authority: &Path054AuthoritativeEpochStore,
+    key: &OccurrenceKey,
+    token: u64,
+) -> Result<(), Path054FencingRejection> {
+    let current = path_054_authoritative_epoch(authority, key).unwrap_or(0);
+    if token < current {
+        return Err(Path054FencingRejection { attempted: token, visible: current });
+    }
+    Ok(())
+}
+
+/// STEP 4 for candidate 1 -- commit the external effect. Deliberately
+/// takes NO authority reference: this is the crux of the TOCTOU
+/// construction (case C). This function trusts whatever validation
+/// already happened at some earlier point and does not re-check. A real
+/// effect boundary that re-validated on every internal step would not
+/// exhibit case C; this candidate models one that does not, specifically
+/// to expose the gap between "validated" and "committed."
+fn path_055_commit_real_effect(provider: &mut Path055DirectAuthorityProvider, key: OccurrenceKey, payload: ContributionEvent) {
+    provider.ground_truth.real_effect_count += 1;
+    provider.persist_completion(key, payload);
+}
+
+/// Validate-then-commit as two back-to-back calls with NO intervening
+/// authority change -- used for case B, where candidate 1's direct
+/// consultation alone is sufficient because nothing splits the two
+/// steps in time.
+fn path_055_validate_and_commit_direct(
+    authority: &Path054AuthoritativeEpochStore,
+    provider: &mut Path055DirectAuthorityProvider,
+    key: OccurrenceKey,
+    payload: ContributionEvent,
+    token: u64,
+) -> Result<(), Path054FencingRejection> {
+    path_055_validate_token_against_authority(authority, &key, token)?;
+    path_055_commit_real_effect(provider, key, payload);
+    Ok(())
+}
+
+/// CANDIDATE 2 -- shared ordering domain. `advance_authoritative_epoch`
+/// and `validate_epoch_and_commit_effect` are both `&mut self` methods
+/// on the SAME struct; the latter performs check-then-commit inside ONE
+/// function call, so there is no point at which external code can
+/// observe "validated but not yet committed" and act on a change to
+/// `current_epoch` in between. Wrapping this struct in one
+/// `std::sync::Mutex` (case P) additionally prevents interleaving across
+/// real threads. The Mutex is NOT the theorem -- it is this candidate's
+/// chosen way to make two operations mutually ordered; the property
+/// under test is that validate-and-commit is indivisible, not that a
+/// Mutex specifically is required.
+#[derive(Debug, Clone, Default)]
+struct Path055AuthorityAndEffectState {
+    current_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+}
+
+impl Path055AuthorityAndEffectState {
+    /// Epoch advancement, MONOTONIC like PATH-054's `propagate_epoch`
+    /// (relied on by case L for out-of-order delivery and case M for
+    /// skipped epochs).
+    fn advance_authoritative_epoch(&mut self, key: OccurrenceKey, epoch: u64) {
+        let entry = self.current_epoch.entry(key).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+    }
+
+    /// THE CANDIDATE FIX: validate and commit as ONE indivisible
+    /// operation relative to `advance_authoritative_epoch`. An unclaimed
+    /// key defaults to epoch 0 (accept anything), the same permissive
+    /// default as candidate 1 and PATH-054.
+    fn validate_epoch_and_commit_effect(
+        &mut self,
+        key: OccurrenceKey,
+        payload: ContributionEvent,
+        token: u64,
+    ) -> Result<(), Path054FencingRejection> {
+        let current = self.current_epoch.get(&key).copied().unwrap_or(0);
+        if token < current {
+            return Err(Path054FencingRejection { attempted: token, visible: current });
+        }
+        self.ground_truth.real_effect_count += 1;
+        self.completion_memory.persist(key, payload);
+        Ok(())
+    }
+
+    fn query_completion(&self, key: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.completion_memory.query(key)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Mandatory cases A-O, plus one supplementary real-thread case (P).
+// ---------------------------------------------------------------------
+
+/// PATH-055-A -- BASELINE, anchoring this PATH to PATH-054-D2 exactly.
+/// Reuses PATH-054's own helpers unchanged: A owns epoch 1, B is issued
+/// and persisted as authoritative epoch 2, propagation is DELIBERATELY
+/// not yet called. Stale A executes inside the window; propagation then
+/// completes and B executes too. Expected: 2 effects -- the same result
+/// as `path_054_d2_stale_owner_can_execute_inside_persist_to_propagate_handoff_window`,
+/// reproduced here as PATH-055's own starting point.
+#[test]
+fn path_055_a_baseline_d2_duplicate_reproduced() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    let b_epoch = match b { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    path_054_persist_authoritative_epoch(&mut authority, &key, b_epoch);
+    // STOP -- propagate_epoch not yet called; the handoff window is open.
+    assert_eq!(path_054_authoritative_epoch(&authority, &key), Some(2));
+    assert!(provider.visible_epoch.get(&key).is_none());
+
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(a_result.is_ok(), "PATH-054-D2 baseline: stale A still executes inside the window");
+
+    provider.propagate_epoch(key.clone(), b_epoch);
+    let b_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch);
+    assert!(b_result.is_ok());
+    assert_eq!(provider.ground_truth.real_effect_count, 2, "D2 baseline duplicate reproduced -- this anchors PATH-055 to PATH-054");
+}
+
+/// PATH-055-B -- DIRECT AUTHORITY CONSULT closes the D2 gap for a stale
+/// call that arrives AFTER epoch 2 is authoritative, with no cache and
+/// no propagation step needed at all. B is made authoritative FIRST;
+/// stale A's call, arriving strictly after, is rejected immediately.
+#[test]
+fn path_055_b_direct_authority_consult_rejects_stale_after_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path055DirectAuthorityProvider::default();
+
+    // Epoch 2 authoritative BEFORE stale A calls -- no propagation exists
+    // in this candidate at all; there is nothing to propagate to.
+    path_054_persist_authoritative_epoch(&mut authority, &key, 2);
+
+    let a_result = path_055_validate_and_commit_direct(&authority, &mut provider, key.clone(), payload.clone(), 1);
+    assert_eq!(
+        a_result,
+        Err(Path054FencingRejection { attempted: 1, visible: 2 }),
+        "stale token 1 rejected immediately -- direct authority visibility closes PATH-054-D2's specific propagation-lag gap"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 0);
+
+    let b_result = path_055_validate_and_commit_direct(&authority, &mut provider, key.clone(), payload, 2);
+    assert!(b_result.is_ok());
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-055-C -- THE HORUS PACOV: CHECK/COMMIT TOCTOU, the central
+/// adversarial witness. Candidate 1 closes B, but exposes validation and
+/// commitment as two SEPARATE calls. Deterministic construction:
+///   1. authority epoch = 1
+///   2. stale A validates token 1 -- SUCCEEDS (1 >= 1)
+///   3. STOP -- A has not committed yet
+///   4. B's takeover makes epoch 2 authoritative
+///   5. A resumes and commits using its EARLIER successful validation,
+///      never re-checking authority
+///   6. B validates token 2 (now current) and commits
+/// Expected, NOT patched away: 2 effects. This demonstrates that a fresh
+/// read at validation time proves only "token was current AT THAT
+/// INSTANT" -- it does not prove the token remained current until the
+/// effect irreversibly committed.
+#[test]
+fn path_055_c_stale_owner_validates_before_revocation_then_commits_after_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path055DirectAuthorityProvider::default();
+
+    // 1. authority epoch = 1 (A is the current, legitimately authoritative owner).
+    path_054_persist_authoritative_epoch(&mut authority, &key, 1);
+
+    // 2. stale-A-to-be validates token 1 successfully, while it is still current.
+    let a_validation = path_055_validate_token_against_authority(&authority, &key, 1);
+    assert!(a_validation.is_ok(), "token 1 is current at validation time");
+
+    // 3. STOP -- deliberately no commit yet.
+
+    // 4. B's takeover makes epoch 2 authoritative. A is now stale, but has
+    //    ALREADY validated and does not know this.
+    path_054_persist_authoritative_epoch(&mut authority, &key, 2);
+    assert_eq!(path_054_authoritative_epoch(&authority, &key), Some(2), "A is now stale");
+
+    // 5. A resumes and commits from its earlier, now-outdated validation --
+    //    the commit function takes no authority reference and cannot detect this.
+    path_055_commit_real_effect(&mut provider, key.clone(), payload.clone());
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "A's stale-but-previously-valid commit went through");
+
+    // 6. B validates its own current token 2 and commits.
+    let b_result = path_055_validate_and_commit_direct(&authority, &mut provider, key.clone(), payload, 2);
+    assert!(b_result.is_ok());
+
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "TOCTOU WITNESS: direct authority consult alone does not close the check-to-effect gap -- \
+         a stale owner can validate while current and commit after revocation"
+    );
+}
+
+/// PATH-055-D -- ATOMIC CANDIDATE, EFFECT WINS ORDER. A's
+/// validate-and-commit (token 1, while epoch 1 is still authoritative)
+/// happens BEFORE epoch 2's advancement. Expected: A's effect commits;
+/// epoch 2 then advances; B may later execute token 2; the resulting
+/// effect count is 2. A's commit is NOT a stale-owner violation relative
+/// to REVOCATION ORDERING -- it linearized before revocation, and
+/// revocation cannot retroactively invalidate it. That is a narrower
+/// claim than "two legitimate effects": whether a two-effect history for
+/// the same occurrence is economically correct (an intentional
+/// double-payout) or an unresolved duplicate is exactly the question
+/// this candidate does NOT answer -- see FIND-029 / PATH-055-O.
+#[test]
+fn path_055_d_atomic_candidate_effect_wins_before_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.current_epoch.insert(key.clone(), 1); // A is currently authoritative.
+
+    let a_result = state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 1);
+    assert!(a_result.is_ok(), "A's validate+commit linearizes BEFORE revocation -- accepted");
+    assert_eq!(state.ground_truth.real_effect_count, 1);
+
+    state.advance_authoritative_epoch(key.clone(), 2);
+
+    let b_result = state.validate_epoch_and_commit_effect(key.clone(), payload, 2);
+    assert!(b_result.is_ok(), "B's own current epoch, after revocation, is separately accepted");
+    assert_eq!(
+        state.ground_truth.real_effect_count, 2,
+        "A's pre-revocation commit is not a stale-owner violation, but this does NOT thereby prove the resulting two-effect history is economically correct -- that is FIND-029's still-open question, not this candidate's claim"
+    );
+}
+
+/// PATH-055-E -- ATOMIC CANDIDATE, REVOCATION WINS ORDER. Epoch 2's
+/// advancement happens BEFORE A's validate-and-commit. Expected: A's
+/// stale token 1 is rejected; B's token 2 is accepted. The stale-owner
+/// safety case.
+#[test]
+fn path_055_e_atomic_candidate_revocation_wins_rejects_stale_owner() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.current_epoch.insert(key.clone(), 1);
+
+    state.advance_authoritative_epoch(key.clone(), 2);
+
+    let a_result = state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 1);
+    assert_eq!(a_result, Err(Path054FencingRejection { attempted: 1, visible: 2 }), "revocation happened BEFORE A's validate+commit -- rejected");
+    assert_eq!(state.ground_truth.real_effect_count, 0);
+
+    let b_result = state.validate_epoch_and_commit_effect(key.clone(), payload, 2);
+    assert!(b_result.is_ok());
+    assert_eq!(state.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-055-F -- CURRENT OWNER. Token 2 is accepted after revocation has
+/// already occurred, isolated from any stale-token interaction.
+#[test]
+fn path_055_f_atomic_candidate_current_owner_accepted_after_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key.clone(), 2);
+
+    let result = state.validate_epoch_and_commit_effect(key.clone(), payload, 2);
+    assert!(result.is_ok(), "the current owner's token is accepted after revocation");
+    assert_eq!(state.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-055-G -- DIFFERENT KEYS. K1's epoch advancement must not
+/// serialize/poison K2 semantically -- each key has its own entry in
+/// `current_epoch`. This candidate's deterministic tests never wrap the
+/// struct in a lock; ONLY the real-thread test (P) uses one Mutex over
+/// the WHOLE struct, which is a documented CANDIDATE LIMITATION on
+/// parallelism (reduced concurrency across unrelated keys), not a claim
+/// that per-key locking is necessary.
+#[test]
+fn path_055_g_different_keys_have_independent_epoch_domains() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("bob", "audit", 25.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let event_2 = path_047_candidate("payroll-system", "evt-2", payload_2.clone());
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key_1.clone(), 2);
+
+    let k1_stale = state.validate_epoch_and_commit_effect(key_1.clone(), payload_1, 1);
+    assert!(k1_stale.is_err(), "K1's revoked epoch 1 is rejected");
+
+    let k2_fresh = state.validate_epoch_and_commit_effect(key_2.clone(), payload_2, 1);
+    assert!(k2_fresh.is_ok(), "K2 was never touched by K1's revocation -- its own domain is unaffected");
+    assert_eq!(state.ground_truth.real_effect_count, 1, "only K2's legitimate effect ran");
+}
+
+/// PATH-055-H -- ALIAS CONVERGENCE. Two raw `SourceId`s resolving to the
+/// SAME canonical `OccurrenceKey` share the SAME revocation domain: a
+/// revocation issued through one raw label is visible to a validation
+/// attempt made through the OTHER raw label.
+#[test]
+fn path_055_h_alias_convergence_shares_one_revocation_domain() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "both raw labels canonicalize to the SAME OccurrenceKey");
+
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key_a, 2);
+
+    let result = state.validate_epoch_and_commit_effect(key_b, payload, 1);
+    assert!(result.is_err(), "revocation via one alias is enforced against a validation attempt via the OTHER alias -- one shared domain");
+}
+
+/// PATH-055-I -- PAYLOAD CONFLICT. A conflicting payload is rejected by
+/// the existing ledger-level check (unchanged from PATH-054, reused
+/// verbatim) before the atomic candidate is ever consulted -- no epoch
+/// state, no effect.
+#[test]
+fn path_055_i_payload_conflict_rejected_before_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_a = path_047_payload("alice", "review", 40.0);
+    let payload_b = path_047_payload("alice", "review", 999.0);
+    let reserved_event = path_047_candidate("payroll-system", "evt-1", payload_a);
+    let conflicting_event = path_047_candidate("payroll-system", "evt-1", payload_b);
+    let key = path_048_occurrence_key(&contract, &reserved_event).unwrap();
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &reserved_event);
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+
+    let verdict = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &conflicting_event, "worker-A", 0);
+    assert_eq!(verdict, Path054ClaimVerdict::Conflicted, "rejected before any epoch/effect machinery is touched");
+
+    let state = Path055AuthorityAndEffectState::default();
+    assert_eq!(state.ground_truth.real_effect_count, 0, "the atomic candidate was never consulted");
+}
+
+/// PATH-055-J -- COMPLETION PRESENT. When completion evidence for this
+/// key/payload already exists, no NEW takeover or effect is needed; the
+/// atomic candidate is correctly never invoked a second time.
+#[test]
+fn path_055_j_completion_present_needs_no_new_effect() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key.clone(), 1);
+    state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 1).expect("initial effect");
+    assert_eq!(state.ground_truth.real_effect_count, 1);
+
+    // Completion already present for this exact payload -- a correctly
+    // written caller checks this FIRST and does not call
+    // `validate_epoch_and_commit_effect` again.
+    let already_complete = state.query_completion(&key) == Some(payload);
+    assert!(already_complete, "completion evidence already exists");
+    assert_eq!(state.ground_truth.real_effect_count, 1, "no NEW effect -- the candidate was not re-invoked");
+}
+
+/// PATH-055-K -- ALREADY SETTLED. The ledger already shows this key as
+/// settled; a correctly written caller does not invoke the atomic
+/// candidate at all.
+#[test]
+fn path_055_k_settled_no_new_effect() {
+    let (_contract, _payload, _event, key, mut ledger) = path_054_setup();
+    path_048_confirm_settlement(&mut ledger, &key);
+    assert!(matches!(ledger.records.get(&key), Some(SettlementRecord::Settled { .. })));
+
+    let state = Path055AuthorityAndEffectState::default();
+    assert_eq!(state.ground_truth.real_effect_count, 0, "settled state alone requires no effect");
+}
+
+/// PATH-055-L -- OUT-OF-ORDER / OLD EPOCH. Once epoch 2 is authoritative,
+/// an old token 1 is rejected; a delayed, older `advance_authoritative_epoch`
+/// call for epoch 1 arriving AFTER epoch 2 does not downgrade it either
+/// (monotonicity, same property PATH-054-I isolated at its own boundary).
+#[test]
+fn path_055_l_old_epoch_rejected_once_authoritative_epoch_advanced() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key.clone(), 2);
+    state.advance_authoritative_epoch(key.clone(), 1); // delayed, older, arrives late
+    assert_eq!(state.current_epoch.get(&key), Some(&2), "the older, delayed advancement does not downgrade the current epoch");
+
+    let result = state.validate_epoch_and_commit_effect(key, payload, 1);
+    assert!(result.is_err(), "old token rejected once the authoritative epoch has advanced");
+}
+
+/// PATH-055-M -- SKIPPED EPOCH. The authoritative epoch jumps straight
+/// to 3 (no assumption of contiguity). Tokens 1 and 2 are both stale;
+/// only 3 is current.
+#[test]
+fn path_055_m_skipped_epoch_no_contiguity_assumption() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key.clone(), 3);
+
+    assert!(state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 1).is_err(), "epoch 1 stale");
+    assert!(state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 2).is_err(), "epoch 2 stale, though never individually observed");
+    assert!(state.validate_epoch_and_commit_effect(key, payload, 3).is_ok(), "epoch 3 current");
+}
+
+/// PATH-055-N -- SAME-TOKEN REPLAY BOUNDARY, kept to exactly ONE test,
+/// per this mission's brief: revocation ordering is not idempotency. The
+/// CURRENT token, presented twice, executes twice under this candidate
+/// -- `validate_epoch_and_commit_effect` has no per-call dedup mechanism.
+/// NOT solved here.
+#[test]
+fn path_055_n_same_token_replay_is_not_prevented_by_revocation_ordering() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut state = Path055AuthorityAndEffectState::default();
+    state.advance_authoritative_epoch(key.clone(), 2);
+
+    assert!(state.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 2).is_ok());
+    assert!(
+        state.validate_epoch_and_commit_effect(key, payload, 2).is_ok(),
+        "the SAME current token, presented again, is accepted again"
+    );
+    assert_eq!(state.ground_truth.real_effect_count, 2, "REVOCATION ORDERING != OPERATION IDEMPOTENCY -- a separate, still-open gap, not solved here");
+}
+
+/// PATH-055-O -- FIND-029 P0/P1 under the ATOMIC candidate. World 0 (no
+/// prior effect) and World 1 (a prior effect committed before revocation
+/// happened; its completion evidence is lost) are both brought to the
+/// SAME current epoch and the SAME recovery-visible (absent) completion
+/// state, via this candidate's OWN indivisible validate-and-commit path.
+/// Question: should B execute? Expected: historical ambiguity remains --
+/// perfect revocation ordering answers only "is this token stale," never
+/// "did an effect already happen." Stronger revocation semantics must
+/// NOT be read as having erased FIND-029.
+#[test]
+fn path_055_o_atomic_candidate_does_not_resolve_find_029_p0_p1() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+
+    let mut world_0 = Path055AuthorityAndEffectState::default();
+    // WORLD 0: no historical effect.
+
+    let mut world_1 = Path055AuthorityAndEffectState::default();
+    // WORLD 1: an effect already committed once, legitimately, before
+    // revocation; completion evidence for it was lost (modeled by simply
+    // never having called `persist_completion`/never inserting a receipt).
+    world_1.ground_truth.real_effect_count += 1;
+
+    assert_eq!(world_0.query_completion(&key), None);
+    assert_eq!(world_1.query_completion(&key), None, "identical -- absent completion evidence in both worlds");
+
+    world_0.advance_authoritative_epoch(key.clone(), 2);
+    world_1.advance_authoritative_epoch(key.clone(), 2);
+    assert_eq!(world_0.current_epoch.get(&key), world_1.current_epoch.get(&key), "identical current epoch in both worlds");
+
+    let v0 = world_0.validate_epoch_and_commit_effect(key.clone(), payload.clone(), 2);
+    let v1 = world_1.validate_epoch_and_commit_effect(key.clone(), payload, 2);
+    assert_eq!(v0, v1, "SAME verdict in both worlds -- perfect revocation ordering carries no historical-truth signal");
+
+    assert_eq!(world_0.ground_truth.real_effect_count, 1, "World 0: correct, single effect");
+    assert_eq!(world_1.ground_truth.real_effect_count, 2, "World 1: a SECOND effect, despite identical, perfectly-ordered epoch state in both worlds -- FIND-029 remains open");
+}
+
+/// PATH-055-P (supplementary, real threads, OPTIONAL). Thread A tries
+/// `validate_epoch_and_commit_effect` for stale-owner-to-be token 1 (A
+/// is initially authoritative at epoch 1); thread B tries
+/// `advance_authoritative_epoch` to 2. One barrier, no sleeps, no
+/// assertion about which thread wins the race for the single Mutex.
+/// ALLOWED: (1) A's effect commits, and only THEN does epoch advance to
+/// 2 visibly complete after it; or (2) epoch advances to 2 first, and A
+/// is rejected. FORBIDDEN, and structurally impossible by this
+/// candidate's construction (validate-and-commit is one function under
+/// one lock): epoch advancing before A's commit, yet A commits anyway
+/// from a stale pre-advance validation. The assertion below checks the
+/// only two allowed outcomes hold, without inferring which one occurred.
+#[test]
+fn path_055_p_real_threads_atomic_candidate_forbids_stale_commit_after_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut initial = Path055AuthorityAndEffectState::default();
+    initial.current_epoch.insert(key.clone(), 1); // A is currently authoritative.
+
+    let state = std::sync::Arc::new(std::sync::Mutex::new(initial));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let a_handle = {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = state.lock().expect("PATH-055 test state mutex poisoned");
+            guard.validate_epoch_and_commit_effect(key, payload, 1)
+        })
+    };
+    let b_handle = {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = state.lock().expect("PATH-055 test state mutex poisoned");
+            guard.advance_authoritative_epoch(key, 2);
+        })
+    };
+    let a_result = a_handle.join().unwrap();
+    b_handle.join().unwrap();
+
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.current_epoch.get(&key), Some(&2), "B's advancement always eventually completes, regardless of interleaving order");
+    match a_result {
+        Ok(()) => assert_eq!(guard.ground_truth.real_effect_count, 1, "A committed -- this can ONLY have linearized before revocation, since validate+commit is one locked operation"),
+        Err(rejection) => {
+            assert_eq!(rejection, Path054FencingRejection { attempted: 1, visible: 2 });
+            assert_eq!(guard.ground_truth.real_effect_count, 0, "A was rejected -- revocation linearized first; no stale commit occurred");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+//
+// H26 CONFIRMED for the tested candidates. Direct authority consultation
+// (candidate 1) closes PATH-054-D2's specific "provider had not learned
+// the new epoch" gap (B): once the effect boundary reads authority
+// directly, there is no propagated cache to lag behind, so a stale call
+// arriving strictly after revocation is rejected immediately, with no
+// propagation step required at all. BUT direct consultation alone does
+// NOT close a check-to-effect TOCTOU gap: candidate 1 exposes validation
+// and commitment as two separate, independently callable functions, and
+// case C constructs a deterministic witness -- a stale owner validates
+// successfully while its epoch is current, an intervening revocation
+// happens, and the SAME owner then commits from its earlier, now-
+// outdated validation, producing a duplicate effect the direct-read
+// candidate does not prevent. A fresh authority read proves only "token
+// was current AT THE INSTANT OF THE READ" -- it does not prove the token
+// remained current until the effect irreversibly committed. Therefore:
+// fresh read != revocation atomicity, and authority visibility !=
+// commit ordering.
+//
+// CANDIDATE 2 closes the TOCTOU gap FOR THE TESTED CASES by making
+// validate-and-commit a single, indivisible operation relative to epoch
+// advancement (D-F): under EITHER legal ordering -- A's validate+commit
+// linearizing before revocation (D), or revocation linearizing before
+// A's validate+commit (E/F) -- there is no execution equivalent to "A
+// validates under epoch 1, epoch advances to 2, A commits as though
+// epoch 1 were still valid." An effect is forced onto one side of the
+// revocation boundary: it either commits before the newer epoch becomes
+// authoritative, or the older token is rejected afterward. Case D is
+// EXPLICITLY not a duplicate-by-staleness: A's effect is legitimate
+// RELATIVE TO REVOCATION ORDERING because it linearized before
+// revocation, and revocation cannot retroactively invalidate it -- but
+// the resulting TWO-EFFECT HISTORY is not thereby proven economically
+// correct. Revocation ordering answers only which side of the boundary
+// an effect fell on, never whether two effects for the same occurrence
+// are an intended outcome or an unresolved duplicate (this connects to,
+// and does not override, FIND-029's historical-effect ambiguity -- see O).
+// The real-thread test (P) shows the same coupling holds under genuine
+// concurrency, for this candidate's chosen single-Mutex construction:
+// whichever operation acquires the lock runs to completion before the
+// other can observe or change anything, so the forbidden interleaving
+// (epoch advances first, yet a stale commit still lands) never occurs by
+// construction, not by scheduler luck.
+//
+// G/H mirror PATH-054's per-key-independence and alias-convergence
+// results at this candidate's own boundary: distinct keys have
+// independent entries in `current_epoch` (G) -- though this candidate's
+// real-thread test wraps the WHOLE struct in one Mutex, which is a
+// DOCUMENTED LIMITATION on cross-key parallelism, not a claim that
+// per-key locking is necessary or that this candidate's deterministic
+// (non-threaded) cases share any such limitation; two raw source
+// aliases resolving to the same `OccurrenceKey` share the same
+// revocation domain (H). I/J/K mirror PATH-054-M/N/O: payload conflict,
+// completion-present, and already-settled states are all handled BEFORE
+// the atomic candidate is ever consulted, and nothing about closing the
+// TOCTOU gap changes any of them. L/M reconfirm monotonicity (no
+// downgrade on delayed old-epoch delivery) and no-contiguity-assumption
+// (a skipped epoch stales out every token below it) at this candidate's
+// own boundary, exactly as PATH-054-I/J did at theirs.
+//
+// SAME-TOKEN REPLAY REMAINS SEPARATELY OPEN, NOT RE-LITIGATED (N): the
+// CURRENT token, presented twice, executes twice under this candidate.
+// Revocation ordering answers "is this token stale, and did it commit
+// before or after the boundary" -- it says nothing about deduplicating
+// two calls that both carry the SAME still-current token. This is the
+// same open gap as PATH-053-O/PATH-054-Q, not expanded here.
+//
+// FIND-029'S P0/P1 REMAINS OPEN EVEN UNDER THIS CANDIDATE'S PERFECT,
+// INDIVISIBLE REVOCATION ORDERING (O): two worlds with IDENTICAL current
+// epoch and IDENTICAL (absent) completion evidence, differing only in
+// ground-truth history (a prior effect legitimately committed before
+// revocation, in World 1, with its completion evidence lost), receive
+// the SAME verdict from `validate_epoch_and_commit_effect` and still
+// diverge in total effect count. A precise, indivisible revocation
+// boundary answers "is this token stale," never "did this effect already
+// happen." Stronger revocation semantics do not, and must not be read
+// to, erase FIND-029.
+//
+// KNOWN FROM LITERATURE (PKV-TRANSACTION-RECOVERY-MAP-001.md, read for
+// terminology/context only -- nothing above is claimed as tested beyond
+// this PATH's own two candidates, and no source is claimed to PROVE this
+// file's result): fencing tokens (Kleppmann, ch. 8) remain the named
+// mechanism candidate 1 and 2 both instantiate at the validation step;
+// Kleppmann ch. 9 names linearizability and idempotency/retries as
+// related but SEPARATE concepts -- this file does not claim to have
+// built or tested general linearizability, only that ONE test-local
+// candidate's validate-and-commit operation is indivisible relative to
+// ONE other operation (epoch advancement) under the cases exercised
+// here. "Check-then-act" / TOCTOU is used here as a plain descriptive
+// term for the case-C gap, not attributed to any specific cited source
+// as a named result.
+//
+// NOT ESTABLISHED: that a `std::sync::Mutex`, or any single concrete
+// locking/ordering mechanism, is the ONLY or universally necessary way
+// to make validate-and-commit indivisible -- only that THIS candidate's
+// chosen construction achieves it for the tested cases. That a real
+// external effect boundary (a payment provider, a message queue, a
+// third-party API) CAN participate in the same ordering domain as an
+// epoch authority at all -- `Path055AuthorityAndEffectState` remains a
+// test-local, in-process, single-struct construction; if a real external
+// effect cannot share this ordering boundary, that is explicitly
+// PATH-056's question, not answered here. That per-key locking is
+// necessary rather than merely one option distinct from this candidate's
+// single-Mutex real-thread test. Any resolution of PATH-054-H's
+// double-loss stop condition, same-token idempotency (N), or FIND-029's
+// P0/P1 ambiguity (O). Any consensus-necessity or database-transaction-
+// necessity claim -- this candidate's state is a single, unreplicated,
+// in-process struct. Any novel theoretical result -- Section 2 of
+// PKV-TRANSACTION-RECOVERY-MAP-001.md's mappings remain standard,
+// decades-old concepts, and general linearizability is Lamport/Herlihy-
+// Wing-era literature this file does not claim to extend.
+//
+// STOP CONDITION REACHED: whether a REAL external effect boundary (a
+// system this candidate's in-process struct does not model) can
+// participate in the same ordering domain as epoch authority AT ALL is
+// an open question, not solved here -- named in this mission's brief as
+// PATH-056's likely territory, distinct from stop conditions (1) and (2)
+// already recorded in FIND-032.
+//
+// Recommended next PATH: PATH-056 -- whether/how a genuinely external
+// effect boundary (a real provider or resource in a DIFFERENT process or
+// system than the epoch authority) can be brought into one ordering
+// domain with epoch advancement, given that candidate 2's in-process
+// single-Mutex construction is not available once authority and effect
+// are different systems. Alternatives, named but not built here: same-
+// token idempotency (PATH-053-O/PATH-054-Q/PATH-055-N, still open);
+// FIND-029's historical-effect ambiguity (still open, PATH-055-O);
+// authenticity/trust of the epoch authority writer itself (named in
+// FIND-032's own recommendation, still not taken up). Only one of these
+// should be taken up next.
+//
+// NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, NO CONSENSUS-NECESSITY CLAIM,
+// NO DATABASE-TRANSACTION-NECESSITY CLAIM, NO UNIVERSAL-MUTEX CLAIM,
+// PRODUCTION UNTOUCHED.
