@@ -18531,3 +18531,953 @@ fn path_052_k_false_negative_completion_memory_grants_recovery_that_duplicates()
 // take over. Documented as a new blocker, not solved here. Recommended
 // next PATH: abandoned recovery ownership / fencing / ownership epochs /
 // leases (PATH-053).
+
+// =====================================================================
+// PATH-053 -- ABANDONED RECOVERY OWNERSHIP / TAKEOVER AMBIGUITY /
+// FENCING BOUNDARY (H24)
+//
+// PATH-052/FIND-030 established that concurrent LIVE recoverers need
+// their own single-winner boundary, and PATH-052-I/I2 exposed a NEW gap:
+// a recovery claim with no owner identity, token, timestamp, or expiry
+// can never be reclaimed once its holder disappears, and even a claim
+// WITH expiry cannot tell the next worker whether takeover is safe.
+// PATH-053 tests H24:
+//
+//   A time-bounded or replaceable recovery-ownership mechanism can make
+//   abandoned recovery claims reclaimable, but ownership expiry alone
+//   cannot establish whether the previous owner already caused the
+//   external effect. If a stale owner can still execute after losing
+//   ownership, lease-based takeover alone does not guarantee at-most-one
+//   external effect. A fencing mechanism can prevent stale-owner
+//   execution only if the downstream effect boundary actually validates
+//   and rejects stale fencing tokens.
+//
+// FOUR axes this file deliberately does NOT collapse into one another:
+//   1. OWNERSHIP LIVENESS         -- can a stuck claim eventually be reclaimed?
+//   2. LIVE OWNERSHIP-CLAIM
+//      EXCLUSION                  -- can only one worker hold the current
+//                                    recovery ownership / receive the
+//                                    current ownership grant while the
+//                                    lease is live? (a claim-grant
+//                                    property, NOT a claim about who can
+//                                    act at the downstream effect
+//                                    boundary -- PATH-053-F2 shows those
+//                                    are different questions.)
+//   3. EFFECT SAFETY              -- can a stale owner still cause the effect?
+//   4. TEMPORAL IDENTIFIABILITY -- did a prior owner already cause the
+//                                  effect before disappearing? (FIND-029)
+//
+// TEST-LOCAL ONLY -- no production code touched. A TEST-CONTROLLED
+// logical tick (`now: u64`), never the wall clock, drives lease expiry;
+// no test sleeps. Case letters below follow this mission's brief
+// (A-P); PATH-053-Q is a supplementary real-thread case.
+// =====================================================================
+
+/// A strictly-monotonic fencing token. `Path053RecoveryOwnership` issues
+/// one new (higher) token per successful acquire/takeover; the fenced
+/// provider below enforces freshness against the HIGHEST token it has
+/// ever accepted per key -- the actual downstream enforcement point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Path053Token(u64);
+
+/// One occurrence's current recovery ownership: WHO holds it, WHICH
+/// token they were issued, and UNTIL WHEN (in test-controlled ticks)
+/// their lease is live. No wall-clock, no heartbeat -- the smallest
+/// state that can express liveness (`lease_until`) separately from
+/// exclusion (`owner_id`/`token`).
+#[derive(Debug, Clone, PartialEq)]
+struct Path053Owner {
+    owner_id: String,
+    token: Path053Token,
+    lease_until: u64,
+}
+
+/// Durable-in-this-test ownership table, one entry per in-flight
+/// recovery, plus the monotonic counter that issues fencing tokens.
+/// Replaces PATH-052's `Path052RecoveryClaims::in_flight` (a bare set,
+/// with no way to ever reclaim an entry) with an entry that CAN expire
+/// and CAN be taken over.
+#[derive(Debug, Clone, Default)]
+struct Path053RecoveryOwnership {
+    owners: std::collections::HashMap<OccurrenceKey, Path053Owner>,
+    next_token: u64,
+}
+
+/// The recovery-ownership-acquisition verdict. `Granted` now CARRIES the
+/// token the caller must present to the fenced provider -- distinct from
+/// PATH-052's `Granted`, which carried no evidence a caller could later
+/// be checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path053ClaimVerdict {
+    Granted(Path053Token),
+    AlreadyComplete,
+    Conflicted,
+    Unresolved,
+    AlreadyRecovering,
+}
+
+/// Returned when the fenced provider rejects a stale token -- the
+/// EXPLICIT downstream-enforcement failure mode; cases F/O/P below are
+/// the only places this file constructs or inspects one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path053FencingRejection {
+    attempted: Path053Token,
+    highest_accepted: Path053Token,
+}
+
+/// The provider under test for PATH-053: a ground-truth effect log
+/// (test-oracle only, as in `Path051SplitProvider`), recovery-visible
+/// completion memory, and a NEW per-key "highest accepted fencing
+/// token" record -- the ONLY thing in this file that can reject a stale
+/// owner's effect call. Deliberately SEPARATE from
+/// `Path053RecoveryOwnership`: fencing is enforced at the EFFECT
+/// boundary, never inside the ownership map, per this mission's brief
+/// ("fencing works here ONLY because the effect provider enforces it").
+#[derive(Debug, Clone, Default)]
+struct Path053FencedProvider {
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+    highest_accepted_token: std::collections::HashMap<OccurrenceKey, Path053Token>,
+}
+
+impl Path053FencedProvider {
+    /// UNFENCED effect execution: ignores ownership/tokens entirely --
+    /// models a provider (or a stale caller bypassing the fenced path)
+    /// that does not enforce anything. Used only by PATH-053-C/D/E to
+    /// construct worlds/show what happens WITHOUT the fencing rule below.
+    fn execute_real_effect_unfenced(&mut self, _key: OccurrenceKey, _payload: ContributionEvent) {
+        self.ground_truth.real_effect_count += 1;
+    }
+
+    /// FENCED effect execution: accepted only if `token` is >= the
+    /// highest token this provider has EVER accepted for `key` -- a
+    /// strictly-monotonic "highest accepted" rule, the smallest
+    /// mechanism that fits this mission's brief. THIS check, at THIS
+    /// boundary, is the entire fencing enforcement point in this file;
+    /// nothing about `Path053RecoveryOwnership` enforces it.
+    fn execute_real_effect_fenced(
+        &mut self,
+        key: OccurrenceKey,
+        payload: ContributionEvent,
+        token: Path053Token,
+    ) -> Result<(), Path053FencingRejection> {
+        if let Some(&highest) = self.highest_accepted_token.get(&key) {
+            if token < highest {
+                return Err(Path053FencingRejection { attempted: token, highest_accepted: highest });
+            }
+        }
+        self.highest_accepted_token.insert(key.clone(), token);
+        self.ground_truth.real_effect_count += 1;
+        let _ = payload;
+        Ok(())
+    }
+
+    fn persist_completion(&mut self, key: OccurrenceKey, payload: ContributionEvent) {
+        self.completion_memory.persist(key, payload);
+    }
+
+    fn query_completion(&self, key: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.completion_memory.query(key)
+    }
+}
+
+const PATH_053_LEASE_DURATION: u64 = 10;
+
+/// THE TESTED CANDIDATE: one indivisible critical section (mirrors
+/// PATH-052's `path_052_try_claim_recovery`) that additionally checks
+/// LEASE LIVENESS before treating an existing entry as exclusive, and
+/// issues a fresh, strictly-higher token on every grant/takeover. `now`
+/// is a TEST-CONTROLLED logical tick, supplied by the caller -- never
+/// read from the wall clock.
+fn path_053_try_acquire_recovery(
+    state: &std::sync::Mutex<(Path053RecoveryOwnership, Path048Ledger, Path053FencedProvider)>,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+    owner_id: &str,
+    now: u64,
+) -> Path053ClaimVerdict {
+    let mut guard = state.lock().expect("PATH-053 test state mutex poisoned");
+    let (ownership, ledger, provider) = &mut *guard;
+
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            return if *payload == event.payload { Path053ClaimVerdict::AlreadyComplete } else { Path053ClaimVerdict::Conflicted };
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path053ClaimVerdict::Conflicted;
+            }
+        }
+        None => return Path053ClaimVerdict::Unresolved,
+    }
+
+    match provider.query_completion(key) {
+        Some(existing) if existing == event.payload => {
+            path_048_confirm_settlement(ledger, key);
+            return Path053ClaimVerdict::AlreadyComplete;
+        }
+        Some(_) => return Path053ClaimVerdict::Conflicted,
+        None => {}
+    }
+
+    // LIVE OWNERSHIP-CLAIM EXCLUSION: an unexpired entry excludes every
+    // other WORKER FROM ACQUIRING the claim -- it says nothing about
+    // whether a stale prior holder can still reach the effect boundary
+    // (see PATH-053-F2). OWNERSHIP LIVENESS: an EXPIRED entry is
+    // reclaimable -- this `if`
+    // is the ONLY difference from PATH-052's unconditional
+    // `AlreadyRecovering` on any existing entry.
+    if let Some(owner) = ownership.owners.get(key) {
+        if now < owner.lease_until {
+            return Path053ClaimVerdict::AlreadyRecovering;
+        }
+    }
+
+    ownership.next_token += 1;
+    let token = Path053Token(ownership.next_token);
+    ownership.owners.insert(key.clone(), Path053Owner { owner_id: owner_id.to_string(), token, lease_until: now + PATH_053_LEASE_DURATION });
+    Path053ClaimVerdict::Granted(token)
+}
+
+/// Releases an ownership entry -- but ONLY if `token` still matches the
+/// CURRENT entry, so a late release from a worker that has already been
+/// superseded by a takeover cannot clobber the new owner's claim.
+fn path_053_release(
+    state: &std::sync::Mutex<(Path053RecoveryOwnership, Path048Ledger, Path053FencedProvider)>,
+    key: &OccurrenceKey,
+    token: Path053Token,
+) {
+    let mut guard = state.lock().expect("PATH-053 test state mutex poisoned");
+    let ownership = &mut guard.0;
+    if ownership.owners.get(key).map(|o| o.token) == Some(token) {
+        ownership.owners.remove(key);
+    }
+}
+
+/// Performs the recovery effect through the FENCED path for a caller
+/// that already holds `Granted(token)`, then releases via
+/// `path_053_release`. Returns the fencing verdict directly so a test
+/// can observe rejection without panicking. Two short critical sections
+/// rather than one -- matching this file's existing split-step
+/// convention (`path_052_execute_and_release` is likewise a single call
+/// that itself locks twice via its own two steps in spirit, here made
+/// explicit).
+fn path_053_execute_and_release_fenced(
+    state: &std::sync::Mutex<(Path053RecoveryOwnership, Path048Ledger, Path053FencedProvider)>,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+    token: Path053Token,
+) -> Result<(), Path053FencingRejection> {
+    {
+        let mut guard = state.lock().expect("PATH-053 test state mutex poisoned");
+        let (_ownership, ledger, provider) = &mut *guard;
+        provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), token)?;
+        provider.persist_completion(key.clone(), event.payload.clone());
+        path_048_confirm_settlement(ledger, key);
+    }
+    path_053_release(state, key, token);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Mandatory adversarial cases A-P, plus one supplementary real-thread
+// case (Q).
+// ---------------------------------------------------------------------
+
+/// PATH-053-A -- ABANDONED CLAIM WITHOUT EXPIRY. A owns recovery and
+/// disappears; B attempts takeover strictly BEFORE the lease expires.
+/// Expected: denied, zero B licenses -- LIVE OWNERSHIP-CLAIM EXCLUSION,
+/// unaffected by anything below.
+#[test]
+fn path_053_a_abandoned_claim_before_expiry_denies_takeover() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    assert!(matches!(a_verdict, Path053ClaimVerdict::Granted(_)));
+    // A disappears -- no execute, no release.
+
+    let b_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-B", PATH_053_LEASE_DURATION - 1);
+    assert_eq!(b_verdict, Path053ClaimVerdict::AlreadyRecovering, "lease not yet expired -- B denied");
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0, "zero B licenses -- nothing executed");
+}
+
+/// PATH-053-B -- LEASE EXPIRY RESTORES OWNERSHIP LIVENESS. Once A's
+/// lease expires, B CAN acquire ownership -- LIVENESS ONLY. This test
+/// asserts nothing about whether executing afterward is SAFE (cases
+/// C/D below).
+#[test]
+fn path_053_b_lease_expiry_restores_ownership_liveness() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    let a_token = match a_verdict {
+        Path053ClaimVerdict::Granted(t) => t,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+
+    let b_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    let b_token = match b_verdict {
+        Path053ClaimVerdict::Granted(t) => t,
+        other => panic!("expected Granted once the lease has expired -- ownership LIVENESS restored, got {other:?}"),
+    };
+    assert!(b_token > a_token, "takeover issues a STRICTLY higher token than the abandoned owner held");
+}
+
+/// PATH-053-C/D -- THE PRIMARY WORLDS, and the core proof that lease
+/// expiry alone does not answer EFFECT SAFETY. WORLD A: A's lease
+/// expires, A never executed. WORLD B: A's lease expires, A DID execute,
+/// but left no completion evidence. Every recovery-visible ownership
+/// observable available to B is IDENTICAL between the two worlds BEFORE
+/// B takes over (mirrors PATH-052-H's P0/P1 construction one boundary
+/// further out). B then takes over and executes in both: World A gets
+/// the correct single effect (case C); World B duplicates (case D).
+/// Ground truth differs ONLY as a test oracle, read after B's verdict is
+/// already fixed.
+#[test]
+fn path_053_c_d_lease_takeover_world_a_vs_world_b_cannot_establish_effect_safety() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    // WORLD A: A's lease expires; A never executed.
+    let mut ledger_a = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_a, &contract, ContractVersion(1), CallId(1), &event);
+    let state_a = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger_a, Path053FencedProvider::default()));
+    let a_verdict = path_053_try_acquire_recovery(&state_a, &key, &event, "worker-A", 0);
+    assert!(matches!(a_verdict, Path053ClaimVerdict::Granted(_)));
+    // A's lease expires without executing.
+
+    // WORLD B: A's lease expires; A DID execute, but left no completion
+    // evidence -- models a crash strictly after the effect.
+    let mut ledger_b = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_b, &contract, ContractVersion(1), CallId(1), &event);
+    let state_b = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger_b, Path053FencedProvider::default()));
+    let a_verdict_b = path_053_try_acquire_recovery(&state_b, &key, &event, "worker-A", 0);
+    assert!(matches!(a_verdict_b, Path053ClaimVerdict::Granted(_)));
+    {
+        let mut guard = state_b.lock().unwrap();
+        let provider = &mut guard.2;
+        provider.execute_real_effect_unfenced(key.clone(), payload.clone());
+    }
+    // A's lease expires without persisting completion or releasing.
+
+    // Every recovery-visible ownership observable available to B is
+    // IDENTICAL across both worlds before B acts.
+    {
+        let guard_a = state_a.lock().unwrap();
+        let guard_b = state_b.lock().unwrap();
+        assert_eq!(guard_a.1.records, guard_b.1.records, "identical Reserved(K) record in both worlds");
+        assert_eq!(guard_a.2.query_completion(&key), None, "World A: completion memory absent");
+        assert_eq!(guard_b.2.query_completion(&key), None, "World B: completion memory STILL absent -- release never ran");
+        let owner_a = guard_a.0.owners.get(&key).expect("World A: ownership entry still present");
+        let owner_b = guard_b.0.owners.get(&key).expect("World B: ownership entry still present");
+        assert_eq!(owner_a.token, owner_b.token, "identical token in both worlds -- both worlds' A is the first-ever grant");
+        assert_eq!(owner_a.lease_until, owner_b.lease_until, "identical lease_until in both worlds");
+    }
+
+    // WORKER B takes over in both worlds -- CAN lease expiry alone tell
+    // B whether executing is safe? Expected: NO.
+    let b_verdict_a = path_053_try_acquire_recovery(&state_a, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    let b_verdict_b = path_053_try_acquire_recovery(&state_b, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    let b_token_a = match b_verdict_a { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    let b_token_b = match b_verdict_b { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(b_verdict_a, b_verdict_b, "B receives the SAME takeover verdict in both worlds -- lease expiry carries no effect-safety signal");
+
+    path_053_execute_and_release_fenced(&state_a, &key, &event, b_token_a).expect("World A: fenced execute accepted");
+    path_053_execute_and_release_fenced(&state_b, &key, &event, b_token_b).expect("World B: fenced execute accepted");
+
+    let guard_a = state_a.lock().unwrap();
+    let guard_b = state_b.lock().unwrap();
+    assert_eq!(guard_a.2.ground_truth.real_effect_count, 1, "CASE C -- World A: correct outcome, one total effect");
+    assert_eq!(guard_b.2.ground_truth.real_effect_count, 2, "CASE D -- World B: the SAME lease takeover DUPLICATES an effect that already happened");
+    assert_ne!(
+        guard_a.2.ground_truth.real_effect_count,
+        guard_b.2.ground_truth.real_effect_count,
+        "CORE PROOF: lease expiry restores ownership LIVENESS identically in both worlds, but cannot \
+         establish EFFECT SAFETY -- this reconnects directly to FIND-029's P0/P1 temporal \
+         identifiability ambiguity, one boundary further out than PATH-052-H. STILL UNRESOLVED."
+    );
+}
+
+/// PATH-053-E -- STALE OWNER AFTER LEASE EXPIRY, NO FENCING. A's lease
+/// expires; B takes over and executes; A then RESUMES (a stale in-
+/// process worker that never learned it lost ownership) and executes
+/// too, through the UNFENCED path -- modeling a provider that does not
+/// enforce ownership tokens at all. Expected: BOTH execute.
+#[test]
+fn path_053_e_stale_owner_without_fencing_can_still_execute() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    assert!(matches!(a_verdict, Path053ClaimVerdict::Granted(_)));
+
+    let b_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    assert!(matches!(b_verdict, Path053ClaimVerdict::Granted(_)), "B takes over after expiry");
+    {
+        let mut guard = state.lock().unwrap();
+        guard.2.execute_real_effect_unfenced(key.clone(), payload.clone());
+    }
+
+    // STALE A resumes, unaware it lost ownership, and executes through
+    // the UNFENCED path -- nothing rejects it.
+    {
+        let mut guard = state.lock().unwrap();
+        guard.2.execute_real_effect_unfenced(key.clone(), payload.clone());
+    }
+
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 2,
+        "WITHOUT fencing enforcement, lease-based takeover restores liveness but does NOT guarantee \
+         at-most-one external effect -- the stale owner still executed"
+    );
+}
+
+/// PATH-053-F -- FENCING TOKEN: STALE OWNER REJECTED. Same sequence as
+/// PATH-053-E, but through the FENCED path: A owns token 1, A expires, B
+/// owns token 2 and executes (raising the provider's highest-accepted
+/// record to 2), A resumes and attempts to execute with its OLD token
+/// 1. Expected: A is rejected AT THE DOWNSTREAM EFFECT BOUNDARY --
+/// fencing works here ONLY because `execute_real_effect_fenced` enforces
+/// it; nothing in `Path053RecoveryOwnership` does.
+#[test]
+fn path_053_f_fencing_rejects_stale_owner_after_takeover() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    let a_token = match a_verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(a_token, Path053Token(1), "A owns token 1");
+
+    let b_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    let b_token = match b_verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(b_token, Path053Token(2), "B owns token 2 after takeover");
+
+    path_053_execute_and_release_fenced(&state, &key, &event, b_token).expect("B, the fresh token holder, is accepted");
+
+    // A resumes with its OLD token 1.
+    let a_resume_result = path_053_execute_and_release_fenced(&state, &key, &event, a_token);
+    assert_eq!(
+        a_resume_result,
+        Err(Path053FencingRejection { attempted: Path053Token(1), highest_accepted: Path053Token(2) }),
+        "A is rejected AT THE DOWNSTREAM EFFECT BOUNDARY -- the fenced provider, not the ownership map"
+    );
+
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 1, "exactly one effect -- fencing prevented the stale owner's duplicate");
+}
+
+/// PATH-053-F2 -- STALE OWNER CAN EXECUTE AFTER TAKEOVER, BEFORE THE
+/// PROVIDER OBSERVES THE NEW EPOCH. HORUS CROSS-REVIEW WITNESS:
+/// PATH-053-F only proved the fence rejects a stale token AFTER the
+/// downstream provider has already accepted a newer one. This isolates
+/// the GAP between "ownership epoch advances" and "downstream effect
+/// boundary learns that epoch": A owns token 1, A's lease expires, B
+/// takes over and is issued token 2 -- but B has NOT yet called the
+/// provider, so `highest_accepted_token` has never observed token 2.
+/// Stale A resumes and calls the fenced provider with its OLD token 1
+/// FIRST. Expected under the CURRENT candidate, honestly exposed and NOT
+/// patched to pass: token 1 is ACCEPTED, because nothing has ever been
+/// recorded as higher for this key. B then executes with token 2, also
+/// accepted. `real_effect_count == 2` -- the highest-SEEN-token fence
+/// gives NO immediate revocation the instant ownership changes hands; it
+/// only starts rejecting once a newer token has actually reached the
+/// provider (contrast PATH-053-F, where B executes BEFORE A resumes).
+#[test]
+fn path_053_f2_stale_owner_can_execute_after_takeover_before_provider_observes_new_epoch() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    let a_token = match a_verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(a_token, Path053Token(1), "A owns token 1");
+
+    // A's lease expires. B takes over -- the OWNERSHIP epoch advances to
+    // token 2 -- but B has NOT yet called the provider at all.
+    let b_verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-B", PATH_053_LEASE_DURATION);
+    let b_token = match b_verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(b_token, Path053Token(2), "B owns token 2 after takeover");
+    {
+        let guard = state.lock().unwrap();
+        assert!(
+            guard.2.highest_accepted_token.get(&key).is_none(),
+            "the provider has NOT yet observed ANY token for this key -- the ownership epoch advancing \
+             is invisible to the downstream boundary until an effect call actually arrives there"
+        );
+    }
+
+    // STALE A resumes and executes FIRST, with its OLD token 1 -- before
+    // the provider has ever seen token 2.
+    let a_resume_result = path_053_execute_and_release_fenced(&state, &key, &event, a_token);
+    assert!(
+        a_resume_result.is_ok(),
+        "CURRENT CANDIDATE, HONESTLY EXPOSED (not patched to pass): token 1 is ACCEPTED, because \
+         provider.highest_accepted_token has not yet observed token 2 -- ownership epoch advancing does \
+         NOT by itself fence the old owner"
+    );
+
+    // B then executes with token 2 -- also accepted.
+    let b_result = path_053_execute_and_release_fenced(&state, &key, &event, b_token);
+    assert!(b_result.is_ok(), "B's own, later, genuinely-current token is accepted");
+
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 2,
+        "BOTH the stale owner and the new owner executed: the highest-SEEN-token fence provides NO \
+         immediate revocation at takeover -- it only rejects a stale token AFTER a newer one has \
+         actually reached the provider. NARROWED CLAIM: the tested fence rejects stale effects only \
+         after the downstream boundary has observed a newer fencing epoch, not the instant ownership \
+         itself changes hands."
+    );
+}
+
+/// PATH-053-G -- CURRENT OWNER ACCEPTED. The straightforward accept
+/// path: the caller holding the LATEST token executes successfully.
+#[test]
+fn path_053_g_current_owner_with_latest_token_accepted() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    let token = match verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+    path_053_execute_and_release_fenced(&state, &key, &event, token).expect("current owner with the latest token is accepted");
+
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 1);
+    assert!(guard.0.owners.get(&key).is_none(), "released on completion");
+}
+
+/// PATH-053-H -- DIFFERENT KEYS. K1 and K2 have fully independent
+/// ownership/fencing domains: taking over K1 after its lease expires
+/// does not touch K2's still-live ownership, and each executes exactly
+/// once with no cross-key poisoning (tokens are globally monotonic in
+/// this candidate, but the accept/reject and lease-liveness decisions
+/// are keyed per-occurrence).
+#[test]
+fn path_053_h_different_keys_have_independent_ownership_domains() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("bob", "audit", 25.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let event_2 = path_047_candidate("payroll-system", "evt-2", payload_2.clone());
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(2), CallId(2), &event_2);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let a1 = path_053_try_acquire_recovery(&state, &key_1, &event_1, "worker-A", 0);
+    assert!(matches!(a1, Path053ClaimVerdict::Granted(_)), "K1 acquired");
+    // K1's owner expires; K2 is claimed fresh and stays LIVE the whole time.
+    let a2 = path_053_try_acquire_recovery(&state, &key_2, &event_2, "worker-A", PATH_053_LEASE_DURATION);
+    let a2_token = match a2 { Path053ClaimVerdict::Granted(t) => t, other => panic!("expected Granted, got {other:?}") };
+
+    let b1 = path_053_try_acquire_recovery(&state, &key_1, &event_1, "worker-B", PATH_053_LEASE_DURATION);
+    let b1_token = match b1 { Path053ClaimVerdict::Granted(t) => t, other => panic!("K1's expired lease must be independently reclaimable, got {other:?}") };
+    // K2 is STILL live at this same tick -- a competing attempt is denied.
+    let b2_conflict = path_053_try_acquire_recovery(&state, &key_2, &event_2, "worker-C", PATH_053_LEASE_DURATION);
+    assert_eq!(b2_conflict, Path053ClaimVerdict::AlreadyRecovering, "K2's live ownership is untouched by K1's takeover -- no cross-key poisoning");
+
+    path_053_execute_and_release_fenced(&state, &key_1, &event_1, b1_token).expect("K1 accepted");
+    path_053_execute_and_release_fenced(&state, &key_2, &event_2, a2_token).expect("K2 accepted");
+
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 2, "one effect per key, independently");
+}
+
+/// PATH-053-I -- ALIAS CONVERGENCE. Two raw `SourceId`s resolving, via
+/// AUTHORITY, to the SAME canonical `OccurrenceKey` converge on the SAME
+/// ownership/fencing domain -- mirrors PATH-052-D one boundary further
+/// out. Real threads, one barrier, no sleeps.
+#[test]
+fn path_053_i_alias_convergence_shares_one_ownership_domain() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "both raw labels canonicalize to the SAME OccurrenceKey before any ownership acquisition is attempted");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_a);
+    let state = std::sync::Arc::new(std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default())));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for (key, event, owner_id) in [(key_a.clone(), event_a.clone(), "worker-A"), (key_b.clone(), event_b.clone(), "worker-B")] {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            path_053_try_acquire_recovery(&state, &key, &event, owner_id, 0)
+        }));
+    }
+    let verdicts: Vec<Path053ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| matches!(v, Path053ClaimVerdict::Granted(_))).count();
+    assert_eq!(licenses, 1, "two raw SourceIds resolving to one canonical occurrence converge on the SAME ownership domain, verdicts: {verdicts:?}");
+}
+
+/// PATH-053-J -- PAYLOAD CONFLICT. Rejected before ownership is ever
+/// touched -- the provider/effect boundary is never reached.
+#[test]
+fn path_053_j_payload_conflict_rejected_before_takeover() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_a = path_047_payload("alice", "review", 40.0);
+    let payload_b = path_047_payload("alice", "review", 999.0);
+    let reserved_event = path_047_candidate("payroll-system", "evt-1", payload_a);
+    let conflicting_event = path_047_candidate("payroll-system", "evt-1", payload_b);
+    let key = path_048_occurrence_key(&contract, &reserved_event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &reserved_event);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &conflicting_event, "worker-A", 0);
+    assert_eq!(verdict, Path053ClaimVerdict::Conflicted);
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0);
+    assert!(guard.0.owners.is_empty(), "ownership map untouched by a rejected conflict");
+}
+
+/// PATH-053-K -- COMPLETION PRESENT. Existing, matching completion
+/// evidence needs no takeover -- mirrors PATH-052-F.
+#[test]
+fn path_053_k_completion_present_needs_no_takeover() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path053FencedProvider::default();
+    provider.execute_real_effect_unfenced(key.clone(), payload.clone());
+    provider.persist_completion(key.clone(), payload.clone());
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, provider));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    assert_eq!(verdict, Path053ClaimVerdict::AlreadyComplete, "no takeover execution needed");
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 1, "no NEW effect");
+    assert!(guard.0.owners.is_empty());
+}
+
+/// PATH-053-L -- ALREADY SETTLED. No recovery ownership or effect
+/// permission of any kind -- mirrors PATH-052-G.
+#[test]
+fn path_053_l_already_settled_grants_no_ownership_or_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    path_048_confirm_settlement(&mut ledger, &key);
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default()));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    assert_eq!(verdict, Path053ClaimVerdict::AlreadyComplete);
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0);
+    assert!(guard.0.owners.is_empty());
+}
+
+/// PATH-053-M -- FALSE POSITIVE COMPLETION MEMORY (mirrors PATH-052-J).
+/// Lease/fencing machinery does not cure FIND-029's evidence-soundness
+/// gap: a forged completion record still suppresses a needed effect.
+#[test]
+fn path_053_m_false_positive_completion_memory_still_suppresses_needed_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path053FencedProvider::default();
+    provider.completion_memory.persist(key.clone(), payload.clone());
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, provider));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    assert_eq!(verdict, Path053ClaimVerdict::AlreadyComplete, "lease/fencing does not cure evidence soundness");
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0, "the NEEDED real effect is suppressed exactly as in PATH-052-J/PATH-051-I");
+}
+
+/// PATH-053-N -- FALSE NEGATIVE COMPLETION MEMORY (mirrors PATH-052-K).
+/// Fencing stops stale LIVE owners (case F), but has no way to infer a
+/// PAST, unrecorded effect: only one worker ever runs here (no live
+/// race, nothing for fencing to reject) and it still duplicates.
+#[test]
+fn path_053_n_false_negative_completion_memory_fencing_cannot_infer_history() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path053FencedProvider::default();
+    provider.execute_real_effect_unfenced(key.clone(), payload.clone()); // effect GENUINELY happened
+    assert_eq!(provider.query_completion(&key), None, "completion memory says NOTHING -- the false negative");
+    let state = std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, provider));
+
+    let verdict = path_053_try_acquire_recovery(&state, &key, &event, "worker-A", 0);
+    let token = match verdict { Path053ClaimVerdict::Granted(t) => t, other => panic!("no LIVE race exists for fencing to reject, expected Granted, got {other:?}") };
+    path_053_execute_and_release_fenced(&state, &key, &event, token).expect("fresh token is accepted -- fencing has nothing to reject here");
+
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 2,
+        "fencing prevents stale LIVE owners from executing, but cannot know about a PAST effect \
+         completion memory failed to record -- connects directly to PATH-053-C/D and FIND-029's P0/P1"
+    );
+}
+
+/// PATH-053-O -- TOKEN REUSE / NON-MONOTONIC EPOCH, isolated at the
+/// PROVIDER boundary (bypassing ownership/ledger entirely -- this is
+/// specifically a claim about `execute_real_effect_fenced`'s own rule,
+/// not about ownership acquisition). After token 2 has been accepted,
+/// REPLAYING the older token 1 is rejected; RE-using the current highest
+/// token 2 again is still accepted (>=, not >, matching the mission's
+/// stated rule).
+#[test]
+fn path_053_o_token_reuse_after_newer_token_exists_is_rejected() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut provider = Path053FencedProvider::default();
+    provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(2)).expect("token 2 accepted as the first-ever token for this key");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+
+    let replay = provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(1));
+    assert_eq!(replay, Err(Path053FencingRejection { attempted: Path053Token(1), highest_accepted: Path053Token(2) }), "an OLDER token is rejected once a newer one has been accepted");
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "the rejected replay executes nothing");
+
+    let retry_same = provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(2));
+    assert!(retry_same.is_ok(), "re-presenting the CURRENT highest token (>=, not >) is still accepted");
+    assert_eq!(provider.ground_truth.real_effect_count, 2);
+}
+
+/// PATH-053-P -- OWNERSHIP WRAP / RESET / LOST EPOCH MEMORY. STOP
+/// CONDITION, recorded and not solved further. If the provider's own
+/// `highest_accepted_token` record for a key is lost (a restart,
+/// migration, or storage failure of THAT memory specifically -- not the
+/// ground truth, not the ledger), a stale token that was previously
+/// rejected becomes ACCEPTED again, because nothing durable remembers it
+/// was ever superseded. This exposes a NEW trust/durability boundary --
+/// fencing epoch memory must itself be durable and authoritative --
+/// deliberately NOT solved here. See FIND-031's stop-condition section;
+/// recommended next PATH: PATH-054.
+#[test]
+fn path_053_p_lost_fencing_epoch_memory_reopens_stale_owner_execution() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut provider = Path053FencedProvider::default();
+    provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(2)).expect("token 2 accepted");
+    let stale_rejected = provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(1));
+    assert!(stale_rejected.is_err(), "token 1 correctly rejected while epoch memory is intact");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+
+    // The provider's fencing-epoch memory for THIS key is lost -- e.g. a
+    // restart of just that record, distinct from ground truth (which
+    // this experiment can never let recovery logic see) and distinct
+    // from the ledger (unaffected here).
+    provider.highest_accepted_token.remove(&key);
+
+    let stale_now_accepted = provider.execute_real_effect_fenced(key.clone(), event.payload.clone(), Path053Token(1));
+    assert!(
+        stale_now_accepted.is_ok(),
+        "STOP CONDITION: once fencing-epoch memory for a key is lost, the SAME stale token that was \
+         correctly rejected above is now silently accepted again"
+    );
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "NEW trust/durability boundary exposed, NOT solved here: fencing only works as long as its own \
+         epoch memory is itself durable and authoritative. Recorded per this mission's stop condition -- \
+         recommended next PATH: PATH-054."
+    );
+}
+
+/// PATH-053-Q (supplementary, real threads) -- LIVE OWNERSHIP-CLAIM
+/// EXCLUSION holds under real concurrent racing while the lease is
+/// still live: N
+/// workers race to acquire the SAME occurrence at `now = 0`, one
+/// barrier, no sleeps, no scheduler-dependent correctness claimed --
+/// only the COUNT of `Granted` verdicts is asserted.
+#[test]
+fn path_053_q_real_threads_live_exclusion_holds_under_racing() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Arc::new(std::sync::Mutex::new((Path053RecoveryOwnership::default(), ledger, Path053FencedProvider::default())));
+
+    const WORKERS: usize = 8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+    let mut handles = Vec::new();
+    for i in 0..WORKERS {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        let event = event.clone();
+        handles.push(std::thread::spawn(move || {
+            let owner_id = format!("worker-{i}");
+            barrier.wait();
+            path_053_try_acquire_recovery(&state, &key, &event, &owner_id, 0)
+        }));
+    }
+    let verdicts: Vec<Path053ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| matches!(v, Path053ClaimVerdict::Granted(_))).count();
+    assert_eq!(licenses, 1, "exactly one winner among {WORKERS} racing workers at a fixed logical tick, verdicts: {verdicts:?}");
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+//
+// H24 CONFIRMED for the tested candidate, NARROWED after HORUS cross-
+// review (PATH-053-F2): a time-bounded, replaceable recovery-ownership
+// entry (`Path053RecoveryOwnership`) restores OWNERSHIP LIVENESS for an
+// abandoned claim (B) without weakening LIVE OWNERSHIP-CLAIM EXCLUSION
+// while the lease is still live (A, Q). But lease expiry alone answers ONLY
+// liveness: PATH-053-C/D constructs two recovery-visible-IDENTICAL
+// worlds and shows the SAME takeover verdict in both, while total effect
+// count silently differs (1 vs 2) -- EFFECT SAFETY is a SEPARATE axis
+// lease expiry does not touch.
+//
+// NARROWED FENCING CLAIM (post-F2): the tested highest-SEEN-token fence,
+// enforced AT THE PROVIDER'S OWN EFFECT BOUNDARY, rejects a stale token
+// ONLY AFTER that boundary has already observed a newer one (E vs F: an
+// identical stale-owner-resumes scenario, unfenced duplicates, fenced
+// rejects -- but ONLY because B's own execute call reached the provider
+// FIRST). It does NOT immediately revoke the old owner's ability to
+// execute the instant OWNERSHIP itself changes hands: PATH-053-F2
+// reverses F's ordering -- B is issued token 2 but has not yet CALLED
+// the provider -- and shows stale A's token 1 is ACCEPTED, then B's
+// token 2 is also accepted, `real_effect_count == 2`. There is a real
+// gap between "the ownership epoch advances" and "the downstream effect
+// boundary learns that epoch"; this candidate does not close it. Not
+// called general "effect safety" for this reason.
+//
+// SAME-TOKEN REPLAY IS A SEPARATE, ALSO-OPEN GAP (O): fencing token
+// freshness is NOT operation idempotency. A fencing token can reject an
+// OLDER owner's token; it does NOT deduplicate repeated effect calls
+// carrying the SAME valid (current-highest) token -- O demonstrates
+// token 2 accepted, then token 2 presented again, accepted AGAIN,
+// `real_effect_count == 2`. No exactly-once or at-most-once external
+// effect semantics are claimed anywhere in this file.
+//
+// G/H/I/J/K/L mirror PATH-052's non-owner-crash cases one boundary
+// further out, confirming nothing about payload conflict, settlement,
+// completion-present, already-settled, alias convergence, or per-key
+// independence changed by adding lease+fencing.
+//
+// TEMPORAL IDENTIFIABILITY (FIND-029's P0/P1) REMAINS OPEN, EXACTLY AS
+// BEFORE, and would remain open even under a PERFECT epoch-propagation
+// fix to the F2 gap: M shows forged completion evidence still suppresses
+// a needed effect; N shows a genuinely-past, unrecorded effect still
+// gets duplicated by an HONEST single grant -- fencing has nothing to
+// reject because no live race ever occurred. C/D is the direct, executed
+// proof that stale-owner prevention and historical-effect knowledge are
+// different questions with different answers; F2 adds a THIRD, distinct
+// question (did the downstream boundary learn the new epoch yet?) that
+// is also not the same as either.
+//
+// STOP CONDITIONS REACHED, NOT SOLVED HERE -- deliberately only these,
+// per this mission's instruction not to build a cathedral:
+//   (1, PATH-053-P) fencing's own protection is contingent on
+//       `highest_accepted_token` being durable and authoritative --
+//       losing that record for one key silently reopens exactly the
+//       stale-owner duplication F closed.
+//   (2, PATH-053-F2) authoritative epoch PROPAGATION to the downstream
+//       effect boundary is itself a gap: advancing ownership does not
+//       by itself fence a stale owner still racing to call the provider
+//       before the new epoch ever reaches it.
+// Recommended next PATH: PATH-054 -- durable/authoritative fencing-epoch
+// memory AND its propagation to the effect boundary before a takeover is
+// considered enforceable, plus (per this mission's later questions) same-
+// token-retry idempotency, which epoch-propagation does not solve either.
+//
+// KNOWN FROM LITERATURE (PKV-TRANSACTION-RECOVERY-MAP-001.md, read for
+// terminology/context only -- nothing below is claimed as tested by
+// PATH-053 itself, and no source is claimed to PROVE this file's
+// result): leases (Kleppmann, ch. 8) are the named mechanism for
+// OWNERSHIP LIVENESS over an abandoned claim holder; fencing tokens
+// (Kleppmann, ch. 8) are the named mechanism for EFFECT SAFETY against a
+// stale writer, but ONLY when a downstream resource/effect boundary
+// actually enforces them AND has already learned the current epoch --
+// exactly the distinction PATH-053-E/F/F2 exercises directly, and
+// exactly the FIND-030/FIND-031 cross-review corrections this PATH was
+// commissioned to make executable.
+//
+// NOT ESTABLISHED: that a single global monotonic token counter, a
+// std::sync::Mutex, or lease-based ownership in general are the ONLY or
+// universally necessary mechanisms -- only that THIS candidate achieves
+// the tested properties under the tested cases. That per-key token
+// counters would behave any differently (likely not, but not measured).
+// Any resolution of PATH-053-P's fencing-epoch-durability gap or
+// PATH-053-F2's epoch-propagation gap. Any same-token-retry idempotency
+// mechanism. Real external provider or lease-service behavior --
+// `Path053FencedProvider` remains this experiment's own test-only
+// construction. Any novel theoretical result -- Section 2 of
+// PKV-TRANSACTION-RECOVERY-MAP-001.md's mappings remain standard,
+// decades-old concepts.
+//
+// NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, PRODUCTION UNTOUCHED.
