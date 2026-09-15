@@ -17669,3 +17669,865 @@ fn path_051_concurrent_recovery_probe_two_unsynchronized_workers_both_execute() 
 // sequence, exactly-one-license-style counting) was NOT built here; it
 // is flagged as the most likely next PATH, kept deliberately out of
 // this experiment's scope per the mission brief.
+
+// =====================================================================
+// PATH-052 -- CONCURRENT RECOVERY OF ONE IN-DOUBT OCCURRENCE (H23)
+//
+// H23: once K is already Reserved and completion evidence is absent,
+// concurrent recovery attempts require their OWN single-winner boundary
+// before recovery-effect permission is issued -- distinct from PATH-049's
+// Absent -> Reserved(K) claim boundary, which does not by itself
+// serialize LATER recovery decisions over an occurrence it already
+// claimed.
+//
+// PATH-049:  Absent            -> Reserved(K)
+// PATH-052:  Reserved(K) + completion unknown -> recovery-effect permission
+//
+// CRITICAL NON-SOLUTION (do not let this drift): serializing concurrent
+// recoverers against EACH OTHER is a completely different property from
+// resolving FIND-029's P0/P1 ambiguity (whether an unrecorded prior
+// effect already happened). PATH-052-H is the load-bearing test that
+// keeps these separate; nothing below should be read as closing P0/P1.
+//
+// SAFETY METRIC: recovery-effect LICENSES and real EXECUTIONS, counted
+// directly -- never final map/set cardinality, which collapses multiple
+// executions onto one surviving row (PATH-052-A makes this explicit).
+// =====================================================================
+
+/// PATH-052's own recovery-claim state -- deliberately SEPARATE from
+/// `Path048Ledger.records` (PATH-048/049's Reserved/Settled claim
+/// boundary) and from `Path051SplitProvider` (ground truth / completion
+/// memory). Models exactly one new fact: has some worker already been
+/// granted permission to attempt THIS canonical occurrence's recovery
+/// effect, and not yet finished (released)? Membership alone is what is
+/// tested here -- no owner identity, token, timestamp, or expiry is
+/// modeled (see PATH-052-I, where that absence is the whole point).
+#[derive(Debug, Clone, Default)]
+struct Path052RecoveryClaims {
+    in_flight: std::collections::HashSet<OccurrenceKey>,
+}
+
+/// The recovery-CLAIM verdict -- distinct from `Path051RecoveryVerdict`
+/// (which conflates "permission granted" with "effect executed" into one
+/// `EffectExecutedNowSettled` state). PATH-052 needs the permission step
+/// isolated so a test can observe TWO grants before either worker acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path052ClaimVerdict {
+    /// Permission granted: this caller may proceed to attempt the
+    /// recovery effect. The ONLY state this experiment counts as a
+    /// "recovery-effect license."
+    Granted,
+    /// Local `Settled` record, or provider completion memory, already
+    /// matches this payload -- reconstructs `Settled` locally if needed;
+    /// no execution, nothing claimed.
+    AlreadyComplete,
+    /// Local `Reserved`/`Settled` payload, or provider completion
+    /// memory, disagrees with the incoming request. Rejected before the
+    /// provider's effect boundary is reached.
+    Conflicted,
+    /// K is not `Reserved` at all (absent). Never collapsed into
+    /// `Granted`.
+    Unresolved,
+    /// Another worker already holds this occurrence's recovery claim and
+    /// has not released it. NOT itself evidence about ground truth --
+    /// see PATH-052-I: this says nothing about whether that worker is
+    /// still legitimately working, crashed before the effect, or crashed
+    /// after it.
+    AlreadyRecovering,
+}
+
+/// DELIBERATELY NAIVE (never adopted): checks recovery permission with
+/// NOTHING enforcing exclusion against any other concurrent caller --
+/// the recovery-decision analogue of PATH-049-A's naive split
+/// check/reserve. Reads only `ledger.records` and
+/// `provider.query_completion`, exactly like `path_051_recover`, but
+/// returns BEFORE acting so two callers can be forced to both observe
+/// `Granted` prior to either executing anything (PATH-052-A).
+fn path_052_naive_check_recovery_permission(
+    ledger: &Path048Ledger,
+    provider: &Path051SplitProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) -> Path052ClaimVerdict {
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            return if *payload == event.payload {
+                Path052ClaimVerdict::AlreadyComplete
+            } else {
+                Path052ClaimVerdict::Conflicted
+            };
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path052ClaimVerdict::Conflicted;
+            }
+        }
+        None => return Path052ClaimVerdict::Unresolved,
+    }
+    match provider.query_completion(key) {
+        Some(existing) if existing == event.payload => Path052ClaimVerdict::AlreadyComplete,
+        Some(_) => Path052ClaimVerdict::Conflicted,
+        None => Path052ClaimVerdict::Granted,
+    }
+}
+
+/// Performs the recovery effect for a caller that already holds
+/// `Granted` permission from the NAIVE check above. Deliberately a
+/// separate call, so two naive callers can each act on their own
+/// already-stale `Granted` result (PATH-052-A) -- exactly the TOCTOU
+/// shape PATH-049-A used for the original claim boundary.
+fn path_052_naive_act_after_permission(
+    ledger: &mut Path048Ledger,
+    provider: &mut Path051SplitProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) {
+    provider.execute_real_effect(key.clone(), event.payload.clone());
+    provider.persist_completion(key.clone(), event.payload.clone());
+    path_048_confirm_settlement(ledger, key);
+}
+
+/// THE TESTED SINGLE-WINNER CANDIDATE: one indivisible critical section
+/// spanning the completion-memory check AND the recovery-claim grant --
+/// the recovery-decision analogue of PATH-049's `path_049_atomic_claim`.
+/// A `std::sync::Mutex` guarding `(claims, ledger, provider)` together is
+/// the smallest mechanism that fits this file's existing machinery, NOT
+/// a claim that a Mutex, or serialization in general, is the only or
+/// universally necessary shape -- see FIND-030's scope note. This
+/// candidate's own logical linearization point is precisely the
+/// `claims.in_flight.insert(key.clone())` below: whichever caller's
+/// insert executes while holding the lock, when `key` was not already a
+/// member, is the sole winner; that is a property of THIS candidate, not
+/// a general theorem about recovery boundaries.
+fn path_052_try_claim_recovery(
+    state: &std::sync::Mutex<(Path052RecoveryClaims, Path048Ledger, Path051SplitProvider)>,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) -> Path052ClaimVerdict {
+    let mut guard = state.lock().expect("PATH-052 test state mutex poisoned");
+    let (claims, ledger, provider) = &mut *guard;
+
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            return if *payload == event.payload {
+                Path052ClaimVerdict::AlreadyComplete
+            } else {
+                Path052ClaimVerdict::Conflicted
+            };
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path052ClaimVerdict::Conflicted;
+            }
+        }
+        None => return Path052ClaimVerdict::Unresolved,
+    }
+
+    match provider.query_completion(key) {
+        Some(existing) if existing == event.payload => {
+            path_048_confirm_settlement(ledger, key);
+            return Path052ClaimVerdict::AlreadyComplete;
+        }
+        Some(_) => return Path052ClaimVerdict::Conflicted,
+        None => {}
+    }
+
+    if claims.in_flight.contains(key) {
+        return Path052ClaimVerdict::AlreadyRecovering;
+    }
+    claims.in_flight.insert(key.clone());
+    Path052ClaimVerdict::Granted
+}
+
+/// Performs the recovery effect for a caller that already holds
+/// `Granted` permission from `path_052_try_claim_recovery`, then releases
+/// the recovery claim. Deliberately a SEPARATE call -- exactly so a test
+/// can model a crash between claim and effect, or between effect and
+/// release (PATH-052-I), the same way PATH-048 splits Reserve from
+/// Confirm.
+fn path_052_execute_and_release(
+    state: &std::sync::Mutex<(Path052RecoveryClaims, Path048Ledger, Path051SplitProvider)>,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+) {
+    let mut guard = state.lock().expect("PATH-052 test state mutex poisoned");
+    let (claims, ledger, provider) = &mut *guard;
+    provider.execute_real_effect(key.clone(), event.payload.clone());
+    provider.persist_completion(key.clone(), event.payload.clone());
+    path_048_confirm_settlement(ledger, key);
+    claims.in_flight.remove(key);
+}
+
+// ---------------------------------------------------------------------
+// Mandatory adversarial cases A-K.
+// ---------------------------------------------------------------------
+
+/// PATH-052-A (PRIMARY LOSING WITNESS) -- deterministic interleaving, no
+/// threads, no scheduler dependence: both workers observe recovery
+/// permission BEFORE either acts, exactly mirroring PATH-049-A's TOCTOU
+/// shape one boundary later. Asserts LICENSES and EXECUTIONS directly --
+/// never final map cardinality.
+#[test]
+fn path_052_a_naive_same_k_recovery_race_yields_two_licenses_and_two_executions() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    let v = path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    assert_eq!(v, Path048Verdict::New, "K starts Reserved; completion memory starts absent");
+
+    let mut provider = Path051SplitProvider::default();
+
+    // WORKER A and WORKER B both check recovery permission BEFORE either
+    // acts -- forced deterministically.
+    let a_permission = path_052_naive_check_recovery_permission(&ledger, &provider, &key, &event);
+    let b_permission = path_052_naive_check_recovery_permission(&ledger, &provider, &key, &event);
+    assert_eq!(a_permission, Path052ClaimVerdict::Granted);
+    assert_eq!(b_permission, Path052ClaimVerdict::Granted);
+    let licenses = [a_permission, b_permission].iter().filter(|v| **v == Path052ClaimVerdict::Granted).count();
+    assert_eq!(
+        licenses, 2,
+        "PRIMARY LOSING WITNESS: recovery_effect_licenses == 2 for one canonical occurrence"
+    );
+
+    // Both proceed from their own already-stale `Granted` result.
+    path_052_naive_act_after_permission(&mut ledger, &mut provider, &key, &event);
+    path_052_naive_act_after_permission(&mut ledger, &mut provider, &key, &event);
+
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "PRIMARY LOSING WITNESS: real_effect_count == 2 -- LICENSES and EXECUTIONS are the safety \
+         metric"
+    );
+    // Final map cardinality does NOT prove one economic effect: exactly
+    // one completion row and one Settled record survive despite two real
+    // executions having occurred.
+    assert_eq!(
+        provider.completion_memory.receipts.len(),
+        1,
+        "one surviving completion ROW despite two real executions -- cardinality is not the safety \
+         metric"
+    );
+    assert!(matches!(ledger.records.get(&key), Some(SettlementRecord::Settled { .. })));
+}
+
+/// PATH-052-A2, SUPPLEMENTARY: the same naive race under real threads.
+/// Made deterministic (not scheduler-dependent) with a SECOND barrier
+/// forcing both workers' checks to complete before either worker acts --
+/// without it, a fast worker can complete check-then-act before the
+/// other's check even runs, hiding the race (observed directly: an
+/// earlier version of this test without the second barrier flaked to
+/// `[AlreadyComplete, Granted]`). The deterministic PATH-052-A witness
+/// above remains authoritative regardless.
+#[test]
+fn path_052_a2_real_threads_naive_recovery_race_confirms_duplicate_licenses() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new((ledger, Path051SplitProvider::default())));
+    let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let checked_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let shared = std::sync::Arc::clone(&shared);
+        let start_barrier = std::sync::Arc::clone(&start_barrier);
+        let checked_barrier = std::sync::Arc::clone(&checked_barrier);
+        let event = event.clone();
+        let key = key.clone();
+        handles.push(std::thread::spawn(move || {
+            start_barrier.wait();
+            let permission = {
+                let guard = shared.lock().unwrap();
+                path_052_naive_check_recovery_permission(&guard.0, &guard.1, &key, &event)
+            };
+            // Forces BOTH workers' checks to complete before either acts
+            // -- the real-thread analogue of PATH-052-A's forced
+            // ordering.
+            checked_barrier.wait();
+            if permission == Path052ClaimVerdict::Granted {
+                let mut guard = shared.lock().unwrap();
+                let (ledger, provider) = &mut *guard;
+                path_052_naive_act_after_permission(ledger, provider, &key, &event);
+            }
+            permission
+        }));
+    }
+    let verdicts: Vec<Path052ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| **v == Path052ClaimVerdict::Granted).count();
+    assert_eq!(licenses, 2, "real threads: two recovery-effect licenses, verdicts: {verdicts:?}");
+    let guard = shared.lock().unwrap();
+    assert_eq!(guard.1.ground_truth.real_effect_count, 2, "real threads: two real effect executions for one occurrence");
+}
+
+/// PATH-052-B -- SINGLE-WINNER SAME-K, real concurrent threads. Asserts
+/// exactly one `Granted`; the loser observes `AlreadyRecovering`. Says
+/// NOTHING about whether an unknown PREVIOUS effect already happened
+/// before recovery began -- see PATH-052-H.
+#[test]
+fn path_052_b_single_winner_same_k_yields_exactly_one_recovery_license() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Arc::new(std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default())));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let event = event.clone();
+        let key = key.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            path_052_try_claim_recovery(&state, &key, &event)
+        }));
+    }
+    let verdicts: Vec<Path052ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| **v == Path052ClaimVerdict::Granted).count();
+    assert_eq!(licenses, 1, "exactly ONE recovery-effect license under concurrent racing, verdicts: {verdicts:?}");
+    assert!(
+        verdicts.iter().any(|v| *v == Path052ClaimVerdict::AlreadyRecovering),
+        "the losing caller observes AlreadyRecovering, verdicts: {verdicts:?}"
+    );
+
+    // The winner performs the effect exactly once. This says NOTHING
+    // about whether an unknown PREVIOUS effect already happened before
+    // recovery began -- see PATH-052-H.
+    path_052_execute_and_release(&state, &key, &event);
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 1,
+        "exactly one execution attributable to concurrent recovery workers"
+    );
+}
+
+/// PATH-052-B2, repeated real-thread races to catch obvious flakiness:
+/// 25 independent iterations, 4 racing workers each (100 racing attempts
+/// total), fresh state per iteration.
+#[test]
+fn path_052_b2_single_winner_repeated_real_thread_races_stay_exactly_one_license() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    for iteration in 0..25 {
+        let payload = path_047_payload("alice", "review", 40.0);
+        let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+        let key = path_048_occurrence_key(&contract, &event).unwrap();
+        let mut ledger = Path048Ledger::new_attested_genesis();
+        path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+        let state = std::sync::Arc::new(std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default())));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let state = std::sync::Arc::clone(&state);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let event = event.clone();
+            let key = key.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                path_052_try_claim_recovery(&state, &key, &event)
+            }));
+        }
+        let verdicts: Vec<Path052ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let licenses = verdicts.iter().filter(|v| **v == Path052ClaimVerdict::Granted).count();
+        assert_eq!(
+            licenses, 1,
+            "iteration {iteration}: exactly one recovery-effect license across 4 racing workers, \
+             verdicts: {verdicts:?}"
+        );
+    }
+}
+
+/// PATH-052-C -- DIFFERENT KEYS recover independently. A global Mutex
+/// guarding the whole `(claims, ledger, provider)` tuple serializes
+/// EXECUTION across unrelated keys (a recorded LIMITATION of this
+/// candidate's simplicity, mirroring PATH-049-E's identical caveat about
+/// its whole-ledger lock) but must not couple their ECONOMIC outcomes.
+#[test]
+fn path_052_c_different_keys_recover_independently_without_cross_key_coalescing() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", path_047_payload("alice", "review-1", 40.0));
+    let event_2 = path_047_candidate("payroll-system", "evt-2", path_047_payload("alice", "review-2", 25.0));
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_2);
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+
+    let state = std::sync::Arc::new(std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default())));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (key, event) in [(key_1.clone(), event_1.clone()), (key_2.clone(), event_2.clone())] {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            path_052_try_claim_recovery(&state, &key, &event)
+        }));
+    }
+    let verdicts: Vec<Path052ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(
+        verdicts.iter().all(|v| *v == Path052ClaimVerdict::Granted),
+        "DIFFERENT occurrence keys must both be granted independently, verdicts: {verdicts:?}"
+    );
+
+    path_052_execute_and_release(&state, &key_1, &event_1);
+    path_052_execute_and_release(&state, &key_2, &event_2);
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 2,
+        "one winner for K1, one winner for K2 -- no cross-key coalescing or starvation"
+    );
+    // LIMITATION, recorded not hidden: this candidate locks the WHOLE
+    // tuple for each call's duration, so EXECUTION of K1 and K2 is
+    // serialized relative to each other even though their ECONOMIC
+    // claim decisions are not coupled -- reduced parallelism is a
+    // property of this candidate's chosen simplicity, not a general
+    // requirement (a per-key lock, or per-key claim set with a finer
+    // lock, would avoid it and was not built here).
+}
+
+/// PATH-052-D -- ALIAS CONVERGENCE. Two raw `SourceId`s resolving, via
+/// AUTHORITY, to the SAME canonical `NamespaceId`/`OccurrenceKey`
+/// converge on the SAME recovery claim domain. SCOPE NOTE (mirrors
+/// PATH-049-F): canonicalization (`contract.authority_for`) is resolved
+/// by the caller BEFORE either thread ever touches `state` -- this does
+/// NOT establish that canonicalization must physically execute inside
+/// the recovery lock, only that the synchronization domain must key on
+/// the resolved canonical identity, never on a raw source label.
+#[test]
+fn path_052_d_alias_convergence_recovery_claims_share_one_domain() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "both raw labels canonicalize to the SAME OccurrenceKey before any recovery claim is attempted");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_a);
+    let state = std::sync::Arc::new(std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default())));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for (key, event) in [(key_a.clone(), event_a.clone()), (key_b.clone(), event_b.clone())] {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            path_052_try_claim_recovery(&state, &key, &event)
+        }));
+    }
+    let verdicts: Vec<Path052ClaimVerdict> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let licenses = verdicts.iter().filter(|v| **v == Path052ClaimVerdict::Granted).count();
+    assert_eq!(
+        licenses, 1,
+        "two raw SourceIds resolving to one canonical occurrence converge on the SAME recovery \
+         claim domain, verdicts: {verdicts:?}"
+    );
+}
+
+/// PATH-052-E -- PAYLOAD CONFLICT. A recovery request against an
+/// existing `Reserved(K, payload_A)` with a different payload is
+/// rejected locally; the provider/effect boundary is never reached.
+#[test]
+fn path_052_e_payload_conflict_yields_zero_recovery_licenses() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_a = path_047_payload("alice", "review", 40.0);
+    let payload_b = path_047_payload("alice", "review", 999.0);
+    let reserved_event = path_047_candidate("payroll-system", "evt-1", payload_a);
+    let conflicting_event = path_047_candidate("payroll-system", "evt-1", payload_b);
+    let key = path_048_occurrence_key(&contract, &reserved_event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &reserved_event);
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default()));
+
+    let verdict = path_052_try_claim_recovery(&state, &key, &conflicting_event);
+    assert_eq!(verdict, Path052ClaimVerdict::Conflicted);
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0, "provider/effect boundary is never reached");
+    assert!(guard.0.in_flight.is_empty(), "zero recovery licenses -- nothing claimed");
+}
+
+/// PATH-052-F -- COMPLETION ALREADY PRESENT. Existing, matching provider
+/// completion memory reconstructs `Settled` locally and grants no new
+/// recovery effect -- mirrors `path_051_recover`'s own `AlreadyComplete`
+/// branch. Does NOT generalize forged-positive safety beyond FIND-029's
+/// already-known soundness boundary -- see PATH-052-J.
+#[test]
+fn path_052_f_completion_already_present_grants_no_new_recovery_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload.clone());
+    provider.persist_completion(key.clone(), payload.clone());
+
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, provider));
+    let verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(
+        verdict,
+        Path052ClaimVerdict::AlreadyComplete,
+        "existing, matching completion memory reconstructs Settled locally -- no Granted permission \
+         issued"
+    );
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 1, "no NEW recovery effect executes");
+    assert!(matches!(guard.1.records.get(&key), Some(SettlementRecord::Settled { .. })));
+}
+
+/// PATH-052-G -- ALREADY SETTLED. Zero recovery licenses, zero
+/// executions.
+#[test]
+fn path_052_g_already_settled_yields_zero_recovery_licenses_and_executions() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    path_048_confirm_settlement(&mut ledger, &key);
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default()));
+
+    let verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(verdict, Path052ClaimVerdict::AlreadyComplete);
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0);
+    assert!(guard.0.in_flight.is_empty());
+}
+
+/// PATH-052-H (MOST IMPORTANT SCOPE GUARD): construct WORLD 0 (P0: effect
+/// never happened) and WORLD 1 (P1: effect already happened, completion
+/// memory lost) with IDENTICAL recovery-visible state -- the same
+/// construction PATH-051-C used. Run the SAME single-winner recovery
+/// candidate against each. A perfect single-winner mechanism prevents
+/// concurrent recoverers from duplicating EACH OTHER (both worlds get
+/// exactly one `Granted`, zero races) but CANNOT distinguish P0 from P1:
+/// concurrency safety and temporal identifiability are different axes.
+#[test]
+fn path_052_h_single_winner_recovery_cannot_distinguish_p0_from_p1() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    // WORLD 0 (P0): the effect never happened.
+    let mut ledger_0 = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_0, &contract, ContractVersion(1), CallId(1), &event);
+    let provider_0 = Path051SplitProvider::default();
+    assert_eq!(provider_0.ground_truth.real_effect_count, 0, "World 0: effect never happened");
+
+    // WORLD 1 (P1): the effect already happened; completion memory
+    // persistence was lost.
+    let mut ledger_1 = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_1, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider_1 = Path051SplitProvider::default();
+    provider_1.execute_real_effect(key.clone(), payload.clone());
+    assert_eq!(provider_1.ground_truth.real_effect_count, 1, "World 1: effect already happened once");
+
+    // RECOVERY-VISIBLE STATE IS IDENTICAL in both worlds.
+    assert_eq!(ledger_0.records, ledger_1.records, "identical Reserved(K) record in both worlds");
+    assert_eq!(provider_0.query_completion(&key), None);
+    assert_eq!(provider_1.query_completion(&key), None, "identical -- absent completion memory in both worlds");
+
+    let state_0 = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger_0, provider_0));
+    let verdict_0 = path_052_try_claim_recovery(&state_0, &key, &event);
+    assert_eq!(verdict_0, Path052ClaimVerdict::Granted);
+    path_052_execute_and_release(&state_0, &key, &event);
+
+    let state_1 = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger_1, provider_1));
+    let verdict_1 = path_052_try_claim_recovery(&state_1, &key, &event);
+    assert_eq!(verdict_1, Path052ClaimVerdict::Granted);
+    path_052_execute_and_release(&state_1, &key, &event);
+
+    let guard_0 = state_0.lock().unwrap();
+    let guard_1 = state_1.lock().unwrap();
+    assert_eq!(guard_0.2.ground_truth.real_effect_count, 1, "World 0: recovery correctly performs the needed effect once");
+    assert_eq!(guard_1.2.ground_truth.real_effect_count, 2, "World 1: the SAME single-winner recovery DUPLICATES an effect that already happened");
+    assert_ne!(
+        guard_0.2.ground_truth.real_effect_count,
+        guard_1.2.ground_truth.real_effect_count,
+        "MOST IMPORTANT SCOPE GUARD: a perfect single-winner recovery mechanism prevents concurrent \
+         recoverers from duplicating EACH OTHER (both worlds got exactly one Granted permission, \
+         zero races), but cannot distinguish P0 from P1 -- concurrency safety and temporal \
+         identifiability are different axes; PATH-052 solves only the first, exactly as FIND-029 \
+         already established for the un-serialized case. STILL UNRESOLVED."
+    );
+}
+
+/// PATH-052-I -- RECOVERY OWNER CRASH, minimal probe only. Worker A wins
+/// recovery ownership, then crashes before calling
+/// `path_052_execute_and_release` at all. Worker B observes
+/// `AlreadyRecovering` and can infer NOTHING further: no owner identity,
+/// token, timestamp, or expiry exists in this candidate. STOP CONDITION
+/// reached per this mission's brief -- recorded, not solved. See FIND-030
+/// for the recommended next PATH (abandoned recovery ownership / fencing
+/// / ownership epochs / leases).
+#[test]
+fn path_052_i_recovery_owner_crash_leaves_an_unresolvable_ambiguity_for_the_next_worker() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, Path051SplitProvider::default()));
+
+    // WORKER A wins recovery ownership...
+    let a_verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(a_verdict, Path052ClaimVerdict::Granted);
+    // ...then CRASHES before calling `path_052_execute_and_release` at
+    // all -- no effect, no release. The claim remains held forever;
+    // nothing in this candidate's state models ownership expiry.
+
+    // WORKER B now attempts recovery for the SAME occurrence.
+    let b_verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(
+        b_verdict,
+        Path052ClaimVerdict::AlreadyRecovering,
+        "B observes the claim A left behind -- indistinguishable from A still legitimately working"
+    );
+
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 0,
+        "the needed effect has executed ZERO times and B has no license to attempt it"
+    );
+
+    // AMBIGUITY, RECORDED AND NOT SOLVED: `AlreadyRecovering` carries no
+    // owner identity, token, timestamp, or expiry -- B cannot safely
+    // infer whether A is still working, crashed before the effect (safe
+    // to take over), or crashed AFTER the effect but before release
+    // (taking over would duplicate it). Not solved here with leases,
+    // fencing, or epochs -- deliberately, per this mission's brief.
+}
+
+/// PATH-052-I2 -- DUAL-WORLD RECOVERY-OWNER CRASH. PATH-052-I above only
+/// EXECUTES the "A crashes BEFORE the effect" world; the "A crashes
+/// AFTER the effect but before release" world was previously asserted in
+/// prose only. This test constructs BOTH worlds directly and shows every
+/// recovery-visible observable available to B (the ledger record, the
+/// provider's completion memory, and the in-flight claim set) is
+/// IDENTICAL between them, so B receives the SAME `AlreadyRecovering`
+/// verdict in both. `real_effect_count` is read only as a TEST ORACLE
+/// after B's verdict is already fixed -- never as recovery input.
+#[test]
+fn path_052_i2_dual_world_recovery_owner_crash_is_observationally_identical_to_b() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    // WORLD 0: A wins the claim, then crashes BEFORE the effect.
+    let mut ledger_0 = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_0, &contract, ContractVersion(1), CallId(1), &event);
+    let state_0 = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger_0, Path051SplitProvider::default()));
+    let a0_verdict = path_052_try_claim_recovery(&state_0, &key, &event);
+    assert_eq!(a0_verdict, Path052ClaimVerdict::Granted);
+    // A crashes here -- no effect, no release.
+
+    // WORLD 1: A wins an IDENTICAL claim, then crashes AFTER the effect
+    // but BEFORE `path_052_execute_and_release`'s persist/confirm/release
+    // steps run.
+    let mut ledger_1 = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger_1, &contract, ContractVersion(1), CallId(1), &event);
+    let state_1 = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger_1, Path051SplitProvider::default()));
+    let a1_verdict = path_052_try_claim_recovery(&state_1, &key, &event);
+    assert_eq!(a1_verdict, Path052ClaimVerdict::Granted);
+    {
+        // The real effect happens, but A crashes before anything
+        // recovery-visible records that fact -- no persist_completion,
+        // no confirm_settlement, no claim release.
+        let mut guard = state_1.lock().unwrap();
+        let (_claims, _ledger, provider) = &mut *guard;
+        provider.execute_real_effect(key.clone(), payload.clone());
+    }
+
+    // Every recovery-visible observable available to B is IDENTICAL
+    // across both worlds before B acts.
+    {
+        let guard_0 = state_0.lock().unwrap();
+        let guard_1 = state_1.lock().unwrap();
+        assert_eq!(guard_0.1.records, guard_1.1.records, "identical Reserved(K) record in both worlds");
+        assert_eq!(guard_0.2.query_completion(&key), None, "World 0: completion memory absent");
+        assert_eq!(guard_1.2.query_completion(&key), None, "World 1: completion memory STILL absent -- release never ran");
+        assert!(guard_0.0.in_flight.contains(&key), "World 0: claim still held");
+        assert!(guard_1.0.in_flight.contains(&key), "World 1: claim still held -- identical to World 0");
+    }
+
+    // WORKER B attempts recovery in both worlds.
+    let b0_verdict = path_052_try_claim_recovery(&state_0, &key, &event);
+    let b1_verdict = path_052_try_claim_recovery(&state_1, &key, &event);
+    assert_eq!(b0_verdict, Path052ClaimVerdict::AlreadyRecovering);
+    assert_eq!(
+        b1_verdict, Path052ClaimVerdict::AlreadyRecovering,
+        "B receives the SAME AlreadyRecovering verdict whether A crashed before or after the effect -- \
+         the crash-timing ambiguity FIND-030 describes is now an EXECUTED observation, not just prose"
+    );
+
+    // Ground truth differs ONLY as a test oracle here, read AFTER both
+    // verdicts above are already fixed -- never visible to B, never used
+    // as recovery input.
+    let guard_0 = state_0.lock().unwrap();
+    let guard_1 = state_1.lock().unwrap();
+    assert_eq!(guard_0.2.ground_truth.real_effect_count, 0, "World 0 test oracle: effect never ran");
+    assert_eq!(guard_1.2.ground_truth.real_effect_count, 1, "World 1 test oracle: effect ran once, unrecorded");
+}
+
+/// PATH-052-J -- FALSE POSITIVE completion memory (mirrors PATH-051-I).
+/// PATH-052's single-winner boundary does not cure FIND-029's soundness
+/// gap: a forged completion record still suppresses a needed effect.
+#[test]
+fn path_052_j_false_positive_completion_memory_still_suppresses_needed_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path051SplitProvider::default();
+    // FORGERY, identical construction to PATH-051-I: completion memory
+    // inserted directly, bypassing `execute_real_effect` entirely.
+    provider.completion_memory.persist(key.clone(), payload.clone());
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, provider));
+
+    let verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(
+        verdict,
+        Path052ClaimVerdict::AlreadyComplete,
+        "PATH-052's single-winner boundary does not magically cure FIND-029's soundness gap"
+    );
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 0, "the NEEDED real effect is suppressed exactly as in PATH-051-I");
+}
+
+/// PATH-052-K -- FALSE NEGATIVE completion memory (mirrors PATH-051-J),
+/// connecting directly to PATH-052-H: single-winner concurrency control
+/// prevents multiple LIVE recoverers (only one worker ever runs here),
+/// but cannot know about a PAST effect completion memory failed to
+/// record.
+#[test]
+fn path_052_k_false_negative_completion_memory_grants_recovery_that_duplicates() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    let mut provider = Path051SplitProvider::default();
+    provider.execute_real_effect(key.clone(), payload.clone()); // effect GENUINELY happened
+    assert_eq!(provider.query_completion(&key), None, "completion memory says NOTHING -- the false negative");
+    let state = std::sync::Mutex::new((Path052RecoveryClaims::default(), ledger, provider));
+
+    let verdict = path_052_try_claim_recovery(&state, &key, &event);
+    assert_eq!(verdict, Path052ClaimVerdict::Granted, "single-winner concurrency control has no way to know about the historical effect");
+    path_052_execute_and_release(&state, &key, &event);
+    let guard = state.lock().unwrap();
+    assert_eq!(
+        guard.2.ground_truth.real_effect_count, 2,
+        "single-winner concurrency control prevented multiple LIVE recoverers (only one worker ever \
+         ran), but could not know about the PAST effect -- connects directly to PATH-052-H: the \
+         same P0/P1 ambiguity, exercised via the false-negative construction instead of the direct \
+         dual-world construction"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+// ---------------------------------------------------------------------
+//
+// OBSERVED (executable PATH-052 evidence): a naive check-then-act
+// recovery decision over Reserved(K) + absent completion memory yields
+// TWO recovery-effect licenses and TWO real executions for one
+// occurrence, both deterministically (A) and under real threads (A2). A
+// single, indivisible critical section spanning the completion check and
+// an in-flight claim set (`path_052_try_claim_recovery`) yields exactly
+// ONE license under concurrent racing (B), repeatably across 100 racing
+// attempts (B2), without coupling unrelated keys' economic outcomes (C),
+// converging correctly under alias canonicalization resolved before the
+// claim (D), rejecting payload conflicts before the provider boundary
+// (E), granting no new effect when completion memory already agrees (F)
+// or the record is already Settled (G).
+//
+// DERIVED (immediate conclusions from those tests): H23 is CONFIRMED for
+// the tested candidate and tested cases -- once Reserved(K) exists,
+// concurrent recovery attempts require their OWN single-winner boundary,
+// distinct from PATH-049's claim-insertion boundary, because the claim
+// boundary's own critical section has already closed by the time
+// recovery begins (H). That new boundary is a genuinely NEW mechanism,
+// not a restatement of PATH-049's: PATH-049 governs Absent -> Reserved;
+// PATH-052 governs Reserved+unknown-completion -> permission to execute.
+//
+// THE CENTRAL SCOPE GUARD (H): the SAME single-winner candidate, run
+// against two worlds with IDENTICAL recovery-visible state (Reserved(K),
+// completion query None) but OPPOSITE ground truth (P0: never executed;
+// P1: executed, completion lost), grants exactly one license in EACH
+// world and therefore duplicates P1's effect. Serialization prevents
+// concurrent recoverers from duplicating EACH OTHER; it does not, and
+// cannot, resolve whether an earlier, unrecorded execution already
+// happened. FIND-029's P0/P1 result is explicitly preserved, not
+// weakened, by adding concurrency control (H, K).
+//
+// AUTHENTICITY IS ORTHOGONAL, STILL: a forged completion record still
+// suppresses a needed effect (J, mirrors PATH-051-I/PATH-050-K/K2) --
+// single-winner concurrency control operates entirely downstream of
+// whether completion evidence is authentic, and does not and cannot fix
+// that axis.
+//
+// KNOWN FROM LITERATURE (PKV-TRANSACTION-RECOVERY-MAP-001.md, read for
+// terminology/context only -- nothing below is claimed as tested by
+// PATH-052 itself): mutual exclusion / locking (Bernstein, Hadzilacos &
+// Goodman) is the general classical tool for "two actors, one contested
+// decision," which is what `path_052_try_claim_recovery`'s Mutex
+// instantiates narrowly for the recovery decision specifically. Leases
+// and fencing tokens (Kleppmann, ch. 8) are the literature's named
+// mechanism for exactly the gap PATH-052-I exposes -- a claim holder that
+// may have failed, leaving another worker unable to safely decide
+// whether to take over. Neither is claimed as built or tested here beyond
+// the plain Mutex candidate actually exercised.
+//
+// NOT ESTABLISHED (alternatives not built here): that a Mutex, or
+// serialization in general, is the ONLY or universally necessary
+// single-winner mechanism -- only that THIS candidate achieves the
+// tested property. That a per-key (rather than whole-tuple) lock would
+// avoid PATH-052-C's recorded cross-key execution serialization -- likely
+// true, per PATH-049-E's identical caveat, but not built or measured
+// here. Any resolution of PATH-052-I's recovery-owner-crash ambiguity --
+// leases, fencing tokens, ownership epochs, and heartbeat-based takeover
+// are all literature-named candidates, none implemented or tested in
+// this file.
+//
+// NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM: as in every prior FIND in this
+// series, nothing here claims a novel result, and nothing claims real
+// external provider behavior -- `Path051SplitProvider` remains this
+// experiment's own test-only construction.
+//
+// STOP CONDITION REACHED (PATH-052-I): recovery ownership acquired ->
+// owner disappears -> another worker cannot safely decide whether to
+// take over. Documented as a new blocker, not solved here. Recommended
+// next PATH: abandoned recovery ownership / fencing / ownership epochs /
+// leases (PATH-053).
