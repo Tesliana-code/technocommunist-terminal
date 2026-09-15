@@ -19481,3 +19481,1009 @@ fn path_053_q_real_threads_live_exclusion_holds_under_racing() {
 // decades-old concepts.
 //
 // NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, PRODUCTION UNTOUCHED.
+
+// =====================================================================
+// PATH-054 -- AUTHORITATIVE FENCING EPOCH / DURABILITY / PROPAGATION TO
+// EFFECT BOUNDARY (H25)
+//
+// PATH-053-F2 showed a stale owner can still execute after a takeover if
+// the downstream provider has not yet observed the newer token. H25:
+//
+//   For stale-owner fencing to be enforceable across recovery takeover,
+//   the current fencing epoch must be both DURABLE/AUTHORITATIVE and
+//   VISIBLE TO THE DOWNSTREAM EFFECT BOUNDARY before a newer ownership
+//   epoch is treated as effect-authoritative. A fencing epoch carried
+//   only by the new owner is insufficient if the downstream boundary has
+//   not yet learned that a newer epoch exists.
+//
+// FIVE things this file deliberately keeps separate (never collapsed):
+//   1. EPOCH ISSUED         -- ownership system minted token N
+//   2. EPOCH AUTHORITATIVE  -- durably committed that N is current for K
+//   3. EPOCH VISIBLE        -- the effect boundary can reject tokens < N
+//   4. EFFECT EXECUTED      -- the external effect actually happened
+//   5. COMPLETION RECORDED  -- completion evidence exists
+//
+// TEST-LOCAL CANDIDATE, FOUR EXPLICIT STEPS (never fused into one atomic
+// call except in `path_054_takeover_and_publish`, which is itself just a
+// SEQUENCE of the same three calls -- see its own doc comment for
+// exactly what it does and does not make atomic):
+//   `path_054_issue_epoch`               -- step 1
+//   `path_054_persist_authoritative_epoch` -- step 2
+//   `Path054FencedProvider::propagate_epoch` -- step 3
+//   `Path054FencedProvider::execute_with_token` -- step 4
+// No shared Mutex wraps these by default -- each deterministic test
+// below owns its structs directly and calls the steps it chooses, in
+// the order it chooses, stopping short exactly where it wants to
+// construct a gap. This is deliberate: fusing steps behind one lock
+// would smuggle back the very atomicity this file studies the absence
+// of. Same-token retry idempotency (H24's separate, already-open gap)
+// is NOT folded into H25 -- case Q below keeps exactly one boundary test
+// of it, unchanged in verdict, not re-litigated.
+// =====================================================================
+
+/// Recovery-ownership entry: WHO holds it and WHICH epoch NUMBER they
+/// were issued, plus lease liveness -- same shape as PATH-053's
+/// `Path053Owner`. Epoch issuance here is DELIBERATELY just step 1: it
+/// establishes nothing about durability (step 2) or downstream
+/// visibility (step 3).
+#[derive(Debug, Clone, PartialEq)]
+struct Path054Owner {
+    owner_id: String,
+    epoch: u64,
+    lease_until: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Path054RecoveryOwnership {
+    owners: std::collections::HashMap<OccurrenceKey, Path054Owner>,
+    /// Per-key issuance counter -- epoch numbers are NOT assumed globally
+    /// shared across keys in this candidate (contrast PATH-053's single
+    /// global counter); nothing here assumes contiguity either (PATH-054-J).
+    next_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path054ClaimVerdict {
+    Granted(u64),
+    AlreadyComplete,
+    Conflicted,
+    Unresolved,
+    AlreadyRecovering,
+}
+
+/// STEP 2's durable store: for each canonical `OccurrenceKey`, the ONE
+/// recovery-visible, durable CURRENT epoch. Deliberately a SEPARATE
+/// struct from both ownership (step 1) and the provider (step 3) --
+/// nothing here is automatically visible to the effect boundary; that is
+/// always a later, explicit act (`Path054FencedProvider::propagate_epoch`).
+#[derive(Debug, Clone, Default)]
+struct Path054AuthoritativeEpochStore {
+    current_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+}
+
+fn path_054_persist_authoritative_epoch(store: &mut Path054AuthoritativeEpochStore, key: &OccurrenceKey, epoch: u64) {
+    store.current_epoch.insert(key.clone(), epoch);
+}
+
+fn path_054_authoritative_epoch(store: &Path054AuthoritativeEpochStore, key: &OccurrenceKey) -> Option<u64> {
+    store.current_epoch.get(key).copied()
+}
+
+/// Returned when the provider rejects a stale token against its OWN
+/// visible epoch (never against the authority store, which it has no
+/// access to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path054FencingRejection {
+    attempted: u64,
+    visible: u64,
+}
+
+/// The downstream effect boundary: ground-truth effect log (test-oracle
+/// only), recovery-visible completion memory, and its OWN copy of
+/// "current epoch per key" (step 3's target) -- populated ONLY by
+/// `propagate_epoch`, NEVER automatically by ownership issuance or by
+/// authority persistence. This is the entire point of the candidate:
+/// this struct has no way to reach into `Path054AuthoritativeEpochStore`
+/// at all.
+#[derive(Debug, Clone, Default)]
+struct Path054FencedProvider {
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+    visible_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+}
+
+impl Path054FencedProvider {
+    /// STEP 3 -- EPOCH VISIBLE DOWNSTREAM. MONOTONIC: an older epoch
+    /// delivered late (PATH-054-I, out-of-order propagation) never moves
+    /// `visible_epoch` backward.
+    fn propagate_epoch(&mut self, key: OccurrenceKey, epoch: u64) {
+        let entry = self.visible_epoch.entry(key).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+    }
+
+    /// STEP 4 -- EFFECT EXECUTED, gated ONLY by whatever THIS provider
+    /// currently believes is visible. An UNOBSERVED key (never
+    /// propagated to) defaults to "accept anything" -- the same
+    /// permissive default PATH-053's fenced provider used, reproduced
+    /// here as the PATH-054-A baseline.
+    fn execute_with_token(&mut self, key: OccurrenceKey, payload: ContributionEvent, token: u64) -> Result<(), Path054FencingRejection> {
+        let visible = self.visible_epoch.get(&key).copied().unwrap_or(0);
+        if token < visible {
+            return Err(Path054FencingRejection { attempted: token, visible });
+        }
+        self.ground_truth.real_effect_count += 1;
+        let _ = payload;
+        Ok(())
+    }
+
+    fn persist_completion(&mut self, key: OccurrenceKey, payload: ContributionEvent) {
+        self.completion_memory.persist(key, payload);
+    }
+
+    fn query_completion(&self, key: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.completion_memory.query(key)
+    }
+}
+
+const PATH_054_LEASE_DURATION: u64 = 10;
+
+/// STEP 1 -- EPOCH ISSUED. Lease-liveness/exclusion logic mirrors
+/// PATH-053's `path_053_try_acquire_recovery` exactly; issuing a new
+/// epoch number here establishes NOTHING about durability or downstream
+/// visibility -- this function never touches
+/// `Path054AuthoritativeEpochStore` or `Path054FencedProvider::visible_epoch`.
+fn path_054_issue_epoch(
+    ownership: &mut Path054RecoveryOwnership,
+    ledger: &mut Path048Ledger,
+    provider: &Path054FencedProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+    owner_id: &str,
+    now: u64,
+) -> Path054ClaimVerdict {
+    match ledger.records.get(key) {
+        Some(SettlementRecord::Settled { payload, .. }) => {
+            return if *payload == event.payload { Path054ClaimVerdict::AlreadyComplete } else { Path054ClaimVerdict::Conflicted };
+        }
+        Some(SettlementRecord::Reserved { payload, .. }) => {
+            if *payload != event.payload {
+                return Path054ClaimVerdict::Conflicted;
+            }
+        }
+        None => return Path054ClaimVerdict::Unresolved,
+    }
+
+    match provider.query_completion(key) {
+        Some(existing) if existing == event.payload => {
+            path_048_confirm_settlement(ledger, key);
+            return Path054ClaimVerdict::AlreadyComplete;
+        }
+        Some(_) => return Path054ClaimVerdict::Conflicted,
+        None => {}
+    }
+
+    if let Some(owner) = ownership.owners.get(key) {
+        if now < owner.lease_until {
+            return Path054ClaimVerdict::AlreadyRecovering;
+        }
+    }
+
+    let counter = ownership.next_epoch.entry(key.clone()).or_insert(0);
+    *counter += 1;
+    let epoch = *counter;
+    ownership.owners.insert(key.clone(), Path054Owner { owner_id: owner_id.to_string(), epoch, lease_until: now + PATH_054_LEASE_DURATION });
+    Path054ClaimVerdict::Granted(epoch)
+}
+
+/// THE CANDIDATE HANDOFF PROTOCOL: steps 1-3 in sequence -- issue, then
+/// durably persist as authoritative, then propagate to the provider --
+/// ALL completed before this function RETURNS `Granted` to its caller.
+/// This is the exact ordering this
+/// file's success cases (C/D/K/L/P) rely on: a caller only ever learns
+/// `Granted` AFTER the provider already has the new epoch. NARROWED
+/// CLAIM (post HORUS cross-review, PATH-054-D2): this delays EXPOSURE of
+/// `Granted` to callers -- it does NOT make the persist-to-propagate
+/// handoff itself atomic or revoking with respect to a STALE former
+/// owner still executing during that window. NOTE on atomicity: this is
+/// a plain sequential function call, not a lock -- it makes the THREE
+/// steps happen in this ORDER within one call, but does NOT make them
+/// atomic with respect to any OTHER concurrent caller, including a stale
+/// owner who never observes `Granted` at all (see PATH-054-D2, and
+/// PATH-054-R for the one thread test in this file, which is explicit
+/// about what its own Mutex covers). Cases A/B/D2 deliberately do NOT
+/// run this helper to completion -- they call the individual steps
+/// directly and stop short, to construct the gaps.
+fn path_054_takeover_and_publish(
+    ownership: &mut Path054RecoveryOwnership,
+    ledger: &mut Path048Ledger,
+    authority: &mut Path054AuthoritativeEpochStore,
+    provider: &mut Path054FencedProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+    owner_id: &str,
+    now: u64,
+) -> Path054ClaimVerdict {
+    let verdict = path_054_issue_epoch(ownership, ledger, provider, key, event, owner_id, now);
+    if let Path054ClaimVerdict::Granted(epoch) = verdict {
+        path_054_persist_authoritative_epoch(authority, key, epoch);
+        provider.propagate_epoch(key.clone(), epoch);
+    }
+    verdict
+}
+
+/// Releases an ownership entry -- only if `epoch` still matches the
+/// CURRENT entry, so a late release from a superseded worker cannot
+/// clobber a newer owner's claim (mirrors PATH-053-`path_053_release`).
+fn path_054_release(ownership: &mut Path054RecoveryOwnership, key: &OccurrenceKey, epoch: u64) {
+    if ownership.owners.get(key).map(|o| o.epoch) == Some(epoch) {
+        ownership.owners.remove(key);
+    }
+}
+
+/// STEP 4 plus bookkeeping: executes through the provider (gated ONLY by
+/// whatever the provider currently believes is visible -- this function
+/// never consults `Path054AuthoritativeEpochStore`), then persists
+/// completion, confirms settlement, and releases ownership.
+fn path_054_execute_and_release(
+    ownership: &mut Path054RecoveryOwnership,
+    ledger: &mut Path048Ledger,
+    provider: &mut Path054FencedProvider,
+    key: &OccurrenceKey,
+    event: &Path047CandidateEvent,
+    epoch: u64,
+) -> Result<(), Path054FencingRejection> {
+    provider.execute_with_token(key.clone(), event.payload.clone(), epoch)?;
+    provider.persist_completion(key.clone(), event.payload.clone());
+    path_048_confirm_settlement(ledger, key);
+    path_054_release(ownership, key, epoch);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Mandatory adversarial cases A-Q, plus one supplementary real-thread
+// case (R).
+// ---------------------------------------------------------------------
+
+fn path_054_setup() -> (TrustedSourceContract, ContributionEvent, Path047CandidateEvent, OccurrenceKey, Path048Ledger) {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event = path_047_candidate("payroll-system", "evt-1", payload.clone());
+    let key = path_048_occurrence_key(&contract, &event).unwrap();
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event);
+    (contract, payload, event, key, ledger)
+}
+
+/// PATH-054-A -- BASELINE (reproduces PATH-053-F2): A owns epoch 1, A's
+/// lease expires, B is ISSUED epoch 2 (step 1 ONLY -- never persisted,
+/// never propagated). Stale A executes with its old epoch 1 FIRST.
+/// Expected: ACCEPTED -- `provider.visible_epoch` has never observed
+/// ANYTHING for this key.
+#[test]
+fn path_054_a_baseline_issued_but_not_propagated_stale_token_accepted() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut provider = Path054FencedProvider::default();
+
+    let a = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    assert_eq!(a, Path054ClaimVerdict::Granted(1));
+
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    assert_eq!(b, Path054ClaimVerdict::Granted(2), "epoch ISSUED for B -- nothing else yet");
+    assert!(provider.visible_epoch.get(&key).is_none(), "downstream has observed NOTHING for this key");
+
+    let result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(result.is_ok(), "stale epoch 1 is ACCEPTED -- issuance alone does not fence anyone");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-054-B -- AUTHORITATIVE, NOT YET PROPAGATED. Epoch 2 is durably
+/// persisted in the authority store, but the provider's own
+/// `visible_epoch` is never touched. Expected: stale epoch 1 is STILL
+/// accepted, because the provider consults only its own local visible
+/// epoch, never the authority store. This is the durability/visibility
+/// distinction, isolated.
+#[test]
+fn path_054_b_authoritative_but_not_visible_stale_token_still_accepted() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    assert_eq!(b, Path054ClaimVerdict::Granted(2));
+    path_054_persist_authoritative_epoch(&mut authority, &key, 2);
+
+    assert_eq!(path_054_authoritative_epoch(&authority, &key), Some(2), "DURABLE: authority knows epoch 2 is current");
+    assert!(provider.visible_epoch.get(&key).is_none(), "NOT VISIBLE: the provider has not been told");
+
+    let result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(result.is_ok(), "durability alone does not fence a stale owner -- the provider never consults the authority store directly");
+}
+
+/// PATH-054-C -- PROPAGATED EPOCH REJECTS THE STALE OWNER. Epoch 2 is
+/// now BOTH authoritative AND explicitly propagated to the provider.
+/// Stale epoch 1 is rejected; epoch 2 is accepted. This is the candidate
+/// success case, built from the individual steps by hand.
+#[test]
+fn path_054_c_propagated_epoch_rejects_stale_owner() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    let b_epoch = match b { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    path_054_persist_authoritative_epoch(&mut authority, &key, b_epoch);
+    provider.propagate_epoch(key.clone(), b_epoch);
+
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert_eq!(a_result, Err(Path054FencingRejection { attempted: 1, visible: 2 }), "stale epoch 1 REJECTED now that it is visible");
+
+    let b_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch);
+    assert!(b_result.is_ok(), "the current, visible epoch is accepted");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-054-D -- DELAYED EXPOSURE OF `Granted`, via the CANDIDATE
+/// PROTOCOL (`path_054_takeover_and_publish`) rather than hand-assembled
+/// steps: B's takeover is not REPORTED `Granted` to its caller until
+/// AFTER propagation has already happened -- SYNCHRONOUS PUBLICATION
+/// inside one sequential function call is the exact mechanism used here
+/// (not acknowledgment, not a shared store B waits to be notified about
+/// -- see the function's own doc comment for what it does and does not
+/// make atomic). NARROWED CLAIM (post HORUS cross-review, see
+/// PATH-054-D2): this proves only that a caller acting STRICTLY AFTER
+/// `path_054_takeover_and_publish` returns sees enforceable rejection.
+/// It does NOT prove the handoff itself is atomic or revoking -- the
+/// function is explicitly not a lock over the downstream boundary, and
+/// PATH-054-D2 constructs the stale-execution window that exists DURING
+/// it.
+#[test]
+fn path_054_d_delayed_granted_protects_callers_acting_after_publication_completes() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b = path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    let b_epoch = match b { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    // By the time THIS line runs, propagation has ALREADY happened --
+    // the protocol guarantees it, synchronously, inside the call above.
+    assert_eq!(provider.visible_epoch.get(&key), Some(&b_epoch), "already visible the instant Granted is observed");
+
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(a_result.is_err(), "stale A, resuming AFTER the protocol call returned, is rejected");
+}
+
+/// PATH-054-D2 -- THE HANDOFF-WINDOW WITNESS (HORUS cross-review). D
+/// only shows safety for a caller acting AFTER
+/// `path_054_takeover_and_publish` has fully returned. This test stops
+/// the SAME protocol midway -- issue epoch 2, persist it as
+/// authoritative -- and DELIBERATELY HALTS before the propagate step.
+/// At that exact point `authority.current_epoch[K] == 2` while
+/// `provider.visible_epoch[K]` is still absent (i.e. effectively 1, the
+/// old epoch). Stale A calls `execute_with_token` with its old epoch 1
+/// HERE, inside the window: expected, and NOT patched to hide it,
+/// ACCEPTED. Propagation then completes, and B's own epoch-2 execute is
+/// also accepted. `real_effect_count == 2` -- the handoff window itself
+/// is unsafe, exactly as durable+visible-after-completion (C/D) never
+/// claimed to prevent.
+#[test]
+fn path_054_d2_stale_owner_can_execute_inside_persist_to_propagate_handoff_window() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    // B's takeover, HAND-ASSEMBLED and DELIBERATELY STOPPED after step 2:
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    let b_epoch = match b { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    path_054_persist_authoritative_epoch(&mut authority, &key, b_epoch);
+    // STOP HERE -- propagate_epoch has NOT been called yet.
+
+    assert_eq!(path_054_authoritative_epoch(&authority, &key), Some(2), "authoritative: epoch 2 IS current");
+    assert!(provider.visible_epoch.get(&key).is_none(), "NOT YET VISIBLE: the handoff window is open");
+
+    // Stale A executes INSIDE the window.
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(a_result.is_ok(), "ACCEPTED, honestly exposed and NOT patched to hide it -- publication-before-Granted does not make the handoff itself atomic or revoking");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+
+    // The window closes: propagation completes, THEN B executes.
+    provider.propagate_epoch(key.clone(), b_epoch);
+    let b_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch);
+    assert!(b_result.is_ok(), "B's own current epoch is accepted");
+    assert_eq!(
+        provider.ground_truth.real_effect_count, 2,
+        "BOTH executed: \"publication-before-Granted\" (D) is NOT \"atomic/revoking handoff\" -- a stale \
+         former owner can still act DURING the persist-to-propagate window, before any caller has ever \
+         observed Granted for the new epoch"
+    );
+}
+
+/// PATH-054-E -- CRASH AFTER AUTHORITATIVE PERSIST, BEFORE PROPAGATION.
+/// Epoch 2 is durably authoritative; the provider "crashes" before ever
+/// being told (modeled simply by never calling `propagate_epoch` -- the
+/// same gap as B). After "restart," DETERMINISTIC REPLAY of the
+/// authoritative epoch (reading it back from the durable store and
+/// calling `propagate_epoch` with that value) REPAIRS visibility: stale
+/// epoch 1 is rejected only AFTER the replay, not before.
+#[test]
+fn path_054_e_deterministic_replay_of_authoritative_epoch_repairs_visibility() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    let b_epoch = match b { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    path_054_persist_authoritative_epoch(&mut authority, &key, b_epoch);
+    // "CRASH" here -- propagation never ran.
+    assert!(provider.visible_epoch.get(&key).is_none(), "pre-repair: not yet visible");
+
+    // "RESTART/RECOVERY": replay the authoritative epoch, deterministically.
+    let replayed = path_054_authoritative_epoch(&authority, &key).expect("authority survived the crash");
+    provider.propagate_epoch(key.clone(), replayed);
+
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(a_result.is_err(), "post-repair: stale epoch 1 is now rejected");
+    let b_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch);
+    assert!(b_result.is_ok(), "the replayed-current epoch is accepted");
+}
+
+/// PATH-054-F -- CRASH AFTER PROPAGATION, BEFORE EITHER EFFECT. Epoch 2
+/// is already visible; nothing has executed yet; "crash" -- nothing
+/// clears the provider's already-propagated state (this in-memory model
+/// has no spontaneous data loss). After "restart," enforcement state is
+/// unchanged: stale epoch 1 remains rejected, epoch 2 may still proceed.
+#[test]
+fn path_054_f_visible_epoch_survives_crash_before_either_effect() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b_epoch = match path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION) {
+        Path054ClaimVerdict::Granted(e) => e,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    // "CRASH" -- no effect has run yet; nothing here clears provider state.
+
+    let a_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1);
+    assert!(a_result.is_err(), "enforcement state survived the crash -- stale epoch 1 still rejected");
+    let b_result = path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch);
+    assert!(b_result.is_ok(), "the legitimate current owner may still proceed");
+}
+
+/// PATH-054-G -- PROVIDER LOSES VISIBLE-EPOCH MEMORY (reproduces
+/// PATH-053-P in this candidate) -- THE CENTRAL RECOVERY TEST. After
+/// epoch 2 is authoritative AND visible, the provider's OWN copy for
+/// this key is lost (a restart of just that cache). Stale epoch 1
+/// becomes accepted again -- the regression. Because the AUTHORITY STORE
+/// still remembers epoch 2, replaying it (same repair as E) restores
+/// correct rejection.
+#[test]
+fn path_054_g_provider_epoch_memory_loss_is_recoverable_from_surviving_authority() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b_epoch = match path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION) {
+        Path054ClaimVerdict::Granted(e) => e,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    // B, the legitimate current owner, genuinely executes ONCE.
+    path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, b_epoch).expect("B accepted");
+    assert_eq!(provider.ground_truth.real_effect_count, 1);
+    assert!(path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1).is_err(), "stale epoch 1 rejected while memory is intact");
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "the rejection executed nothing");
+
+    // The provider's OWN visible-epoch record for this key is lost.
+    provider.visible_epoch.remove(&key);
+    assert!(
+        path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1).is_ok(),
+        "REGRESSION: stale epoch 1 is accepted again once the provider's own memory is lost"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 2, "the regression duplicated the effect B already performed");
+
+    // RECOVERY: the authority store survived. Replay repairs enforcement.
+    let replayed = path_054_authoritative_epoch(&authority, &key).expect("authority still remembers epoch 2");
+    provider.propagate_epoch(key.clone(), replayed);
+    assert!(
+        path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1).is_err(),
+        "REPAIRED: stale epoch 1 rejected again once the surviving authority is replayed"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 2, "no further duplication after repair");
+}
+
+/// PATH-054-H -- AUTHORITY STORE LOST/RESET. After epoch 2 is
+/// authoritative AND visible, the AUTHORITY store's record is lost
+/// instead of the provider's. The provider's OWN already-propagated
+/// state is untouched and continues to enforce correctly on its own --
+/// enforcement does not depend on authority's CONTINUED memory, only on
+/// having been told once. STOP CONDITION: if the provider's copy is
+/// THEN also lost (both copies gone), nothing durable remembers the
+/// current epoch at all, and a stale token is accepted again with no
+/// surviving source of truth to repair from -- NOT solved here
+/// (no replication/consensus built), recorded per this mission's stop
+/// condition: the canonical epoch source becomes an exogenous trust
+/// root once both copies are lost together.
+#[test]
+fn path_054_h_authority_loss_alone_does_not_break_provider_enforcement_but_double_loss_is_unrecoverable() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    let b_epoch = match path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION) {
+        Path054ClaimVerdict::Granted(e) => e,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+
+    // AUTHORITY alone is lost -- the provider's OWN copy is untouched.
+    authority.current_epoch.remove(&key);
+    assert_eq!(path_054_authoritative_epoch(&authority, &key), None, "authority has forgotten");
+    assert!(
+        path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1).is_err(),
+        "provider enforcement is UNAFFECTED -- it never depended on authority's continued memory, only on having been told once"
+    );
+
+    // STOP CONDITION: BOTH copies now gone.
+    provider.visible_epoch.remove(&key);
+    assert!(
+        path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key, &event, 1).is_ok(),
+        "STOP CONDITION: with BOTH the authority record and the provider's own cache gone, the \
+         current epoch is unknowable within this candidate -- a stale token is accepted again, and \
+         there is no surviving source of truth to replay from. NOT solved here; the canonical epoch \
+         source becomes an exogenous trust root the moment both copies are lost together."
+    );
+    let _ = b_epoch;
+}
+
+/// PATH-054-I -- STALE PROPAGATION / OUT-OF-ORDER DELIVERY. Epoch 2 is
+/// propagated, then a DELAYED, older epoch 1 arrives. `visible_epoch`
+/// must be MONOTONIC: it never moves backward. Isolated at the provider
+/// boundary (no ownership involved -- this is a property of
+/// `propagate_epoch` itself).
+#[test]
+fn path_054_i_out_of_order_propagation_never_downgrades_visible_epoch() {
+    let (_contract, _payload, event, key, _ledger) = path_054_setup();
+    let mut provider = Path054FencedProvider::default();
+
+    provider.propagate_epoch(key.clone(), 2);
+    provider.propagate_epoch(key.clone(), 1); // delayed, older, arrives late
+    assert_eq!(provider.visible_epoch.get(&key), Some(&2), "the OLDER, delayed epoch does NOT downgrade the visible epoch");
+
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 1).is_err(), "epoch 1 still rejected");
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 2).is_ok(), "epoch 2 still accepted");
+}
+
+/// PATH-054-J -- SKIPPED EPOCH. The visible epoch jumps straight to 3 (no
+/// assumption anywhere that epochs must be contiguous, or that this
+/// provider must have seen 1 or 2 first). Epochs 1 and 2 are both stale;
+/// only 3 is current.
+#[test]
+fn path_054_j_skipped_epoch_no_contiguity_assumption() {
+    let (_contract, _payload, event, key, _ledger) = path_054_setup();
+    let mut provider = Path054FencedProvider::default();
+
+    provider.propagate_epoch(key.clone(), 3);
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 1).is_err(), "epoch 1 stale");
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 2).is_err(), "epoch 2 stale, even though never individually observed before");
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 3).is_ok(), "epoch 3 current");
+}
+
+/// PATH-054-K -- DIFFERENT KEYS. K1 and K2 have fully independent
+/// authority and provider-visibility domains: K1's takeover and
+/// publication does not affect K2's still-live ownership or K2's
+/// (absent) visible epoch.
+#[test]
+fn path_054_k_different_keys_have_independent_epoch_domains() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("bob", "audit", 25.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let event_2 = path_047_candidate("payroll-system", "evt-2", payload_2.clone());
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_1);
+    path_048_reserve(&mut ledger, &contract, ContractVersion(2), CallId(2), &event_2);
+
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut authority = Path054AuthoritativeEpochStore::default();
+    let mut provider = Path054FencedProvider::default();
+
+    let k1_epoch = match path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key_1, &event_1, "worker-A", 0) {
+        Path054ClaimVerdict::Granted(e) => e,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    let k2_epoch = match path_054_takeover_and_publish(&mut ownership, &mut ledger, &mut authority, &mut provider, &key_2, &event_2, "worker-A", 0) {
+        Path054ClaimVerdict::Granted(e) => e,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    assert_eq!((k1_epoch, k2_epoch), (1, 1), "per-key issuance counters are independent, not globally shared");
+
+    assert!(path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key_1, &event_1, k1_epoch).is_ok());
+    assert!(path_054_execute_and_release(&mut ownership, &mut ledger, &mut provider, &key_2, &event_2, k2_epoch).is_ok());
+    assert_eq!(provider.ground_truth.real_effect_count, 2, "one effect per key, independently");
+}
+
+/// PATH-054-L -- ALIAS CONVERGENCE. Two raw `SourceId`s resolving, via
+/// AUTHORITY, to the SAME canonical `OccurrenceKey` converge on the SAME
+/// ownership/authority/visibility domain -- a second acquisition attempt
+/// through the OTHER raw label, before the first lease expires, is
+/// denied. Deterministic (no threads needed -- alias resolution itself
+/// is not a race).
+#[test]
+fn path_054_l_alias_convergence_shares_one_epoch_domain() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b, "both raw labels canonicalize to the SAME OccurrenceKey");
+
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &event_a);
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+
+    let via_a = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key_a, &event_a, "worker-A", 0);
+    assert_eq!(via_a, Path054ClaimVerdict::Granted(1));
+    let via_b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key_b, &event_b, "worker-B", 0);
+    assert_eq!(via_b, Path054ClaimVerdict::AlreadyRecovering, "the SECOND raw label resolves to the SAME domain, already claimed");
+}
+
+/// PATH-054-M -- PAYLOAD CONFLICT. Rejected before ownership/epoch
+/// machinery is ever touched.
+#[test]
+fn path_054_m_payload_conflict_rejected_before_epoch_issuance() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_a = path_047_payload("alice", "review", 40.0);
+    let payload_b = path_047_payload("alice", "review", 999.0);
+    let reserved_event = path_047_candidate("payroll-system", "evt-1", payload_a);
+    let conflicting_event = path_047_candidate("payroll-system", "evt-1", payload_b);
+    let key = path_048_occurrence_key(&contract, &reserved_event).unwrap();
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &reserved_event);
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+
+    let verdict = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &conflicting_event, "worker-A", 0);
+    assert_eq!(verdict, Path054ClaimVerdict::Conflicted);
+    assert!(ownership.owners.is_empty());
+    assert_eq!(provider.ground_truth.real_effect_count, 0);
+}
+
+/// PATH-054-N -- COMPLETION PRESENT. No unnecessary takeover.
+#[test]
+fn path_054_n_completion_present_needs_no_takeover() {
+    let (_contract, payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let mut provider = Path054FencedProvider::default();
+    provider.ground_truth.real_effect_count += 1;
+    provider.persist_completion(key.clone(), payload.clone());
+
+    let verdict = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    assert_eq!(verdict, Path054ClaimVerdict::AlreadyComplete);
+    assert!(ownership.owners.is_empty());
+    assert_eq!(provider.ground_truth.real_effect_count, 1, "no NEW effect");
+}
+
+/// PATH-054-O -- ALREADY SETTLED. No effect.
+#[test]
+fn path_054_o_already_settled_no_effect() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    path_048_confirm_settlement(&mut ledger, &key);
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+
+    let verdict = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    assert_eq!(verdict, Path054ClaimVerdict::AlreadyComplete);
+    assert_eq!(provider.ground_truth.real_effect_count, 0);
+}
+
+/// PATH-054-P -- FIND-029 P0/P1, UNDER *PERFECT* EPOCH PROPAGATION. WORLD
+/// 0 (no historical effect) and WORLD 1 (historical effect already
+/// happened, completion evidence lost) are each taken over through the
+/// FULL candidate success protocol -- authoritative AND visible, exactly
+/// like case C/D, no gap anywhere in the epoch machinery. Both worlds
+/// grant the SAME epoch and reach the SAME accept verdict. Execution
+/// still duplicates in World 1. EVEN PERFECT EPOCH CORRECTNESS DOES NOT
+/// REVEAL HISTORICAL EFFECT TRUTH -- FIND-029 is preserved, one boundary
+/// further out than PATH-053-C/D.
+#[test]
+fn path_054_p_perfect_epoch_propagation_does_not_resolve_find_029_p0_p1() {
+    let (_contract, payload, event, key, mut ledger_0) = path_054_setup();
+    let mut ownership_0 = Path054RecoveryOwnership::default();
+    let mut authority_0 = Path054AuthoritativeEpochStore::default();
+    let mut provider_0 = Path054FencedProvider::default();
+    // WORLD 0: no historical effect.
+
+    let (_contract, _payload, _event, _key, mut ledger_1) = path_054_setup();
+    let mut ownership_1 = Path054RecoveryOwnership::default();
+    let mut authority_1 = Path054AuthoritativeEpochStore::default();
+    let mut provider_1 = Path054FencedProvider::default();
+    // WORLD 1: the effect already happened once; completion memory lost.
+    provider_1.ground_truth.real_effect_count += 1;
+
+    assert_eq!(ledger_0.records, ledger_1.records, "identical Reserved(K) in both worlds");
+    assert_eq!(provider_0.query_completion(&key), None);
+    assert_eq!(provider_1.query_completion(&key), None, "identical -- absent completion in both worlds");
+
+    let v0 = path_054_takeover_and_publish(&mut ownership_0, &mut ledger_0, &mut authority_0, &mut provider_0, &key, &event, "worker-B", 0);
+    let v1 = path_054_takeover_and_publish(&mut ownership_1, &mut ledger_1, &mut authority_1, &mut provider_1, &key, &event, "worker-B", 0);
+    assert_eq!(v0, v1, "SAME epoch, SAME takeover verdict in both worlds -- perfect epoch propagation carries no historical-truth signal");
+    let epoch = match v0 { Path054ClaimVerdict::Granted(e) => e, other => panic!("expected Granted, got {other:?}") };
+    assert_eq!(
+        (path_054_authoritative_epoch(&authority_0, &key), provider_0.visible_epoch.get(&key).copied()),
+        (path_054_authoritative_epoch(&authority_1, &key), provider_1.visible_epoch.get(&key).copied()),
+        "identical authoritative AND visible epoch state in both worlds"
+    );
+
+    path_054_execute_and_release(&mut ownership_0, &mut ledger_0, &mut provider_0, &key, &event, epoch).expect("World 0 accepted");
+    path_054_execute_and_release(&mut ownership_1, &mut ledger_1, &mut provider_1, &key, &event, epoch).expect("World 1 accepted");
+    assert_eq!(provider_0.ground_truth.real_effect_count, 1, "World 0: correct, single effect");
+    assert_eq!(provider_1.ground_truth.real_effect_count, 2, "World 1: DUPLICATED, despite PERFECT epoch durability and visibility in both worlds");
+    let _ = payload;
+}
+
+/// PATH-054-Q -- SAME-TOKEN REPLAY, ONE BOUNDARY TEST ONLY (kept, per
+/// this mission's brief, exactly as open as PATH-053-O left it -- not
+/// re-litigated, not solved here). A freshness-only provider does not
+/// deduplicate two calls carrying the IDENTICAL current epoch.
+#[test]
+fn path_054_q_same_token_replay_is_not_idempotency() {
+    let (_contract, _payload, event, key, _ledger) = path_054_setup();
+    let mut provider = Path054FencedProvider::default();
+    provider.propagate_epoch(key.clone(), 2);
+
+    assert!(provider.execute_with_token(key.clone(), event.payload.clone(), 2).is_ok());
+    assert!(
+        provider.execute_with_token(key.clone(), event.payload.clone(), 2).is_ok(),
+        "the SAME current epoch, presented again, is accepted again"
+    );
+    assert_eq!(provider.ground_truth.real_effect_count, 2, "EPOCH FENCING != OPERATION IDEMPOTENCY -- not solved here");
+}
+
+/// PATH-054-R (supplementary, real threads, OPTIONAL) -- reproduces
+/// case A's baseline gap under genuine concurrency: nobody has ever
+/// propagated anything to the provider, so BOTH the stale former owner
+/// (epoch 1) and the legitimate current owner (epoch 2) can execute
+/// concurrently. Ownership issuance for A and B happens single-threaded,
+/// beforehand, exactly like every deterministic case above -- ONLY the
+/// two `execute_and_release` calls race. WHAT THE MUTEX MAKES ATOMIC:
+/// each locked call is its OWN, separate critical section; the two
+/// threads' calls are never fused into one lock scope, and
+/// `execute_and_release` never reads ownership/ledger state to decide
+/// whether to proceed (unlike `issue_epoch`), so the two threads have NO
+/// cross-dependency on each other's completion order. The outcome
+/// asserted below is therefore scheduler-INDEPENDENT: `visible_epoch`
+/// stays empty for this key regardless of interleaving, so BOTH tokens
+/// are always accepted, in either order -- no scheduler-dependent
+/// correctness is claimed.
+#[test]
+fn path_054_r_real_threads_baseline_gap_holds_under_concurrency() {
+    let (_contract, _payload, event, key, mut ledger) = path_054_setup();
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+    let a = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-A", 0);
+    assert_eq!(a, Path054ClaimVerdict::Granted(1));
+    let b = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &event, "worker-B", PATH_054_LEASE_DURATION);
+    assert_eq!(b, Path054ClaimVerdict::Granted(2));
+    // Nobody has propagated anything -- the baseline gap is fully set up,
+    // deterministically, before any thread starts.
+
+    let state = std::sync::Arc::new(std::sync::Mutex::new((ownership, ledger, provider)));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let a_handle = {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        let event = event.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = state.lock().expect("PATH-054 test state mutex poisoned");
+            let (ownership, ledger, provider) = &mut *guard;
+            path_054_execute_and_release(ownership, ledger, provider, &key, &event, 1)
+        })
+    };
+    let b_handle = {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        let event = event.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = state.lock().expect("PATH-054 test state mutex poisoned");
+            let (ownership, ledger, provider) = &mut *guard;
+            path_054_execute_and_release(ownership, ledger, provider, &key, &event, 2)
+        })
+    };
+    let a_result = a_handle.join().unwrap();
+    let b_result = b_handle.join().unwrap();
+
+    assert!(a_result.is_ok(), "stale epoch 1 accepted under real concurrency too -- nobody ever propagated anything");
+    assert!(b_result.is_ok(), "the current epoch 2 is also accepted, regardless of which thread ran first");
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.2.ground_truth.real_effect_count, 2, "BOTH executed -- the baseline gap duplicates under real concurrency too");
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+//
+// H25 CONFIRMED for the tested candidate, NARROWED after HORUS cross-
+// review (PATH-054-D2): issuing a newer ownership epoch (step 1) is
+// INSUFFICIENT by itself to revoke a stale owner (A). Durably persisting
+// that epoch as authoritative (step 2) is ALSO insufficient alone -- the
+// provider consults only its own local `visible_epoch`, never the
+// authority store directly (B). Stale-owner rejection becomes
+// enforceable ONLY for callers acting AFTER the current epoch has been
+// EXPLICITLY propagated to the downstream boundary (C).
+//
+// NARROWED D/D2 CLAIM: the candidate handoff protocol
+// (`path_054_takeover_and_publish`) delays EXPOSURE of `Granted` until
+// AFTER propagation has completed -- a caller who only ever acts on
+// observing `Granted` is safe (D). This is NOT the same as making the
+// handoff itself atomic or revoking: PATH-054-D2 stops the SAME protocol
+// midway (epoch issued and persisted as authoritative, propagation not
+// yet called) and shows a stale former owner, who never needed to
+// observe `Granted` at all, executes successfully DURING that window --
+// `real_effect_count == 2`. "Publication-before-Granted" is therefore
+// NOT "atomic/revoking handoff." The precise, defensible claim: once
+// synchronous publication completes, callers acting strictly after
+// completion observe enforceable stale-token rejection; the answer to
+// "can epoch allocation be safely separated from epoch
+// publication/enforcement" is YES only for callers who wait to observe
+// completion, and NOT a general guarantee that the old owner is revoked
+// the moment a new epoch is issued or persisted. What mechanism would
+// make the handoff itself indivisible with respect to a stale owner who
+// never asks permission is an explicit open question, NOT solved here.
+//
+// DURABILITY AND VISIBILITY, MODELED SEPARATELY, FAIL AND REPAIR
+// SEPARATELY (in this test-local model -- `Path054AuthoritativeEpochStore`
+// is an in-memory, assumed-durable recovery-visible authoritative
+// record in this experiment, not a real storage system, and its
+// survival across a "crash" is a modeling choice for the worlds where it
+// is asserted to survive, not an experimental proof of physical
+// durability): E and F show provider enforcement state, once
+// established, survives an in-memory "crash" and can be deterministically
+// REPAIRED by replaying the modeled-surviving authoritative epoch. G
+// reproduces PATH-053-P in this candidate (provider's own cache lost)
+// and shows the SAME repair-by-replay works as long as the authority
+// record is modeled as surviving -- this is the central recovery
+// result. H shows the converse holds too: authority loss ALONE does not
+// break already-propagated enforcement, because the provider's own
+// state, once set, does not depend on authority's continued memory.
+// PRECISE STATEMENT (not "losing either reopens execution"): loss of
+// downstream visibility reopens stale-token acceptance UNLESS a
+// surviving authoritative source can restore it (E/G); loss of the
+// authoritative source removes that repair path, although
+// already-established downstream enforcement may continue working on
+// its own (H); only when BOTH are lost together is there no tested
+// recovery source at all -- an unsolved STOP CONDITION (see below). An
+// authoritative epoch source must survive the failure modes from which
+// it is expected to repair downstream visibility -- that property-level
+// conclusion is what this candidate supports, not a claim about any real
+// storage implementation.
+//
+// ONLY THE "PROVIDER LAGS BEHIND AUTHORITY" DIRECTION IS UNSAFE: because
+// `execute_with_token` accepts any token >= its own visible epoch, a
+// provider that has fallen behind can still always accept the CURRENT
+// legitimate owner's (higher) token -- it only fails to reject STALE
+// (lower) tokens. This candidate exposes availability/safety asymmetry:
+// under-propagation is an unsafety risk (stale duplication), never a
+// liveness risk for the current owner.
+//
+// MONOTONICITY AND CONTIGUITY, ISOLATED: I shows `propagate_epoch` never
+// moves `visible_epoch` backward when a delayed, older epoch arrives
+// late. J shows no code anywhere assumes epochs are contiguous -- a
+// jump straight to 3 correctly stales out 1 AND 2, neither of which was
+// ever individually observed.
+//
+// K/L/M/N/O mirror PATH-052/053's non-owner-crash cases one boundary
+// further out: per-key independence, alias convergence onto one shared
+// epoch domain, payload conflict, completion-present, and already-
+// settled all behave exactly as before -- nothing about adding the
+// authority/visibility split changed them.
+//
+// FIND-029's P0/P1 REMAINS OPEN EVEN UNDER PERFECT EPOCH PROPAGATION
+// (P): two worlds with IDENTICAL authoritative AND visible epoch state,
+// differing only in ground-truth history, receive the SAME takeover
+// verdict and still diverge in total effect count after execution.
+// Perfect fencing infrastructure answers "is this token stale," never
+// "did this effect already happen." (Note: P's "perfect" epoch state is
+// itself only ever asserted AFTER `path_054_takeover_and_publish`
+// returns -- it says nothing about the D2 handoff window, which remains
+// a separate, additional gap even in the world P constructs.)
+//
+// SAME-TOKEN REPLAY REMAINS SEPARATELY OPEN, NOT RE-LITIGATED (Q): kept
+// to exactly one boundary test, unchanged in verdict from PATH-053-O --
+// epoch fencing is not operation idempotency, regardless of how
+// carefully the epoch itself is propagated.
+//
+// STOP CONDITIONS REACHED, NOT SOLVED HERE:
+//   (1, PATH-054-H) the canonical epoch source becomes an EXOGENOUS
+//       TRUST ROOT the moment BOTH the authority store's record AND the
+//       provider's own visible-epoch cache are lost together for the
+//       same key -- nothing durable remains to replay from, and no
+//       replication/consensus mechanism is built to survive that.
+//   (2, PATH-054-D2) HANDOFF ATOMICITY / REVOCATION BOUNDARY: delaying
+//       exposure of `Granted` protects only callers who wait for it; it
+//       does not revoke a stale former owner during the persist-to-
+//       propagate window, because that owner never asks permission in
+//       the first place. How a newly authoritative epoch could become
+//       downstream-enforceable WITHOUT a window in which the superseded
+//       owner can still execute is recorded as an open question, not
+//       solved here. Candidate future mechanisms (named, NOT built):
+//       downstream consulting the authoritative epoch directly instead
+//       of a propagated cache; an atomic publication/authority boundary;
+//       a revocation handshake; resource-side epoch authority; other
+//       mechanisms.
+// Related, NOT separately exercised here (per this mission's explicit
+// instruction not to build more than one new layer at a time): whether
+// authority and provider can PERMANENTLY (not just transiently) disagree;
+// forged/lost propagation acknowledgments (this candidate uses
+// synchronous publication, not acknowledgment, so this did not arise);
+// an ownership counter resetting independently of authority.
+// Recommended next PATH: PATH-055, choosing ONE of -- the handoff-
+// atomicity/revocation boundary (stop condition 2, arguably the most
+// direct continuation of this mission); trust/authenticity of the epoch
+// authority itself (who may write to `Path054AuthoritativeEpochStore`,
+// and what if THAT is forged); same-token idempotency (PATH-053-O/
+// PATH-054-Q, still open, still separate); or reconciliation between a
+// surviving authority and a provider whose cache disagrees with it in a
+// way this file's simple "replay repairs" story does not cover (e.g. two
+// DIFFERENT non-empty values in permanent disagreement). Only one of
+// these should be taken up next.
+//
+// KNOWN FROM LITERATURE (PKV-TRANSACTION-RECOVERY-MAP-001.md, read for
+// terminology/context only -- nothing above is claimed as tested beyond
+// PATH-054's own candidate, and no source is claimed to PROVE this
+// file's result): fencing tokens (Kleppmann, ch. 8) are the named
+// mechanism this file instantiates; the literature does not, in this
+// experiment's reading, separately name "authoritative epoch persistence"
+// and "downstream epoch visibility" as two distinct sub-steps the way
+// this PATH's mission does -- that split is this file's own test-local
+// construction, built to make PATH-053-F2's gap independently
+// diagnosable, not attributed to any cited source.
+//
+// NOT ESTABLISHED: that synchronous publication (this candidate's chosen
+// mechanism for step 3) is the ONLY or universally necessary way to
+// guarantee propagation-before-Granted -- acknowledgment-based and other
+// mechanisms are named in this mission's brief but not built or measured
+// here. That per-key epoch counters (used throughout, unlike PATH-053's
+// global counter) are required rather than merely convenient. Any
+// resolution of PATH-054-H's double-loss stop condition or PATH-054-D2's
+// handoff-atomicity stop condition. That `Path054AuthoritativeEpochStore`
+// models any real durable storage system -- it is an in-memory,
+// test-local structure whose survival is an assumed modeling condition
+// in the worlds that assert it, never an experimentally proven storage
+// guarantee. Real external provider, authority-service, or
+// distributed-lock-manager behavior -- `Path054AuthoritativeEpochStore`
+// and `Path054FencedProvider` remain this experiment's own test-only
+// constructions. Any novel theoretical result, and no claim that
+// consensus or replication is necessary for any of this -- this
+// candidate's authority store is a single, unreplicated struct, not a
+// claim about what a real system requires.
+//
+// NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, NO CONSENSUS-NECESSITY CLAIM,
+// PRODUCTION UNTOUCHED.
