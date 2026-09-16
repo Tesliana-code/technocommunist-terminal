@@ -21232,3 +21232,906 @@ fn path_055_p_real_threads_atomic_candidate_forbids_stale_commit_after_revocatio
 // NO NOVELTY, NO EXTERNAL-PROVIDER CLAIM, NO CONSENSUS-NECESSITY CLAIM,
 // NO DATABASE-TRANSACTION-NECESSITY CLAIM, NO UNIVERSAL-MUTEX CLAIM,
 // PRODUCTION UNTOUCHED.
+
+// =====================================================================
+// PATH-056 -- CROSS-SYSTEM REVOCATION / REMOTE EFFECT BOUNDARY (H27)
+//
+// PATH-055 confirmed H26 for an IN-PROCESS candidate: fusing epoch
+// advancement and validate-and-commit into one indivisible operation on
+// ONE struct closes the check-to-effect TOCTOU (PATH-055-C) that direct
+// authority consultation alone left open. But PATH-055's own NOT
+// ESTABLISHED section flagged the obvious next question: that fusion
+// used ONE shared struct in ONE process. H27 asks what happens once
+// epoch authority and effect commitment are genuinely TWO separate,
+// independently mutable, independently failing systems -- no shared
+// struct, no shared lock, only values a caller carries between them.
+//
+//   H27: When epoch authority and effect commitment live in separate
+//   independently failing systems, a local validate-and-send protocol
+//   cannot inherit PATH-055 candidate 2's in-process ordering guarantee
+//   merely by carrying a fresh epoch token across the boundary. The
+//   remote effect resource must itself participate in whatever
+//   ordering/fencing rule is expected to reject stale work.
+//
+// TWO-SYSTEM MODEL, deliberately never fused:
+//
+//   SYSTEM A -- `Path056EpochAuthority`. Owns `current_epoch[K]` only.
+//   Mirrors PATH-054/055's authority store; nothing new.
+//
+//   SYSTEM B -- the remote effect resource, modeled as THREE separate
+//   test-local candidates (never all three active in one test, and
+//   NEVER merged into System A's struct or a shared Mutex spanning
+//   both):
+//     - `Path056RemoteResourceBlind` (CANDIDATE 0) -- no epoch memory
+//       at all; commits whatever it is asked to commit.
+//     - `Path056RemoteResourceFenced` (CANDIDATE 1) -- has its OWN
+//       `visible_epoch[K]`, populated only by an explicit
+//       `install_epoch` call, exactly like PATH-054's provider. This is
+//       "remote holds a LOCAL COPY of an externally issued epoch."
+//     - `Path056RemoteEffectAuthority` (CANDIDATE 2) -- `current_epoch`
+//       and `real_effect_count` on the SAME struct, with
+//       `remote_advance_epoch` and `remote_validate_and_commit_effect`
+//       as the only two operations, the latter performing check-then-
+//       commit in ONE function call -- structurally identical in shape
+//       to PATH-055 candidate 2, but now understood as belonging to the
+//       EFFECT RESOURCE itself, not to a caller/authority process. This
+//       is "System B is its own authority for its own effect commits."
+//
+// A caller/client carries only plain values (`OccurrenceKey`, an epoch
+// token, a payload) between System A and whichever System B candidate
+// is under test -- never a shared reference, never one lock spanning
+// both. Cross-system message delivery in case Q is modeled as EXPLICIT,
+// test-controlled steps (construct a message value, then separately
+// choose to deliver it or not) -- never a real network, never assumed
+// exactly-once, never an assumed-truthful acknowledgment. Ground truth
+// (`real_effect_count`) remains assertion-only throughout, exactly as in
+// every prior PATH in this series.
+// =====================================================================
+
+/// SYSTEM A -- authority. Deliberately identical in shape to
+/// `Path054AuthoritativeEpochStore` / PATH-055's authority reuse --
+/// nothing new is being tested about System A's OWN internal behavior
+/// here, only about what crossing the boundary to System B does and
+/// does not preserve.
+#[derive(Debug, Clone, Default)]
+struct Path056EpochAuthority {
+    current_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+}
+
+impl Path056EpochAuthority {
+    fn advance(&mut self, key: OccurrenceKey, epoch: u64) {
+        let entry = self.current_epoch.entry(key).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+    }
+
+    fn current(&self, key: &OccurrenceKey) -> Option<u64> {
+        self.current_epoch.get(key).copied()
+    }
+}
+
+/// SYSTEM B, CANDIDATE 0 -- the remote resource has NO epoch memory at
+/// all. A caller may have validated a token against System A beforehand
+/// (modeled by simply calling `Path056EpochAuthority::current` and
+/// comparing, with no stored proof carried anywhere) but this struct
+/// cannot tell a stale request from a current one -- it commits
+/// whatever arrives. This is the baseline PATH-055-C gap reproduced
+/// ACROSS a system boundary instead of across two function calls in one
+/// process.
+#[derive(Debug, Clone, Default)]
+struct Path056RemoteResourceBlind {
+    ground_truth: GroundTruthEffectLog,
+}
+
+impl Path056RemoteResourceBlind {
+    fn commit_blind_effect(&mut self, payload: ContributionEvent) {
+        self.ground_truth.real_effect_count += 1;
+        let _ = payload;
+    }
+}
+
+/// SYSTEM B, CANDIDATE 1 -- the remote resource holds its OWN
+/// `visible_epoch[K]`, populated ONLY by an explicit `install_epoch`
+/// call -- never automatically, never by reading System A directly.
+/// This is "System A's epoch, propagated to a LOCAL COPY at the remote
+/// resource," structurally identical to PATH-054's
+/// `Path054FencedProvider::visible_epoch`, now living in a genuinely
+/// separate struct with no access back into `Path056EpochAuthority` at
+/// all.
+#[derive(Debug, Clone, Default)]
+struct Path056RemoteResourceFenced {
+    visible_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+    ground_truth: GroundTruthEffectLog,
+}
+
+impl Path056RemoteResourceFenced {
+    /// MONOTONIC, like every prior propagation step in this series
+    /// (relied on by case H).
+    fn install_epoch(&mut self, key: OccurrenceKey, epoch: u64) {
+        let entry = self.visible_epoch.entry(key).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+    }
+
+    /// An unobserved key defaults to "accept anything" -- the same
+    /// permissive default every candidate in this series has used for a
+    /// key the enforcement point has never been told about.
+    fn accept_and_commit(&mut self, key: OccurrenceKey, payload: ContributionEvent, token: u64) -> Result<(), Path054FencingRejection> {
+        let visible = self.visible_epoch.get(&key).copied().unwrap_or(0);
+        if token < visible {
+            return Err(Path054FencingRejection { attempted: token, visible });
+        }
+        self.ground_truth.real_effect_count += 1;
+        let _ = payload;
+        Ok(())
+    }
+}
+
+/// SYSTEM B, CANDIDATE 2 -- the remote resource IS its own authority
+/// for whether its effect commits. `remote_advance_epoch` and
+/// `remote_validate_and_commit_effect` are both `&mut self` methods on
+/// the SAME struct, the mission's exact names, and the latter performs
+/// check-then-commit in ONE function call -- structurally identical to
+/// PATH-055's `Path055AuthorityAndEffectState`, but the point of testing
+/// it again here is semantic, not mechanical: this ordering domain now
+/// belongs to the EFFECT RESOURCE, which may be a genuinely different
+/// system than whatever issues ownership/intent (`Path056EpochAuthority`
+/// may still coordinate ownership, but does not decide whether THIS
+/// struct's effect commits).
+#[derive(Debug, Clone, Default)]
+struct Path056RemoteEffectAuthority {
+    current_epoch: std::collections::HashMap<OccurrenceKey, u64>,
+    ground_truth: GroundTruthEffectLog,
+    completion_memory: CompletionMemory,
+}
+
+impl Path056RemoteEffectAuthority {
+    fn remote_advance_epoch(&mut self, key: OccurrenceKey, epoch: u64) {
+        let entry = self.current_epoch.entry(key).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+    }
+
+    fn remote_validate_and_commit_effect(&mut self, key: OccurrenceKey, token: u64, payload: ContributionEvent) -> Result<(), Path054FencingRejection> {
+        let current = self.current_epoch.get(&key).copied().unwrap_or(0);
+        if token < current {
+            return Err(Path054FencingRejection { attempted: token, visible: current });
+        }
+        self.ground_truth.real_effect_count += 1;
+        self.completion_memory.persist(key, payload);
+        Ok(())
+    }
+
+    fn query_completion(&self, key: &OccurrenceKey) -> Option<ContributionEvent> {
+        self.completion_memory.query(key)
+    }
+}
+
+/// EXPLICIT, TEST-CONTROLLED cross-system message (case Q only) --
+/// represents "install epoch E for key K at the remote resource" as a
+/// plain value a test can construct and then separately CHOOSE to
+/// deliver or not. This is NOT a network: there is no queue, no retry,
+/// no timeout -- only the three steps this mission's brief names
+/// (send/update pending, deliver, acknowledge), each an explicit
+/// function call a test invokes or deliberately skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path056InstallMessage {
+    epoch: u64,
+}
+
+fn path_056_send_install_message(epoch: u64) -> Path056InstallMessage {
+    Path056InstallMessage { epoch }
+}
+
+/// DELIVERY, as its own explicit step -- a test that wants to model a
+/// lost/delayed message simply never calls this.
+fn path_056_deliver_install_message(remote: &mut Path056RemoteResourceFenced, key: &OccurrenceKey, message: Path056InstallMessage) {
+    remote.install_epoch(key.clone(), message.epoch);
+}
+
+/// ACKNOWLEDGMENT, as its own explicit step -- System A's ONLY way to
+/// learn anything about System B's state. If a test never calls this
+/// (case Q2 -- an UNOBSERVED CONFIRMATION, consistent with but not a
+/// unique proof of a lost acknowledgment specifically), System A's own
+/// bookkeeping (`Path056TakeoverStatus`) simply never advances,
+/// REGARDLESS of what System B has actually already done.
+fn path_056_check_remote_installed(remote: &Path056RemoteResourceFenced, key: &OccurrenceKey, epoch: u64) -> bool {
+    remote.visible_epoch.get(key) == Some(&epoch)
+}
+
+/// SYSTEM A's OWN coordinator-side view of whether its takeover is
+/// effect-authoritative yet -- deliberately a SEPARATE piece of state
+/// from anything System B actually knows. Case Q2 is built specifically
+/// to show these two can diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path056TakeoverStatus {
+    Pending,
+    ConfirmedInstalled,
+}
+
+// ---------------------------------------------------------------------
+// Mandatory cases A-P, the main adversarial case Q (split Q1-Q4), plus
+// one supplementary real-thread case (R).
+// ---------------------------------------------------------------------
+
+/// PATH-056-A -- LOCAL PREFLIGHT TOCTOU ACROSS SYSTEMS (CANDIDATE 0).
+/// A validates token 1 against System A while epoch 1 is current
+/// (a plain local comparison, proving nothing to System B). System A
+/// then advances to epoch 2. A's ALREADY-authorized remote request
+/// (constructed before revocation) arrives at the BLIND remote resource,
+/// which has no epoch memory at all and commits it. B's own current
+/// request is then separately committed. Expected: 2 effects --
+/// PATH-055-C's witness, reproduced across a system boundary instead of
+/// across two function calls in one process. Core interpretation:
+/// authorization proof at System A != revocation enforcement at System B.
+#[test]
+fn path_056_a_local_preflight_toctou_across_systems() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path056EpochAuthority::default();
+    let mut remote = Path056RemoteResourceBlind::default();
+
+    authority.advance(key.clone(), 1);
+    // A validates LOCALLY against System A -- proves nothing to System B.
+    let a_local_check = authority.current(&key) == Some(1);
+    assert!(a_local_check, "token 1 validated locally against System A while it is current");
+
+    // System A takes over: epoch advances to 2. A's request was already
+    // "authorized" above and does not re-check.
+    authority.advance(key.clone(), 2);
+
+    // A's already-authorized, now-stale request reaches the BLIND remote
+    // resource, which has no way to know anything changed.
+    remote.commit_blind_effect(payload.clone());
+    assert_eq!(remote.ground_truth.real_effect_count, 1, "stale work committed at the remote resource -- it never validated anything");
+
+    // B's own current-epoch request also commits.
+    remote.commit_blind_effect(payload);
+    assert_eq!(
+        remote.ground_truth.real_effect_count, 2,
+        "CROSS-SYSTEM TOCTOU: local authorization proof at System A does not revoke a stale request already headed to System B"
+    );
+}
+
+/// PATH-056-B -- REMOTE FENCE, CURRENT EPOCH VISIBLE (CANDIDATE 1
+/// baseline). Once the remote resource's OWN `visible_epoch` is 2, a
+/// stale token 1 is rejected and the current token 2 is accepted --
+/// giving System B its own epoch memory closes the baseline case.
+#[test]
+fn path_056_b_remote_fence_current_epoch_visible() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key.clone(), 2);
+
+    let stale = remote.accept_and_commit(key.clone(), payload.clone(), 1);
+    assert_eq!(stale, Err(Path054FencingRejection { attempted: 1, visible: 2 }));
+
+    let current = remote.accept_and_commit(key, payload, 2);
+    assert!(current.is_ok());
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-056-C -- MANDATORY PACOV: AUTHORITY AHEAD, REMOTE BEHIND. System
+/// A has advanced to epoch 2; System B's own `visible_epoch` still says
+/// 1 (propagation has not reached it yet). A stale token-1 request
+/// arrives at the remote resource BEFORE that propagation: ACCEPTED,
+/// because the remote's own enforcement state has not yet learned
+/// epoch 2. Propagation then completes, and B's current token 2 is also
+/// accepted. Expected: 2 effects. Moving fencing to the remote resource
+/// changes WHERE enforcement occurs -- it does not, by itself, remove
+/// the epoch-DISTRIBUTION problem: the remote must still learn the
+/// current epoch from somewhere, and can still lag.
+#[test]
+fn path_056_c_remote_fence_authority_ahead_resource_behind() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path056EpochAuthority::default();
+    let mut remote = Path056RemoteResourceFenced::default();
+
+    authority.advance(key.clone(), 1);
+    remote.install_epoch(key.clone(), 1);
+    authority.advance(key.clone(), 2); // System A is ahead now.
+    assert_eq!(authority.current(&key), Some(2));
+    assert_eq!(remote.visible_epoch.get(&key), Some(&1), "System B has not yet learned epoch 2");
+
+    let stale_result = remote.accept_and_commit(key.clone(), payload.clone(), 1);
+    assert!(stale_result.is_ok(), "accepted -- the remote's own enforcement state has not caught up to System A yet");
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+
+    remote.install_epoch(key.clone(), 2); // propagation reaches the remote.
+    let current_result = remote.accept_and_commit(key, payload, 2);
+    assert!(current_result.is_ok());
+    assert_eq!(
+        remote.ground_truth.real_effect_count, 2,
+        "moving fencing to the remote resource changes WHERE enforcement happens, not whether the remote has current authority -- the distribution gap reappears one layer later"
+    );
+}
+
+/// PATH-056-D -- REMOTE EFFECT-RESOURCE AUTHORITY, EFFECT WINS
+/// (CANDIDATE 2). Token 1's validate-and-commit, run entirely inside
+/// System B's own indivisible operation, wins the race against System
+/// B's own subsequent epoch advancement. Expected: the pre-revocation
+/// effect commits (relative to System B's OWN revocation ordering --
+/// this says nothing about whether the resulting effect HISTORY is
+/// economically correct; see PATH-056-P / FIND-029).
+#[test]
+fn path_056_d_remote_effect_resource_authority_effect_wins() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteEffectAuthority::default();
+    remote.current_epoch.insert(key.clone(), 1);
+
+    let result = remote.remote_validate_and_commit_effect(key.clone(), 1, payload);
+    assert!(result.is_ok(), "linearizes before System B's own revocation");
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+
+    remote.remote_advance_epoch(key, 2);
+    assert_eq!(remote.ground_truth.real_effect_count, 1, "revocation does not retroactively erase the already-committed effect");
+}
+
+/// PATH-056-E -- REMOTE EFFECT-RESOURCE AUTHORITY, REVOCATION WINS.
+/// System B's own epoch advances to 2 BEFORE token 1 arrives: rejected.
+#[test]
+fn path_056_e_remote_effect_resource_authority_revocation_wins() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteEffectAuthority::default();
+    remote.current_epoch.insert(key.clone(), 1);
+    remote.remote_advance_epoch(key.clone(), 2);
+
+    let result = remote.remote_validate_and_commit_effect(key, 1, payload);
+    assert_eq!(result, Err(Path054FencingRejection { attempted: 1, visible: 2 }));
+    assert_eq!(remote.ground_truth.real_effect_count, 0);
+}
+
+/// PATH-056-F -- SYSTEM A AHEAD OF SYSTEM B. Explicit disagreement:
+/// System A's own view says epoch 2 is current (it believes the old
+/// owner revoked); System B's OWN enforcement state (candidate 1) still
+/// says epoch 1. Named consequence: System A's belief governs OWNERSHIP
+/// questions only -- it does NOT, by itself, cause System B to reject
+/// anything. System B may still accept token 1 because System B's own
+/// state is the only thing System B's `accept_and_commit` ever consults.
+#[test]
+fn path_056_f_system_a_ahead_of_system_b_disagreement() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path056EpochAuthority::default();
+    let mut remote = Path056RemoteResourceFenced::default();
+    authority.advance(key.clone(), 2);
+    remote.install_epoch(key.clone(), 1);
+
+    assert_eq!(authority.current(&key), Some(2), "System A believes the old owner is revoked");
+    assert_eq!(remote.visible_epoch.get(&key), Some(&1), "System B disagrees -- it has not been told");
+
+    let result = remote.accept_and_commit(key, payload, 1);
+    assert!(result.is_ok(), "System B, the only authority over its OWN commit, may still accept token 1 despite System A's belief");
+}
+
+/// PATH-056-G -- SYSTEM B AHEAD OF SYSTEM A. The reverse disagreement:
+/// System A's own view still says epoch 1 is current; System B's OWN
+/// enforcement state already says 2 (for instance, propagated through
+/// some other path this model does not need to specify). Named
+/// consequence: System B, governing its own commit boundary, rejects
+/// token 1 regardless of what System A currently believes.
+#[test]
+fn path_056_g_system_b_ahead_of_system_a_disagreement() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path056EpochAuthority::default();
+    let mut remote = Path056RemoteResourceFenced::default();
+    authority.advance(key.clone(), 1);
+    remote.install_epoch(key.clone(), 2);
+
+    assert_eq!(authority.current(&key), Some(1), "System A still thinks epoch 1 is current");
+    assert_eq!(remote.visible_epoch.get(&key), Some(&2), "System B is already ahead");
+
+    let result = remote.accept_and_commit(key, payload, 1);
+    assert_eq!(result, Err(Path054FencingRejection { attempted: 1, visible: 2 }), "System B rejects token 1 on its OWN authority, regardless of System A's belief");
+}
+
+/// PATH-056-H -- OUT-OF-ORDER EPOCH DELIVERY TO REMOTE. Epoch 2 is
+/// installed, then a delayed, older install(1) arrives: no downgrade
+/// (monotonicity, same property as every prior propagation step in this
+/// series).
+#[test]
+fn path_056_h_out_of_order_epoch_delivery_to_remote_no_downgrade() {
+    let (_contract, _payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key.clone(), 2);
+    remote.install_epoch(key.clone(), 1);
+    assert_eq!(remote.visible_epoch.get(&key), Some(&2), "the delayed, older install does not downgrade the remote's visible epoch");
+}
+
+/// PATH-056-I -- SKIPPED EPOCH. Remote jumps straight from unset to 3;
+/// tokens 1 and 2 are both stale, though neither was individually
+/// observed.
+#[test]
+fn path_056_i_skipped_epoch_no_contiguity_assumption_remote() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key.clone(), 3);
+    assert!(remote.accept_and_commit(key.clone(), payload.clone(), 1).is_err());
+    assert!(remote.accept_and_commit(key.clone(), payload.clone(), 2).is_err());
+    assert!(remote.accept_and_commit(key, payload, 3).is_ok());
+}
+
+/// PATH-056-J -- DIFFERENT KEYS. K1's fencing at the remote resource
+/// does not affect K2's independent domain.
+#[test]
+fn path_056_j_different_keys_independent_remote_domains() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_1 = path_047_payload("alice", "review", 40.0);
+    let payload_2 = path_047_payload("bob", "audit", 25.0);
+    let event_1 = path_047_candidate("payroll-system", "evt-1", payload_1.clone());
+    let event_2 = path_047_candidate("payroll-system", "evt-2", payload_2.clone());
+    let key_1 = path_048_occurrence_key(&contract, &event_1).unwrap();
+    let key_2 = path_048_occurrence_key(&contract, &event_2).unwrap();
+
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key_1.clone(), 2);
+
+    assert!(remote.accept_and_commit(key_1, payload_1, 1).is_err(), "K1's revoked epoch 1 rejected");
+    assert!(remote.accept_and_commit(key_2, payload_2, 1).is_ok(), "K2's own domain untouched by K1's revocation");
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+}
+
+/// PATH-056-K -- ALIAS CONVERGENCE. Two raw `SourceId`s resolving to the
+/// same canonical `OccurrenceKey` share the same remote revocation
+/// domain.
+#[test]
+fn path_056_k_alias_convergence_shares_one_remote_domain() {
+    let contract = TrustedSourceContract::trusting_with_aliases(
+        "payroll-canonical",
+        &["source-A", "source-B"],
+        SourceIdContract::both_guaranteed(),
+    );
+    let payload = path_047_payload("alice", "review", 40.0);
+    let event_a = path_047_candidate("source-A", "evt-1", payload.clone());
+    let event_b = path_047_candidate("source-B", "evt-1", payload.clone());
+    let key_a = path_048_occurrence_key(&contract, &event_a).unwrap();
+    let key_b = path_048_occurrence_key(&contract, &event_b).unwrap();
+    assert_eq!(key_a, key_b);
+
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key_a, 2);
+    assert!(remote.accept_and_commit(key_b, payload, 1).is_err(), "revocation via one alias enforced against the other -- one shared remote domain");
+}
+
+/// PATH-056-L -- PAYLOAD CONFLICT. Existing ledger-level conflict
+/// semantics (unchanged from PATH-054/055) reject before either System A
+/// or any System B candidate is ever touched.
+#[test]
+fn path_056_l_payload_conflict_rejected_before_effect() {
+    let contract = TrustedSourceContract::trusting(&[("payroll-system", SourceIdContract::both_guaranteed())]);
+    let payload_a = path_047_payload("alice", "review", 40.0);
+    let payload_b = path_047_payload("alice", "review", 999.0);
+    let reserved_event = path_047_candidate("payroll-system", "evt-1", payload_a);
+    let conflicting_event = path_047_candidate("payroll-system", "evt-1", payload_b);
+    let key = path_048_occurrence_key(&contract, &reserved_event).unwrap();
+    let mut ledger = Path048Ledger::new_attested_genesis();
+    path_048_reserve(&mut ledger, &contract, ContractVersion(1), CallId(1), &reserved_event);
+    let mut ownership = Path054RecoveryOwnership::default();
+    let provider = Path054FencedProvider::default();
+
+    let verdict = path_054_issue_epoch(&mut ownership, &mut ledger, &provider, &key, &conflicting_event, "worker-A", 0);
+    assert_eq!(verdict, Path054ClaimVerdict::Conflicted);
+
+    let remote = Path056RemoteResourceFenced::default();
+    assert_eq!(remote.ground_truth.real_effect_count, 0, "no System B candidate was ever consulted");
+}
+
+/// PATH-056-M -- COMPLETION PRESENT. Completion evidence for this exact
+/// payload already exists at the remote effect authority; no new
+/// takeover or effect is needed.
+#[test]
+fn path_056_m_completion_present_needs_no_new_effect() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteEffectAuthority::default();
+    remote.remote_advance_epoch(key.clone(), 1);
+    remote.remote_validate_and_commit_effect(key.clone(), 1, payload.clone()).expect("initial effect");
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+
+    let already_complete = remote.query_completion(&key) == Some(payload);
+    assert!(already_complete);
+    assert_eq!(remote.ground_truth.real_effect_count, 1, "no NEW effect -- the candidate is not re-invoked");
+}
+
+/// PATH-056-N -- ALREADY SETTLED. The ledger already shows settlement;
+/// no System B candidate needs to be consulted.
+#[test]
+fn path_056_n_settled_no_new_effect() {
+    let (_contract, _payload, _event, key, mut ledger) = path_054_setup();
+    path_048_confirm_settlement(&mut ledger, &key);
+    assert!(matches!(ledger.records.get(&key), Some(SettlementRecord::Settled { .. })));
+
+    let remote = Path056RemoteResourceFenced::default();
+    assert_eq!(remote.ground_truth.real_effect_count, 0);
+}
+
+/// PATH-056-O -- SAME-TOKEN REPLAY, ONE BOUNDARY TEST ONLY, under the
+/// FRESHNESS-ONLY remote candidate (candidate 1). The current token,
+/// presented twice, is accepted twice. Remote fencing != idempotency --
+/// NOT solved here.
+#[test]
+fn path_056_o_same_token_replay_not_prevented_by_remote_fencing() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key.clone(), 2);
+
+    assert!(remote.accept_and_commit(key.clone(), payload.clone(), 2).is_ok());
+    assert!(remote.accept_and_commit(key, payload, 2).is_ok(), "the SAME current token, presented again, is accepted again");
+    assert_eq!(remote.ground_truth.real_effect_count, 2, "REMOTE FENCING != IDEMPOTENCY -- a separate, still-open gap, not solved here");
+}
+
+/// PATH-056-P -- FIND-029 P0/P1 under a remote resource with PERFECT
+/// revocation ordering (candidate 2). World 0 (no historical effect) and
+/// World 1 (a prior effect legitimately committed at the remote before
+/// revocation, completion evidence lost) are both brought to the SAME
+/// current remote epoch and the SAME (absent) completion state.
+/// `remote_validate_and_commit_effect` returns the SAME verdict in both
+/// worlds; `real_effect_count` still diverges. FIND-029 remains open at
+/// the remote-resource boundary, exactly as it did at PATH-055's
+/// in-process boundary.
+#[test]
+fn path_056_p_find_029_p0_p1_under_remote_effect_resource_authority() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+
+    let mut world_0 = Path056RemoteEffectAuthority::default();
+    let mut world_1 = Path056RemoteEffectAuthority::default();
+    world_1.ground_truth.real_effect_count += 1; // historical effect, evidence lost.
+
+    assert_eq!(world_0.query_completion(&key), None);
+    assert_eq!(world_1.query_completion(&key), None, "identical -- absent completion evidence in both worlds");
+
+    world_0.remote_advance_epoch(key.clone(), 2);
+    world_1.remote_advance_epoch(key.clone(), 2);
+    assert_eq!(world_0.current_epoch.get(&key), world_1.current_epoch.get(&key), "identical remote current epoch in both worlds");
+
+    let v0 = world_0.remote_validate_and_commit_effect(key.clone(), 2, payload.clone());
+    let v1 = world_1.remote_validate_and_commit_effect(key.clone(), 2, payload);
+    assert_eq!(v0, v1, "SAME verdict in both worlds");
+
+    assert_eq!(world_0.ground_truth.real_effect_count, 1, "World 0: correct, single effect");
+    assert_eq!(world_1.ground_truth.real_effect_count, 2, "World 1: a SECOND effect, despite identical remote revocation state -- FIND-029 remains open");
+}
+
+/// PATH-056-Q1 -- CROSS-SYSTEM COMMIT GAP: install message lost/delayed.
+/// System A commits epoch 2 locally. The "install epoch 2" message to
+/// System B is never delivered (modeled by simply not calling
+/// `path_056_deliver_install_message`). A stale token-1 request reaches
+/// the remote resource, which still has no idea epoch 2 exists: ACCEPTED.
+/// Expected, matching this mission's brief: Q1 is UNSAFE for stale
+/// rejection -- a lost/delayed install message leaves the remote exactly
+/// as exposed as if propagation had never been attempted.
+#[test]
+fn path_056_q1_install_message_lost_stale_token_still_accepted() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut authority = Path056EpochAuthority::default();
+    let mut remote = Path056RemoteResourceFenced::default();
+    authority.advance(key.clone(), 1);
+    remote.install_epoch(key.clone(), 1);
+
+    authority.advance(key.clone(), 2);
+    let _message = path_056_send_install_message(2); // constructed...
+    // ...but NEVER delivered: models a lost/delayed message.
+
+    let result = remote.accept_and_commit(key, payload, 1);
+    assert!(result.is_ok(), "Q1 UNSAFE: a lost/delayed install message leaves the remote unable to reject the stale token");
+}
+
+/// PATH-056-Q2 -- CROSS-SYSTEM COMMIT GAP: UNOBSERVED CONFIRMATION /
+/// COORDINATOR KNOWLEDGE AMBIGUITY. System B DOES install epoch 2 this
+/// time, but System A never OBSERVES or CONFIRMS that installation (the
+/// test simply never calls `path_056_check_remote_installed` to update
+/// A's own coordinator state). This is CONSISTENT WITH a lost
+/// acknowledgment, but this test does not construct or lose a transport
+/// object, so it does not uniquely model, or prove, message loss
+/// specifically -- a missed check or a coordinator restart before
+/// checking would produce the identical observed state. Expected:
+/// System A's OWN `Path056TakeoverStatus` remains `Pending` forever --
+/// ambiguous for COORDINATOR progress -- even though System B has
+/// ALREADY installed the epoch and would already enforce safely if a
+/// stale request arrived. The two facts are independent: A's knowledge
+/// of B's state, and B's actual state -- proven by a direct contrast:
+/// calling `path_056_check_remote_installed` against the SAME
+/// already-installed remote shows the epoch WAS learnable all along, so
+/// the ambiguity above is about A never having observed it, not about
+/// anything B failed to do.
+#[test]
+fn path_056_q2_acknowledgment_lost_coordinator_ambiguous_but_remote_may_already_enforce() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    let message = path_056_send_install_message(2);
+    path_056_deliver_install_message(&mut remote, &key, message); // B installs it.
+
+    // System A never OBSERVES/CONFIRMS B's installed state -- the test
+    // simply never calls the check below to update A's own bookkeeping.
+    // Consistent with a lost acknowledgment, but not a unique proof of
+    // it: a missed check or a coordinator restart before checking would
+    // look identical from A's side.
+    let a_takeover_status_if_ack_lost = Path056TakeoverStatus::Pending;
+    assert_eq!(
+        a_takeover_status_if_ack_lost,
+        Path056TakeoverStatus::Pending,
+        "Q2 AMBIGUOUS: without observing confirmation, System A's own bookkeeping never learns B installed the epoch"
+    );
+
+    // CONTRAST, same already-installed state at B: if A HAD observed
+    // confirmation, it WOULD correctly learn B installed epoch 2 --
+    // proving the ambiguity above is about A's KNOWLEDGE, not about B's
+    // actual state, which was always learnable.
+    let a_takeover_status_if_ack_delivered = if path_056_check_remote_installed(&remote, &key, 2) {
+        Path056TakeoverStatus::ConfirmedInstalled
+    } else {
+        Path056TakeoverStatus::Pending
+    };
+    assert_eq!(
+        a_takeover_status_if_ack_delivered,
+        Path056TakeoverStatus::ConfirmedInstalled,
+        "B's installed state was always learnable -- only whether A observes confirmation determines whether A actually learns it"
+    );
+
+    // Yet System B ALREADY enforces correctly, independent of A's knowledge.
+    let stale_result = remote.accept_and_commit(key, payload, 1);
+    assert!(stale_result.is_err(), "System B already enforces safely -- its own state does not depend on A ever learning about it");
+}
+
+/// PATH-056-Q3 -- CROSS-SYSTEM COMMIT GAP: effect committed at the
+/// remote JUST BEFORE install. Stale token 1 is accepted and committed
+/// while the remote's own visible epoch is still 1; ONLY THEN does the
+/// install(2) message get delivered. Expected: the historical
+/// pre-install effect cannot be undone by the later install --
+/// structurally the same result as PATH-055-D/PATH-056-D, now phrased in
+/// terms of the install message's delivery order rather than an
+/// in-process epoch advancement call.
+#[test]
+fn path_056_q3_effect_committed_at_remote_just_before_install() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    remote.install_epoch(key.clone(), 1);
+
+    let pre_install_result = remote.accept_and_commit(key.clone(), payload.clone(), 1);
+    assert!(pre_install_result.is_ok(), "committed while epoch 1 was still the remote's own current epoch");
+    assert_eq!(remote.ground_truth.real_effect_count, 1);
+
+    let message = path_056_send_install_message(2);
+    path_056_deliver_install_message(&mut remote, &key, message);
+
+    assert_eq!(remote.ground_truth.real_effect_count, 1, "the later install does not, and cannot, undo the historical pre-install effect");
+}
+
+/// PATH-056-Q4 -- CROSS-SYSTEM COMMIT GAP: stale token arrives AFTER
+/// install completes. Install(2) is delivered first; the stale token-1
+/// request arrives strictly afterward: rejected. The safe case, closing
+/// the loop on Q1-Q3.
+#[test]
+fn path_056_q4_stale_token_rejected_after_install_completes() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut remote = Path056RemoteResourceFenced::default();
+    let message = path_056_send_install_message(2);
+    path_056_deliver_install_message(&mut remote, &key, message);
+
+    let result = remote.accept_and_commit(key, payload, 1);
+    assert_eq!(result, Err(Path054FencingRejection { attempted: 1, visible: 2 }), "Q4 SAFE: stale token rejected once install has completed");
+}
+
+/// PATH-056-R (supplementary, real threads, OPTIONAL). WITHIN System B
+/// candidate 2 ONLY -- one thread races
+/// `remote_validate_and_commit_effect` for stale token 1 against another
+/// thread racing `remote_advance_epoch` to 2, synchronized by one
+/// barrier, no sleeps. The Mutex wraps ONLY `Path056RemoteEffectAuthority`
+/// -- there is no System A struct in this test at all, so nothing here
+/// could be mistaken for "one lock spanning System A and System B."
+/// Allowed: A's effect commits, then epoch settles at 2; or epoch
+/// reaches 2 first and A is rejected. Forbidden, and structurally
+/// impossible by construction: epoch already at 2, yet a stale commit
+/// still lands from a pre-advance check.
+#[test]
+fn path_056_r_real_threads_remote_effect_authority_forbids_stale_commit_after_revocation() {
+    let (_contract, payload, _event, key, _ledger) = path_054_setup();
+    let mut initial = Path056RemoteEffectAuthority::default();
+    initial.current_epoch.insert(key.clone(), 1);
+
+    let remote = std::sync::Arc::new(std::sync::Mutex::new(initial));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let a_handle = {
+        let remote = std::sync::Arc::clone(&remote);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = remote.lock().expect("PATH-056 test remote mutex poisoned");
+            guard.remote_validate_and_commit_effect(key, 1, payload)
+        })
+    };
+    let b_handle = {
+        let remote = std::sync::Arc::clone(&remote);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let key = key.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut guard = remote.lock().expect("PATH-056 test remote mutex poisoned");
+            guard.remote_advance_epoch(key, 2);
+        })
+    };
+    let a_result = a_handle.join().unwrap();
+    b_handle.join().unwrap();
+
+    let guard = remote.lock().unwrap();
+    assert_eq!(guard.current_epoch.get(&key), Some(&2));
+    match a_result {
+        Ok(()) => assert_eq!(guard.ground_truth.real_effect_count, 1, "committed -- must have linearized before revocation"),
+        Err(rejection) => {
+            assert_eq!(rejection, Path054FencingRejection { attempted: 1, visible: 2 });
+            assert_eq!(guard.ground_truth.real_effect_count, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Research conclusions -- answered from the behavior demonstrated above.
+//
+// H27 CONFIRMED for the tested candidates. A validate-and-send protocol
+// does NOT inherit PATH-055 candidate 2's in-process ordering guarantee
+// merely by carrying a fresh token across a system boundary (A):
+// authorization proof at System A is not revocation enforcement at
+// System B, and a BLIND remote resource duplicates exactly like
+// PATH-055-C, now split across two systems instead of two function
+// calls. Giving System B its OWN epoch memory (candidate 1, B) removes
+// the BLINDNESS but reopens the exact PROPAGATION race PATH-054 already
+// found, one layer later (C, Q1): if the remote's epoch state is a copy
+// of something issued elsewhere, a lost or merely delayed install
+// message leaves it exactly as exposed as no propagation at all. Only
+// when the remote resource is made its OWN authority for its own commit
+// (candidate 2, D/E) does the TOCTOU close FOR THAT RESOURCE'S OWN
+// STATE, structurally identical to PATH-055's in-process result -- but
+// this closes nothing about whether that resource's epoch state agrees
+// with whatever ownership authority (System A) believes (F/G): the two
+// systems can disagree, and NEITHER is silently treated as globally
+// correct here -- System A's belief governs ownership/coordination
+// questions, System B's own state is the ONLY thing that governs
+// whether System B's effect commits.
+//
+// THE MAIN ADVERSARIAL CASE (Q1-Q4), explicit message-passing steps,
+// never a real network, never assumed-exactly-once, never an
+// assumed-truthful acknowledgment: Q1 shows a lost/delayed install
+// message is UNSAFE for stale rejection -- exactly as unsafe as no
+// propagation attempt at all. Q2 shows an UNOBSERVED CONFIRMATION --
+// System A never checking, and therefore never learning, whether B
+// installed the epoch -- creates COORDINATOR ambiguity (System A's own
+// bookkeeping never advances). This is consistent with a lost
+// acknowledgment, but the test does not construct or lose a transport
+// object, so nothing here uniquely proves message loss as the cause; a
+// missed check or a coordinator restart before checking would look
+// identical. The ambiguity is INDEPENDENT of whether System B already
+// enforces correctly -- B's own state does not need A's knowledge of it
+// to be correct, but A cannot safely ACT on an assumption that B installed
+// anything without that acknowledgment. Q3 shows a historical effect
+// committed at the remote strictly before a later install cannot be
+// undone by that install -- the same "pre-revocation effects survive"
+// property as PATH-055-D, now at the message-delivery-order boundary.
+// Q4 shows the safe case: stale rejected once install has completed. NOT
+// OVERSTATED beyond what these four deterministic cases show: no general
+// claim about acknowledgment protocols, retries, or message ordering
+// beyond the single delivery/non-delivery step each case constructs.
+//
+// H/I/J/K/L/M/N mirror PATH-054/PATH-055's monotonicity,
+// no-contiguity-assumption, per-key-independence, alias-convergence,
+// payload-conflict, completion-present, and already-settled results at
+// the remote-resource boundary -- nothing about crossing a system
+// boundary changes any of them.
+//
+// SAME-TOKEN REPLAY REMAINS SEPARATELY OPEN, NOT RE-LITIGATED (O), under
+// the freshness-only remote candidate: remote fencing answers "is this
+// token stale," never "have I already seen this exact token." This is
+// the same open gap as PATH-053-O/PATH-054-Q/PATH-055-N.
+//
+// FIND-029'S P0/P1 REMAINS OPEN AT THE REMOTE-RESOURCE BOUNDARY (P): a
+// remote resource with PERFECT, indivisible revocation ordering still
+// cannot distinguish "no prior effect" from "a prior effect already
+// committed, evidence lost" -- identical current epoch, identical
+// (absent) completion state, identical verdict, divergent effect count.
+//
+// ANSWERS TO THIS MISSION'S NAMED PRIMARY QUESTIONS: (1) what breaks --
+// the assumption that a LOCAL validation proof constrains a SEPARATE
+// system's later decision; nothing forces System B to have seen, or to
+// keep seeing, whatever System A currently believes. (2) "authority
+// validates, then client sends request" is NOT sufficient by itself (A,
+// Q1) -- it is exactly as safe as no fencing at the effect boundary
+// unless the remote resource independently enforces something. (3) YES,
+// the remote resource CAN enforce its own current epoch (B, D-G) --
+// candidate 1 with a locally-propagated copy, or candidate 2 as its own
+// authority. (4) YES -- if the remote resource learns epochs
+// asynchronously from a copy, PATH-054's propagation race reappears
+// exactly one layer later (C, Q1); making the remote its OWN authority
+// (candidate 2) sidesteps this only for that resource's OWN state, not
+// for reconciling it with a separate ownership authority. (5) if epoch
+// advancement and remote effect acceptance independently commit without
+// sharing an ordering domain, the same TOCTOU as PATH-055-C reappears
+// (A); sharing ONE ordering domain AT THE REMOTE RESOURCE ITSELF (not
+// spanning both systems) removes it for that resource's own commits
+// (D/E), confirmed under real concurrency in R using a lock that spans
+// ONLY System B, never System A.
+//
+// AUTHORITY OWNERSHIP QUESTION, answered per tested candidate, not
+// universally: CANDIDATE 0 -- nobody governs the remote's commit at all;
+// unsafe stale requests are always possible. CANDIDATE 1 -- the remote
+// holds a LOCAL COPY of an externally issued epoch; it is only as
+// current as its own most recent install. CANDIDATE 2 -- the remote
+// resource's OWN epoch state is authoritative for its OWN effect
+// commits, and System A (if present at all) governs ownership/intent
+// only, never the remote's commit decision. None of these three is
+// declared universally correct; each has a stated, tested consequence.
+//
+// KNOWN FROM LITERATURE (PKV-TRANSACTION-RECOVERY-MAP-001.md and the PKV
+// protocol glossary, read for terminology/context only -- nothing above
+// is claimed as tested beyond this PATH's own three System-B candidates,
+// and no source is claimed to PROVE this file's result): fencing tokens
+// and stale-writer rejection (Kleppmann, ch. 8) remain the named
+// mechanism CANDIDATES 1 AND 2 instantiate as remote stale-token
+// enforcement, now explicitly at a resource that may be a genuinely
+// separate system. CANDIDATE 0 (`Path056RemoteResourceBlind`) is the
+// deliberate NO-ENFORCEMENT control and instantiates no fencing
+// mechanism at all. "Atomic commit" / "transaction
+// commit" as named literature concepts (Gray & Lamport, "Consensus on
+// Transaction Commit") describe a DIFFERENT problem this file does not
+// build or claim to need: nothing here coordinates System A and System B
+// into one atomic outcome, and the cases in this file are constructed
+// PRECISELY to show what happens WITHOUT such coordination.
+//
+// NOT ESTABLISHED: real payment/API/provider behavior --
+// `Path056RemoteResourceBlind`, `Path056RemoteResourceFenced`, and
+// `Path056RemoteEffectAuthority` remain test-local, in-process
+// constructions standing in for "a separate system," never a real
+// network peer. Distributed-transaction necessity, consensus necessity,
+// or two-phase-commit necessity for reconciling System A and System B --
+// this file never attempts such reconciliation and takes no position on
+// whether it would require any of these. That candidate 2 (remote
+// resource as its own epoch authority) is a universally correct
+// architecture -- only that it closes the TOCTOU for that resource's OWN
+// state under the tested cases; candidates 0 and 1 remain valid
+// TEST-LOCAL ARCHITECTURE SHAPES, and the tested cases expose
+// stale-acceptance witnesses for them -- this file inspected no real
+// system, and makes no claim about which architecture a real system
+// resembles or how safe a real system built that way would be.
+// Exactly-once
+// delivery or exactly-once effect semantics -- Q1-Q4 model AT-MOST-ONCE
+// delivery attempts explicitly (a message is either delivered once or
+// not delivered at all in each case), never retried delivery, and this
+// file draws no conclusion about retry-based delivery models. Any
+// resolution of FIND-029's P0/P1 ambiguity (P) or same-token idempotency
+// (O). Any novel theoretical result -- Section 2 of
+// PKV-TRANSACTION-RECOVERY-MAP-001.md's mappings and Gray & Lamport's
+// named atomic-commit problem remain standard, decades-old concepts.
+//
+// STOP CONDITIONS REACHED, NOT SOLVED HERE:
+//   (1) REMOTE EFFECT AUTHORITY AND OWNERSHIP AUTHORITY CAN PERMANENTLY
+//       DISAGREE: F/G construct only a transient mismatch (one system
+//       ahead of the other at a snapshot in time); nothing here tests
+//       whether the two can PERMANENTLY diverge with no tested repair
+//       path, the way PATH-054-H's double-loss case did for a single
+//       authority/provider pair. Named as an open question, not built.
+//   (2) SYSTEM A LACKS A TESTED RECOVERY PROTOCOL WHEN CONFIRMATION OF
+//       B'S INSTALLED STATE IS NOT OBSERVED (Q2): this can include a
+//       lost acknowledgment, a missed check, a coordinator restart
+//       before checking, or other causes -- the test does not
+//       distinguish which. System A's own `Path056TakeoverStatus` has
+//       no tested way to recover from this within this file (no retry,
+//       no re-query protocol was built) -- it simply stays `Pending`
+//       forever in the case as constructed.
+// Neither stop condition (1) nor (2) is solved here, per this mission's
+// instruction not to build the next layer in this same PATH.
+//
+// Recommended next PATH: PATH-057, choosing ONE of -- reconciling System
+// A's ownership authority with System B's own effect-commit authority
+// when the two can PERMANENTLY (not just transiently) disagree (stop
+// condition 1, arguably the most direct continuation of this mission);
+// a re-query/retry protocol for System A to recover when confirmation of
+// B's installed state is not observed, without assuming message truth
+// (stop condition 2);
+// same-token idempotency (PATH-053-O/PATH-054-Q/PATH-055-N/PATH-056-O,
+// still open); or FIND-029's historical-effect ambiguity (still open,
+// PATH-056-P). Only one of these should be taken up next.
+//
+// NO REAL NETWORK, NO EXACTLY-ONCE-DELIVERY CLAIM, NO CONSENSUS-
+// NECESSITY CLAIM, NO TWO-PHASE-COMMIT-NECESSITY CLAIM, NO UNIVERSAL-
+// ARCHITECTURE CLAIM, NO NOVELTY CLAIM, PRODUCTION UNTOUCHED.
