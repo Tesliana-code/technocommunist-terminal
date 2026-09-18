@@ -22832,3 +22832,225 @@ fn path_057_t_foreign_lineage_hop_breaks_otherwise_plausible_chain() {
         )
     );
 }
+
+
+// =====================================================================
+// PATH-058A — ASSERTED TRUST MARKER FORGERY / AUTHENTICITY BOUNDARY
+// =====================================================================
+//
+// FIND-035 assumes authority-transition evidence can be trusted.
+// This PATH attacks that assumption directly.
+//
+// Ground-truth reality below is assertion-only. Reconciliation code cannot
+// observe it. The visible evidence contains only the same test-local fields
+// PATH-057 already used.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path058EvidenceReality {
+    Genuine,
+    Forged,
+}
+
+fn path_058_ground_truth_verdict(
+    reality: Path058EvidenceReality,
+    a_current: u64,
+    claimed_new_epoch: u64,
+) -> Path057ReconcileVerdict {
+    match reality {
+        Path058EvidenceReality::Genuine => Path057ReconcileVerdict::AdvanceA {
+            from: Some(a_current),
+            to: claimed_new_epoch,
+        },
+        Path058EvidenceReality::Forged => Path057ReconcileVerdict::Unresolved,
+    }
+}
+
+#[test]
+fn path_058_a_untrusted_marker_is_rejected_control() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    let b = Path057TransitionEvidence {
+        epoch: 3,
+        lineage: 7,
+        transition_id: 30,
+        parent_transition_id: Some(20),
+        issuer: Path057Issuer::OwnershipAuthorityA,
+        trusted_origin: false,
+    };
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(2, &a, 3, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_058_b_forged_trusted_marker_is_accepted_like_genuine_evidence() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    // Ground truth says this record is forged, but every field visible to
+    // PATH-057 claims a valid trusted A-issued direct child.
+    let forged_visible =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(2, &a, 3, &forged_visible),
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(2),
+            to: 3,
+        }
+    );
+
+    assert_eq!(
+        path_058_ground_truth_verdict(Path058EvidenceReality::Forged, 2, 3),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_058_c_genuine_and_forged_worlds_are_observationally_identical() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    let genuine_visible =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+    let forged_visible = genuine_visible;
+
+    assert_eq!(genuine_visible, forged_visible);
+
+    let genuine_observed =
+        path_057_reconcile_direct_ancestry(2, &a, 3, &genuine_visible);
+    let forged_observed =
+        path_057_reconcile_direct_ancestry(2, &a, 3, &forged_visible);
+
+    assert_eq!(genuine_observed, forged_observed);
+
+    let genuine_correct =
+        path_058_ground_truth_verdict(Path058EvidenceReality::Genuine, 2, 3);
+    let forged_correct =
+        path_058_ground_truth_verdict(Path058EvidenceReality::Forged, 2, 3);
+
+    assert_ne!(genuine_correct, forged_correct);
+    assert_eq!(genuine_observed, genuine_correct);
+    assert_ne!(forged_observed, forged_correct);
+}
+
+#[test]
+fn path_058_d_internally_consistent_chain_does_not_authenticate_its_origin() {
+    let older =
+        Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    // Ground truth: transition 30 is forged. Its visible fields nevertheless
+    // form a perfect modeled A-issued link between 20 and 40.
+    let forged_intermediate =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    let newer =
+        Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert!(
+        path_057_chain_proves_descendant_strict(
+            &older,
+            &newer,
+            &[forged_intermediate],
+        )
+    );
+
+    let intermediate_reality = Path058EvidenceReality::Forged;
+    assert_eq!(intermediate_reality, Path058EvidenceReality::Forged);
+}
+
+
+// =====================================================================
+// PATH-058B — EXTERNAL AUTHENTICITY WITNESS / TRUST-ROOT RELOCATION
+// =====================================================================
+//
+// PATH-058A showed that a visible trusted_origin assertion cannot authenticate
+// itself. This candidate adds a separate modeled authority registry containing
+// the canonical transition record. The registry is an exogenous trust root in
+// this test only; no cryptographic or durability claim is made.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path058AuthorityRecord {
+    epoch: u64,
+    lineage: u64,
+    transition_id: u64,
+    parent_transition_id: Option<u64>,
+}
+
+fn path_058_authority_record(
+    evidence: &Path057TransitionEvidence,
+) -> Path058AuthorityRecord {
+    Path058AuthorityRecord {
+        epoch: evidence.epoch,
+        lineage: evidence.lineage,
+        transition_id: evidence.transition_id,
+        parent_transition_id: evidence.parent_transition_id,
+    }
+}
+
+fn path_058_verify_against_authority(
+    visible: &Path057TransitionEvidence,
+    authoritative: Option<Path058AuthorityRecord>,
+) -> bool {
+    let Some(authoritative) = authoritative else {
+        return false;
+    };
+
+    visible.is_trusted_a_issuance()
+        && path_058_authority_record(visible) == authoritative
+}
+
+#[test]
+fn path_058_e_authority_record_accepts_matching_genuine_transition() {
+    let genuine =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    let authoritative = path_058_authority_record(&genuine);
+
+    assert!(
+        path_058_verify_against_authority(&genuine, Some(authoritative))
+    );
+}
+
+#[test]
+fn path_058_f_authority_record_rejects_forged_visible_transition() {
+    let canonical =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    let forged =
+        Path057TransitionEvidence::trusted_from_a(4, 7, 30, Some(20));
+
+    let authoritative = path_058_authority_record(&canonical);
+
+    assert!(
+        !path_058_verify_against_authority(&forged, Some(authoritative))
+    );
+}
+
+#[test]
+fn path_058_g_loss_of_authority_record_restores_authenticity_ambiguity() {
+    let visible =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    assert!(
+        !path_058_verify_against_authority(&visible, None)
+    );
+}
+
+#[test]
+fn path_058_h_poisoned_authority_record_can_authenticate_the_wrong_history() {
+    let forged =
+        Path057TransitionEvidence::trusted_from_a(4, 7, 30, Some(20));
+
+    let poisoned_authoritative = path_058_authority_record(&forged);
+
+    assert!(
+        path_058_verify_against_authority(
+            &forged,
+            Some(poisoned_authoritative),
+        )
+    );
+
+    let reality = Path058EvidenceReality::Forged;
+    assert_eq!(reality, Path058EvidenceReality::Forged);
+}
