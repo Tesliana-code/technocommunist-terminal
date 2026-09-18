@@ -22135,3 +22135,700 @@ fn path_056_r_real_threads_remote_effect_authority_forbids_stale_commit_after_re
 // NO REAL NETWORK, NO EXACTLY-ONCE-DELIVERY CLAIM, NO CONSENSUS-
 // NECESSITY CLAIM, NO TWO-PHASE-COMMIT-NECESSITY CLAIM, NO UNIVERSAL-
 // ARCHITECTURE CLAIM, NO NOVELTY CLAIM, PRODUCTION UNTOUCHED.
+
+
+// =====================================================================
+// PATH-057A — MINIMAL PERSISTENT A/B EPOCH RECONCILIATION CORE
+// =====================================================================
+//
+// Test-local only. This PATH asks whether numeric epoch order alone is
+// sufficient to reconcile persistent disagreement between an ownership
+// authority (System A) and an effect authority (System B).
+//
+// "trusted" below means only: explicitly marked by this test model as
+// originating from the modeled canonical issuer/lineage. It implies no
+// cryptography, PKI, signatures, tamper resistance, or real authentication.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path057Issuer {
+    OwnershipAuthorityA,
+    EffectAuthorityB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path057EpochEvidence {
+    epoch: u64,
+    lineage: u64,
+    issuer: Path057Issuer,
+    trusted_origin: bool,
+}
+
+impl Path057EpochEvidence {
+    fn trusted_from_a(epoch: u64, lineage: u64) -> Self {
+        Self {
+            epoch,
+            lineage,
+            issuer: Path057Issuer::OwnershipAuthorityA,
+            trusted_origin: true,
+        }
+    }
+
+    fn untrusted_from_b(epoch: u64, lineage: u64) -> Self {
+        Self {
+            epoch,
+            lineage,
+            issuer: Path057Issuer::EffectAuthorityB,
+            trusted_origin: false,
+        }
+    }
+
+    fn is_trusted_a_issuance(&self) -> bool {
+        self.trusted_origin && self.issuer == Path057Issuer::OwnershipAuthorityA
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path057OwnershipAuthority {
+    current_epoch: Option<u64>,
+    evidence: Option<Path057EpochEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path057EffectAuthority {
+    current_epoch: Option<u64>,
+    evidence: Option<Path057EpochEvidence>,
+    real_effect_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path057ReconcileVerdict {
+    InAgreement(u64),
+    AdvanceA { from: Option<u64>, to: u64 },
+    AdvanceB { from: Option<u64>, to: u64 },
+    Unresolved,
+}
+
+fn path_057_naive_max(a: u64, b: u64) -> Path057ReconcileVerdict {
+    if a == b {
+        Path057ReconcileVerdict::InAgreement(a)
+    } else if a > b {
+        Path057ReconcileVerdict::AdvanceB {
+            from: Some(b),
+            to: a,
+        }
+    } else {
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(a),
+            to: b,
+        }
+    }
+}
+
+fn path_057_reconcile(
+    a: &Path057OwnershipAuthority,
+    b: &Path057EffectAuthority,
+) -> Path057ReconcileVerdict {
+    let Some(ae) = a.evidence else {
+        return Path057ReconcileVerdict::Unresolved;
+    };
+
+    if !ae.is_trusted_a_issuance() {
+        return Path057ReconcileVerdict::Unresolved;
+    }
+
+    match b.evidence {
+        Some(be) => {
+            if !be.is_trusted_a_issuance() || be.lineage != ae.lineage {
+                return Path057ReconcileVerdict::Unresolved;
+            }
+
+            if ae.epoch == be.epoch {
+                Path057ReconcileVerdict::InAgreement(ae.epoch)
+            } else if ae.epoch > be.epoch {
+                Path057ReconcileVerdict::AdvanceB {
+                    from: b.current_epoch,
+                    to: ae.epoch,
+                }
+            } else {
+                Path057ReconcileVerdict::AdvanceA {
+                    from: a.current_epoch,
+                    to: be.epoch,
+                }
+            }
+        }
+        None => {
+            if let Some(b_epoch) = b.current_epoch {
+                if b_epoch > ae.epoch {
+                    return Path057ReconcileVerdict::Unresolved;
+                }
+            }
+
+            Path057ReconcileVerdict::AdvanceB {
+                from: b.current_epoch,
+                to: ae.epoch,
+            }
+        }
+    }
+}
+
+#[test]
+fn path_057_a_naive_max_a_ahead_control() {
+    assert_eq!(
+        path_057_naive_max(2, 1),
+        Path057ReconcileVerdict::AdvanceB {
+            from: Some(1),
+            to: 2,
+        }
+    );
+}
+
+#[test]
+fn path_057_b_naive_max_b_ahead_control() {
+    assert_eq!(
+        path_057_naive_max(1, 2),
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(1),
+            to: 2,
+        }
+    );
+}
+
+#[test]
+fn path_057_c_higher_number_without_authority_is_unresolved() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: Some(2),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(2, 7)),
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: Some(3),
+        evidence: Some(Path057EpochEvidence::untrusted_from_b(3, 7)),
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+    assert_eq!(b.real_effect_count, 0);
+}
+
+#[test]
+fn path_057_d_trusted_a_ahead_repairs_b() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: Some(2),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(2, 7)),
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: Some(1),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(1, 7)),
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::AdvanceB {
+            from: Some(1),
+            to: 2,
+        }
+    );
+    assert_eq!(b.real_effect_count, 0);
+}
+
+#[test]
+fn path_057_e_surviving_a_issued_evidence_repairs_regressed_a() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: Some(1),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(1, 7)),
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: Some(2),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(2, 7)),
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(1),
+            to: 2,
+        }
+    );
+    assert_eq!(b.real_effect_count, 0);
+}
+
+#[test]
+fn path_057_f_b_ahead_without_trusted_a_provenance_is_unresolved() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: Some(1),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(1, 7)),
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: Some(2),
+        evidence: Some(Path057EpochEvidence::untrusted_from_b(2, 7)),
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_057_g_double_loss_without_surviving_evidence_is_unresolved() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: None,
+        evidence: None,
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: None,
+        evidence: None,
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+    assert_eq!(b.real_effect_count, 0);
+}
+
+#[test]
+fn path_057_h_poisoned_high_number_does_not_repair_a() {
+    let a = Path057OwnershipAuthority {
+        current_epoch: Some(2),
+        evidence: Some(Path057EpochEvidence::trusted_from_a(2, 7)),
+    };
+    let b = Path057EffectAuthority {
+        current_epoch: Some(999999),
+        evidence: Some(Path057EpochEvidence::untrusted_from_b(999999, 7)),
+        real_effect_count: 0,
+    };
+
+    assert_eq!(
+        path_057_reconcile(&a, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+    assert_eq!(a.current_epoch, Some(2));
+    assert_eq!(b.real_effect_count, 0);
+}
+
+
+// =====================================================================
+// PATH-057B — DIRECT ANCESTRY VS SHARED LINEAGE LABEL
+// =====================================================================
+//
+// PATH-057A used `lineage` only as a shared domain label. That does NOT
+// prove that one epoch transition descends from another. This candidate
+// adds explicit test-local transition identity and direct parent identity.
+//
+// Scope: direct-parent evidence only. No claim about arbitrary-length
+// history, durable logs, cryptographic authenticity, or fork resolution.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path057TransitionEvidence {
+    epoch: u64,
+    lineage: u64,
+    transition_id: u64,
+    parent_transition_id: Option<u64>,
+    issuer: Path057Issuer,
+    trusted_origin: bool,
+}
+
+impl Path057TransitionEvidence {
+    fn trusted_from_a(
+        epoch: u64,
+        lineage: u64,
+        transition_id: u64,
+        parent_transition_id: Option<u64>,
+    ) -> Self {
+        Self {
+            epoch,
+            lineage,
+            transition_id,
+            parent_transition_id,
+            issuer: Path057Issuer::OwnershipAuthorityA,
+            trusted_origin: true,
+        }
+    }
+
+    fn is_trusted_a_issuance(&self) -> bool {
+        self.trusted_origin && self.issuer == Path057Issuer::OwnershipAuthorityA
+    }
+}
+
+fn path_057_is_direct_child(
+    newer: &Path057TransitionEvidence,
+    older: &Path057TransitionEvidence,
+) -> bool {
+    newer.is_trusted_a_issuance()
+        && older.is_trusted_a_issuance()
+        && newer.lineage == older.lineage
+        && newer.epoch > older.epoch
+        && newer.parent_transition_id == Some(older.transition_id)
+}
+
+fn path_057_reconcile_direct_ancestry(
+    a_current: u64,
+    a: &Path057TransitionEvidence,
+    b_current: u64,
+    b: &Path057TransitionEvidence,
+) -> Path057ReconcileVerdict {
+    if !a.is_trusted_a_issuance() || !b.is_trusted_a_issuance() {
+        return Path057ReconcileVerdict::Unresolved;
+    }
+
+    if a.lineage != b.lineage {
+        return Path057ReconcileVerdict::Unresolved;
+    }
+
+    if a.transition_id == b.transition_id && a.epoch == b.epoch {
+        return Path057ReconcileVerdict::InAgreement(a.epoch);
+    }
+
+    if path_057_is_direct_child(b, a) {
+        return Path057ReconcileVerdict::AdvanceA {
+            from: Some(a_current),
+            to: b.epoch,
+        };
+    }
+
+    if path_057_is_direct_child(a, b) {
+        return Path057ReconcileVerdict::AdvanceB {
+            from: Some(b_current),
+            to: a.epoch,
+        };
+    }
+
+    Path057ReconcileVerdict::Unresolved
+}
+
+#[test]
+fn path_057_i_same_lineage_label_without_ancestry_is_unresolved() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let b = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(10));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(2, &a, 3, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_057_j_b_directly_descends_from_a_repairs_a() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let b = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(2, &a, 3, &b),
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(2),
+            to: 3,
+        }
+    );
+}
+
+#[test]
+fn path_057_k_a_directly_descends_from_b_repairs_b() {
+    let b = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let a = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(3, &a, 2, &b),
+        Path057ReconcileVerdict::AdvanceB {
+            from: Some(2),
+            to: 3,
+        }
+    );
+}
+
+
+// =====================================================================
+// PATH-057C — FORKS, MULTI-HOP LIMIT, AND STALE REPAIR
+// =====================================================================
+//
+// This extends PATH-057B without claiming arbitrary ancestry traversal.
+// Direct-parent evidence can prove one hop only. Forks and missing
+// intermediate transitions remain unresolved in this candidate.
+
+fn path_057_install_repair_epoch(current: &mut u64, target: u64) {
+    if target > *current {
+        *current = target;
+    }
+}
+
+#[test]
+fn path_057_l_forked_children_of_same_parent_are_unresolved() {
+    let a = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+    let b = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(20));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(3, &a, 4, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_057_m_multi_hop_without_intermediate_evidence_is_unresolved() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let b = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert_eq!(
+        path_057_reconcile_direct_ancestry(2, &a, 4, &b),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_057_n_delayed_old_repair_never_downgrades_current_epoch() {
+    let mut current = 3;
+    path_057_install_repair_epoch(&mut current, 2);
+    assert_eq!(current, 3);
+
+    path_057_install_repair_epoch(&mut current, 4);
+    assert_eq!(current, 4);
+}
+
+
+// =====================================================================
+// PATH-057D — TRANSITIVE ANCESTRY REQUIRES A COMPLETE TRUSTED CHAIN
+// =====================================================================
+//
+// PATH-057B proved only direct-parent ancestry. This candidate asks whether
+// a complete trusted chain can prove multi-hop ancestry, while missing or
+// incompatible intermediate evidence remains unresolved.
+
+fn path_057_chain_proves_descendant(
+    older: &Path057TransitionEvidence,
+    newer: &Path057TransitionEvidence,
+    intermediates: &[Path057TransitionEvidence],
+) -> bool {
+    if !older.is_trusted_a_issuance()
+        || !newer.is_trusted_a_issuance()
+        || older.lineage != newer.lineage
+        || newer.epoch <= older.epoch
+    {
+        return false;
+    }
+
+    let mut current = *newer;
+
+    for _ in 0..=intermediates.len() {
+        let Some(parent_id) = current.parent_transition_id else {
+            return false;
+        };
+
+        if parent_id == older.transition_id {
+            return true;
+        }
+
+        let Some(parent) = intermediates.iter().find(|candidate| {
+            candidate.transition_id == parent_id
+                && candidate.is_trusted_a_issuance()
+                && candidate.lineage == older.lineage
+        }) else {
+            return false;
+        };
+
+        if parent.epoch >= current.epoch {
+            return false;
+        }
+
+        current = *parent;
+    }
+
+    false
+}
+
+fn path_057_reconcile_transitive_ancestry(
+    a_current: u64,
+    a: &Path057TransitionEvidence,
+    b_current: u64,
+    b: &Path057TransitionEvidence,
+    intermediates: &[Path057TransitionEvidence],
+) -> Path057ReconcileVerdict {
+    if path_057_chain_proves_descendant(a, b, intermediates) {
+        return Path057ReconcileVerdict::AdvanceA {
+            from: Some(a_current),
+            to: b.epoch,
+        };
+    }
+
+    if path_057_chain_proves_descendant(b, a, intermediates) {
+        return Path057ReconcileVerdict::AdvanceB {
+            from: Some(b_current),
+            to: a.epoch,
+        };
+    }
+
+    Path057ReconcileVerdict::Unresolved
+}
+
+#[test]
+fn path_057_o_complete_trusted_chain_proves_multi_hop_ancestry() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let three = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+    let b = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert_eq!(
+        path_057_reconcile_transitive_ancestry(2, &a, 4, &b, &[three]),
+        Path057ReconcileVerdict::AdvanceA {
+            from: Some(2),
+            to: 4,
+        }
+    );
+}
+
+#[test]
+fn path_057_p_missing_intermediate_chain_evidence_is_unresolved() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+    let b = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert_eq!(
+        path_057_reconcile_transitive_ancestry(2, &a, 4, &b, &[]),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+#[test]
+fn path_057_q_wrong_sibling_does_not_complete_the_chain() {
+    let a = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    // Trusted sibling of the required transition 30, but with a different
+    // transition identity. Numeric epoch and shared lineage are insufficient.
+    let wrong_three =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 31, Some(20));
+
+    let b = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert_eq!(
+        path_057_reconcile_transitive_ancestry(
+            2,
+            &a,
+            4,
+            &b,
+            &[wrong_three],
+        ),
+        Path057ReconcileVerdict::Unresolved
+    );
+}
+
+
+// =====================================================================
+// PATH-057E — CYCLES, CONFLICTING TRANSITION IDS, FOREIGN-LINEAGE HOPS
+// =====================================================================
+//
+// This attacks the transition chain itself. A trusted-looking parent graph
+// must not establish ancestry when it cycles, reuses one transition ID for
+// conflicting contents, or crosses into a foreign lineage.
+
+fn path_057_chain_proves_descendant_strict(
+    older: &Path057TransitionEvidence,
+    newer: &Path057TransitionEvidence,
+    intermediates: &[Path057TransitionEvidence],
+) -> bool {
+    if !older.is_trusted_a_issuance()
+        || !newer.is_trusted_a_issuance()
+        || older.lineage != newer.lineage
+        || newer.epoch <= older.epoch
+    {
+        return false;
+    }
+
+    let mut current = *newer;
+    let mut visited: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+
+    loop {
+        if !visited.insert(current.transition_id) {
+            return false;
+        }
+
+        let Some(parent_id) = current.parent_transition_id else {
+            return false;
+        };
+
+        if parent_id == older.transition_id {
+            return true;
+        }
+
+        let mut matches = intermediates
+            .iter()
+            .filter(|candidate| candidate.transition_id == parent_id);
+
+        let Some(parent) = matches.next() else {
+            return false;
+        };
+
+        // One transition identity must resolve to exactly one modeled record.
+        if matches.next().is_some() {
+            return false;
+        }
+
+        if !parent.is_trusted_a_issuance()
+            || parent.lineage != older.lineage
+            || parent.epoch >= current.epoch
+        {
+            return false;
+        }
+
+        current = *parent;
+    }
+}
+
+#[test]
+fn path_057_r_cycle_in_transition_chain_is_unresolved() {
+    let older = Path057TransitionEvidence::trusted_from_a(1, 7, 10, None);
+    let thirty = Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(40));
+    let forty = Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+    let newer = Path057TransitionEvidence::trusted_from_a(5, 7, 50, Some(40));
+
+    assert!(
+        !path_057_chain_proves_descendant_strict(
+            &older,
+            &newer,
+            &[thirty, forty],
+        )
+    );
+}
+
+#[test]
+fn path_057_s_duplicate_transition_id_with_conflicting_records_is_unresolved() {
+    let older = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    let thirty_a =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(20));
+
+    let thirty_b =
+        Path057TransitionEvidence::trusted_from_a(3, 7, 30, Some(99));
+
+    let newer =
+        Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert!(
+        !path_057_chain_proves_descendant_strict(
+            &older,
+            &newer,
+            &[thirty_a, thirty_b],
+        )
+    );
+}
+
+#[test]
+fn path_057_t_foreign_lineage_hop_breaks_otherwise_plausible_chain() {
+    let older = Path057TransitionEvidence::trusted_from_a(2, 7, 20, Some(10));
+
+    let foreign_three =
+        Path057TransitionEvidence::trusted_from_a(3, 8, 30, Some(20));
+
+    let newer =
+        Path057TransitionEvidence::trusted_from_a(4, 7, 40, Some(30));
+
+    assert!(
+        !path_057_chain_proves_descendant_strict(
+            &older,
+            &newer,
+            &[foreign_three],
+        )
+    );
+}
