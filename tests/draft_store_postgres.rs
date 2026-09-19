@@ -215,3 +215,73 @@ async fn corrupt_database_draft_is_rejected_on_read_and_finalize() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn maximum_database_revision_is_explicitly_exhausted_without_mutation() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL persistence test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let store = DraftStore::new(pool.clone());
+
+    let id = "test-store-revision-exhausted";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let original = draft(id);
+    store.insert(&original).await.unwrap();
+
+    sqlx::query(
+        "UPDATE distribution_drafts
+         SET revision = $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(i64::MAX)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let loaded = store.load(id).await.unwrap().unwrap();
+
+    assert_eq!(loaded.revision, i64::MAX as u64);
+
+    let mut changed = loaded.clone();
+    changed.money.revenue = 999_999.0;
+
+    let error = store.update(&changed, i64::MAX as u64).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        DraftStoreError::RevisionExhausted {
+            ref id,
+            revision
+        } if id == "test-store-revision-exhausted"
+            && revision == i64::MAX as u64
+    ));
+
+    let row: (i64, serde_json::Value) = sqlx::query_as(
+        "SELECT revision, body
+         FROM distribution_drafts
+         WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, i64::MAX);
+
+    assert_eq!(row.1["money"]["revenue"].as_f64().unwrap(), 120_000.0);
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

@@ -19,6 +19,7 @@ pub enum DraftStoreError {
     AlreadyExists(String),
     AlreadyFinalized { id: String, revision: u64 },
     RevisionOutOfRange(u64),
+    RevisionExhausted { id: String, revision: u64 },
     CorruptRevision(i64),
     CorruptDraft { id: String, reason: String },
     NotFound(String),
@@ -43,6 +44,12 @@ impl fmt::Display for DraftStoreError {
                 write!(
                     f,
                     "draft revision {revision} exceeds PostgreSQL BIGINT range"
+                )
+            }
+            Self::RevisionExhausted { id, revision } => {
+                write!(
+                    f,
+                    "draft {id} revision {revision} cannot be incremented further"
                 )
             }
             Self::CorruptRevision(revision) => {
@@ -448,6 +455,14 @@ impl DraftStore {
             .map_err(DraftStoreError::Validation)?;
 
         let expected_db_revision = revision_to_db(expected_revision)?;
+
+        if expected_db_revision == i64::MAX {
+            return Err(DraftStoreError::RevisionExhausted {
+                id: draft.id.clone(),
+                revision: expected_revision,
+            });
+        }
+
         let body = body_to_json(draft)?;
 
         let row = sqlx::query(

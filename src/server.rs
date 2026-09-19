@@ -347,6 +347,7 @@ impl IntoResponse for ApiError {
 
                     DraftStoreError::AlreadyExists(_)
                     | DraftStoreError::AlreadyFinalized { .. }
+                    | DraftStoreError::RevisionExhausted { .. }
                     | DraftStoreError::Conflict { .. } => StatusCode::CONFLICT,
 
                     DraftStoreError::NotFound(_) | DraftStoreError::RunNotFound(_) => {
