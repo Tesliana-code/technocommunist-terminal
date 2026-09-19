@@ -1,6 +1,9 @@
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{
+        Path, State,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -243,8 +246,13 @@ async fn get_draft(
 
 async fn get_finalized_run(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    path: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<FinalizedRunDetailResponse>, ApiError> {
+    let Path(id) = path.map_err(|rejection| ApiError::Request {
+        status: rejection.status(),
+        error: rejection.body_text(),
+    })?;
+
     let run = state
         .store
         .load_finalized_run(id)
