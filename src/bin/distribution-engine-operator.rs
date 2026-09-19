@@ -5,7 +5,7 @@ use distribution_machine::{
     contribution::{ContributionEvent, ContributionFactors, ContributionWeights},
     distribution::{ContributionAllocation, allocate_contribution_pool},
     ledger::MoneyLedger,
-    operator_api::{OperatorApiClient, OperatorRunHistory},
+    operator_api::{OperatorApiClient, OperatorRunDetail, OperatorRunHistory},
     protocol::DistributionPools,
 };
 use ratatui::{
@@ -21,6 +21,8 @@ const PURPLE: Color = Color::Rgb(174, 155, 208);
 const AMBER: Color = Color::Rgb(214, 168, 95);
 const MUTED: Color = Color::Rgb(122, 128, 132);
 const TEXT: Color = Color::Rgb(214, 216, 210);
+
+const OPERATOR_API_BASE_URL: &str = "http://127.0.0.1:18080";
 
 #[derive(Clone)]
 struct ContributorDraft {
@@ -133,6 +135,7 @@ struct Preview {
 enum OperatorView {
     Sandbox,
     RunHistory,
+    RunDetail,
 }
 
 struct OperatorState {
@@ -148,6 +151,7 @@ struct OperatorState {
     history_target: Option<String>,
     run_history: Option<OperatorRunHistory>,
     history_selected: usize,
+    run_detail: Option<OperatorRunDetail>,
     message: String,
     quit: bool,
 }
@@ -214,6 +218,7 @@ impl OperatorState {
             history_target: None,
             run_history: None,
             history_selected: 0,
+            run_detail: None,
             message: "SANDBOX READY · deterministic preview · no writes".into(),
             quit: false,
         }
@@ -241,7 +246,7 @@ impl OperatorState {
             return;
         };
 
-        let client = match OperatorApiClient::new("http://127.0.0.1:18080") {
+        let client = match OperatorApiClient::new(OPERATOR_API_BASE_URL) {
             Ok(client) => client,
             Err(error) => {
                 self.message = format!("RUN HISTORY CONFIG ERROR · {error}");
@@ -254,6 +259,7 @@ impl OperatorState {
                 let count = history.runs.len();
                 self.run_history = Some(history);
                 self.history_selected = 0;
+                self.run_detail = None;
                 self.view = OperatorView::RunHistory;
                 self.message = format!("RUN HISTORY · {draft_id} · {count} finalized run(s)");
             }
@@ -279,6 +285,74 @@ impl OperatorState {
         self.history_selected = self.history_selected.saturating_sub(1);
     }
 
+    fn selected_history_run_identity(&self) -> Option<(i64, String, u64)> {
+        let history = self.run_history.as_ref()?;
+        let run = history.runs.get(self.history_selected)?;
+
+        Some((run.id, history.draft_id.clone(), run.source_revision))
+    }
+
+    fn accept_run_detail(
+        &mut self,
+        expected_run_id: i64,
+        expected_draft_id: &str,
+        expected_revision: u64,
+        run: OperatorRunDetail,
+    ) -> bool {
+        if run.id != expected_run_id
+            || run.source_draft_id != expected_draft_id
+            || run.source_revision != expected_revision
+        {
+            self.message = format!(
+                "RUN DETAIL IDENTITY ERROR · expected run {expected_run_id} · draft {expected_draft_id} · rev {expected_revision}"
+            );
+            return false;
+        }
+
+        self.message = format!(
+            "IMMUTABLE RUN {} · draft {} · rev {}",
+            run.id, run.source_draft_id, run.source_revision
+        );
+        self.run_detail = Some(run);
+        self.view = OperatorView::RunDetail;
+        true
+    }
+
+    fn open_selected_run(&mut self) {
+        let Some((run_id, draft_id, revision)) = self.selected_history_run_identity() else {
+            self.message = "RUN DETAIL unavailable · no finalized run selected".into();
+            return;
+        };
+
+        let client = match OperatorApiClient::new(OPERATOR_API_BASE_URL) {
+            Ok(client) => client,
+            Err(error) => {
+                self.message = format!("RUN DETAIL CONFIG ERROR · {error}");
+                return;
+            }
+        };
+
+        match client.get_finalized_run(run_id) {
+            Ok(run) => {
+                self.accept_run_detail(run_id, &draft_id, revision, run);
+            }
+            Err(error) => {
+                self.message = format!("RUN DETAIL ERROR · {error}");
+            }
+        }
+    }
+
+    fn handle_run_detail_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = OperatorView::RunHistory;
+                self.message = "RUN HISTORY · immutable detail closed".into();
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
+            _ => {}
+        }
+    }
+
     fn handle_history_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -287,6 +361,7 @@ impl OperatorState {
             }
             KeyCode::Up => self.previous_history_run(),
             KeyCode::Down => self.next_history_run(),
+            KeyCode::Enter => self.open_selected_run(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => self.load_run_history(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
             _ => {}
@@ -472,9 +547,16 @@ impl OperatorState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.view == OperatorView::RunHistory {
-            self.handle_history_key(key);
-            return;
+        match self.view {
+            OperatorView::RunHistory => {
+                self.handle_history_key(key);
+                return;
+            }
+            OperatorView::RunDetail => {
+                self.handle_run_detail_key(key);
+                return;
+            }
+            OperatorView::Sandbox => {}
         }
 
         if self.editing {
@@ -539,10 +621,18 @@ impl OperatorState {
 
         self.draw_header(frame, root[0]);
 
-        if self.view == OperatorView::RunHistory {
-            self.draw_run_history(frame, root[1]);
-            self.draw_footer(frame, root[2]);
-            return;
+        match self.view {
+            OperatorView::RunHistory => {
+                self.draw_run_history(frame, root[1]);
+                self.draw_footer(frame, root[2]);
+                return;
+            }
+            OperatorView::RunDetail => {
+                self.draw_run_detail(frame, root[1]);
+                self.draw_footer(frame, root[2]);
+                return;
+            }
+            OperatorView::Sandbox => {}
         }
 
         let columns = Layout::default()
@@ -610,6 +700,7 @@ impl OperatorState {
         let mode = match self.view {
             OperatorView::Sandbox => "// OPERATOR SANDBOX",
             OperatorView::RunHistory => "// RUN HISTORY",
+            OperatorView::RunDetail => "// IMMUTABLE RUN",
         };
 
         let widget = Paragraph::new(Line::from(vec![
@@ -1034,12 +1125,131 @@ impl OperatorState {
         frame.render_widget(widget, area);
     }
 
+    fn draw_run_detail(&self, frame: &mut Frame, area: Rect) {
+        let Some(run) = self.run_detail.as_ref() else {
+            let widget = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "NO IMMUTABLE RUN LOADED",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Return to run history and select a finalized run.",
+                    Style::default().fg(TEXT),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .title(" IMMUTABLE RUN ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+            frame.render_widget(widget, area);
+            return;
+        };
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(9), Constraint::Min(10)])
+            .split(area);
+
+        let metadata = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Run ID       ", Style::default().fg(MUTED)),
+                Span::styled(
+                    run.id.to_string(),
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Draft        ", Style::default().fg(MUTED)),
+                Span::styled(run.source_draft_id.as_str(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("Revision     ", Style::default().fg(MUTED)),
+                Span::styled(run.source_revision.to_string(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("Finalized    ", Style::default().fg(MUTED)),
+                Span::styled(run.finalized_at.as_str(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("Protocol     ", Style::default().fg(MUTED)),
+                Span::styled(run.protocol_version.as_str(), Style::default().fg(PURPLE)),
+            ]),
+            Line::from(vec![
+                Span::styled("Engine       ", Style::default().fg(MUTED)),
+                Span::styled(run.engine_version.as_str(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("Manual       ", Style::default().fg(MUTED)),
+                Span::styled(run.manual_version.as_str(), Style::default().fg(TEXT)),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .title(" IMMUTABLE RUN METADATA ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(AMBER)),
+        );
+
+        frame.render_widget(metadata, sections[0]);
+
+        let snapshots = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[1]);
+
+        let draft_snapshot = serde_json::to_string_pretty(&run.draft_snapshot)
+            .unwrap_or_else(|error| format!("snapshot rendering error: {error}"));
+
+        let preview_snapshot = serde_json::to_string_pretty(&run.preview_snapshot)
+            .unwrap_or_else(|error| format!("snapshot rendering error: {error}"));
+
+        let draft_widget = Paragraph::new(draft_snapshot)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" DRAFT SNAPSHOT ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+        let preview_widget = Paragraph::new(preview_snapshot)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" PREVIEW SNAPSHOT ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PURPLE)),
+            );
+
+        frame.render_widget(draft_widget, snapshots[0]);
+        frame.render_widget(preview_widget, snapshots[1]);
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let lines = if self.view == OperatorView::RunHistory {
+        let lines = if self.view == OperatorView::RunDetail {
+            vec![
+                Line::from(vec![
+                    Span::styled("[Esc]", Style::default().fg(PURPLE)),
+                    Span::raw(" Run history   "),
+                    Span::styled("[Q]", Style::default().fg(MUTED)),
+                    Span::raw(" Quit"),
+                ]),
+                Line::from(Span::styled(
+                    self.message.as_str(),
+                    Style::default().fg(PURPLE),
+                )),
+            ]
+        } else if self.view == OperatorView::RunHistory {
             vec![
                 Line::from(vec![
                     Span::styled("[↑/↓]", Style::default().fg(AMBER)),
                     Span::raw(" Select   "),
+                    Span::styled("[Enter]", Style::default().fg(AMBER)),
+                    Span::raw(" Inspect   "),
                     Span::styled("[H]", Style::default().fg(MINERAL)),
                     Span::raw(" Refresh   "),
                     Span::styled("[Esc]", Style::default().fg(PURPLE)),
@@ -1228,5 +1438,63 @@ mod tests {
 
         state.previous_history_run();
         assert_eq!(state.history_selected, 0);
+    }
+
+    #[test]
+    fn exact_run_detail_identity_opens_immutable_view() {
+        use serde_json::json;
+
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunHistory;
+
+        let run = OperatorRunDetail {
+            id: 42,
+            source_draft_id: "history-proof".into(),
+            source_revision: 3,
+            draft_snapshot: json!({
+                "id": "history-proof",
+                "revision": 3
+            }),
+            preview_snapshot: json!({
+                "available_for_distribution": 35000.0
+            }),
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+        };
+
+        let accepted = state.accept_run_detail(42, "history-proof", 3, run);
+
+        assert!(accepted);
+        assert_eq!(state.view, OperatorView::RunDetail);
+        assert_eq!(state.run_detail.as_ref().unwrap().id, 42);
+    }
+
+    #[test]
+    fn mismatched_run_detail_identity_is_rejected() {
+        use serde_json::json;
+
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunHistory;
+
+        let run = OperatorRunDetail {
+            id: 42,
+            source_draft_id: "history-proof".into(),
+            source_revision: 99,
+            draft_snapshot: json!({}),
+            preview_snapshot: json!({}),
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+        };
+
+        let accepted = state.accept_run_detail(42, "history-proof", 3, run);
+
+        assert!(!accepted);
+        assert_eq!(state.view, OperatorView::RunHistory);
+        assert!(state.run_detail.is_none());
+        assert!(state.message.contains("RUN DETAIL IDENTITY ERROR"));
     }
 }
