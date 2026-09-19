@@ -210,8 +210,10 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
 
 async fn create_draft(
     State(state): State<AppState>,
-    Json(request): Json<CreateDraftRequest>,
+    payload: Result<Json<CreateDraftRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<DraftResponse>), ApiError> {
+    let request = parse_json_request(payload)?;
+
     let draft = DistributionDraft {
         id: request.id,
         revision: 0,
@@ -272,7 +274,7 @@ async fn finalize_draft(
     Path(id): Path<String>,
     payload: Result<Json<FinalizeDraftRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<FinalizedRunResponse>), ApiError> {
-    let Json(request) = payload.map_err(|error| ApiError::Request(error.body_text()))?;
+    let request = parse_json_request(payload)?;
 
     let metadata = authoritative_finalization_metadata();
 
@@ -287,8 +289,10 @@ async fn finalize_draft(
 async fn update_draft(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<UpdateDraftRequest>,
+    payload: Result<Json<UpdateDraftRequest>, JsonRejection>,
 ) -> Result<Json<DraftResponse>, ApiError> {
+    let request = parse_json_request(payload)?;
+
     let draft = DistributionDraft {
         id,
         revision: request.expected_revision,
@@ -306,6 +310,17 @@ async fn update_draft(
     Ok(Json(updated.into()))
 }
 
+fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    let Json(request) = payload.map_err(|rejection| {
+        let status = rejection.status();
+        let error = rejection.body_text();
+
+        ApiError::Request { status, error }
+    })?;
+
+    Ok(request)
+}
+
 fn authoritative_finalization_metadata() -> FinalizationMetadata {
     FinalizationMetadata {
         protocol_version: "PP-0.1-draft".to_string(),
@@ -317,7 +332,7 @@ fn authoritative_finalization_metadata() -> FinalizationMetadata {
 enum ApiError {
     Store(DraftStoreError),
     Preview(String),
-    Request(String),
+    Request { status: StatusCode, error: String },
 }
 
 impl From<DraftStoreError> for ApiError {
@@ -329,9 +344,8 @@ impl From<DraftStoreError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
-            Self::Preview(error) | Self::Request(error) => {
-                (StatusCode::UNPROCESSABLE_ENTITY, error)
-            }
+            Self::Preview(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
+            Self::Request { status, error } => (status, error),
 
             Self::Store(error) => {
                 let status = match &error {
