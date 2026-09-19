@@ -1,10 +1,11 @@
-use std::{io, time::Duration};
+use std::{env, io, time::Duration};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use distribution_machine::{
     contribution::{ContributionEvent, ContributionFactors, ContributionWeights},
     distribution::{ContributionAllocation, allocate_contribution_pool},
     ledger::MoneyLedger,
+    operator_api::{OperatorApiClient, OperatorRunHistory},
     protocol::DistributionPools,
 };
 use ratatui::{
@@ -12,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Row, Table, Wrap},
 };
 
 const MINERAL: Color = Color::Rgb(108, 148, 132);
@@ -128,6 +129,12 @@ struct Preview {
     allocations: Vec<ContributionAllocation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorView {
+    Sandbox,
+    RunHistory,
+}
+
 struct OperatorState {
     ledger: MoneyLedger,
     pools: DistributionPools,
@@ -137,6 +144,10 @@ struct OperatorState {
     field_index: usize,
     editing: bool,
     edit_buffer: String,
+    view: OperatorView,
+    history_target: Option<String>,
+    run_history: Option<OperatorRunHistory>,
+    history_selected: usize,
     message: String,
     quit: bool,
 }
@@ -199,8 +210,86 @@ impl OperatorState {
             field_index: 0,
             editing: false,
             edit_buffer: String::new(),
+            view: OperatorView::Sandbox,
+            history_target: None,
+            run_history: None,
+            history_selected: 0,
             message: "SANDBOX READY · deterministic preview · no writes".into(),
             quit: false,
+        }
+    }
+
+    fn from_environment() -> Self {
+        let mut state = Self::new();
+
+        state.history_target = env::var("DISTRIBUTION_ENGINE_DRAFT_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if let Some(id) = state.history_target.as_deref() {
+            state.message = format!("HISTORY TARGET · {id} · [H] load authoritative runs");
+        }
+
+        state
+    }
+
+    fn load_run_history(&mut self) {
+        let Some(draft_id) = self.history_target.clone() else {
+            self.message =
+                "RUN HISTORY requires DISTRIBUTION_ENGINE_DRAFT_ID · no request sent".into();
+            return;
+        };
+
+        let client = match OperatorApiClient::new("http://127.0.0.1:18080") {
+            Ok(client) => client,
+            Err(error) => {
+                self.message = format!("RUN HISTORY CONFIG ERROR · {error}");
+                return;
+            }
+        };
+
+        match client.list_finalized_runs_for_draft(&draft_id) {
+            Ok(history) => {
+                let count = history.runs.len();
+                self.run_history = Some(history);
+                self.history_selected = 0;
+                self.view = OperatorView::RunHistory;
+                self.message = format!("RUN HISTORY · {draft_id} · {count} finalized run(s)");
+            }
+            Err(error) => {
+                self.message = format!("RUN HISTORY ERROR · {error}");
+            }
+        }
+    }
+
+    fn next_history_run(&mut self) {
+        let count = self
+            .run_history
+            .as_ref()
+            .map(|history| history.runs.len())
+            .unwrap_or(0);
+
+        if count > 0 {
+            self.history_selected = (self.history_selected + 1).min(count - 1);
+        }
+    }
+
+    fn previous_history_run(&mut self) {
+        self.history_selected = self.history_selected.saturating_sub(1);
+    }
+
+    fn handle_history_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = OperatorView::Sandbox;
+                self.message = "SANDBOX READY · deterministic preview · no writes".into();
+            }
+            KeyCode::Up => self.previous_history_run(),
+            KeyCode::Down => self.next_history_run(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => self.load_run_history(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
+            _ => {}
         }
     }
 
@@ -383,6 +472,11 @@ impl OperatorState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.view == OperatorView::RunHistory {
+            self.handle_history_key(key);
+            return;
+        }
+
         if self.editing {
             self.handle_edit_key(key);
             return;
@@ -413,6 +507,7 @@ impl OperatorState {
             KeyCode::Enter => self.begin_edit(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => self.begin_edit(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => self.cycle_contributor(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => self.load_run_history(),
             _ => {}
         }
     }
@@ -443,6 +538,12 @@ impl OperatorState {
             .split(frame.area());
 
         self.draw_header(frame, root[0]);
+
+        if self.view == OperatorView::RunHistory {
+            self.draw_run_history(frame, root[1]);
+            self.draw_footer(frame, root[2]);
+            return;
+        }
 
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -506,12 +607,17 @@ impl OperatorState {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let mode = match self.view {
+            OperatorView::Sandbox => "// OPERATOR SANDBOX",
+            OperatorView::RunHistory => "// RUN HISTORY",
+        };
+
         let widget = Paragraph::new(Line::from(vec![
             Span::styled(
                 " DISTRIBUTION-ENGINE ",
                 Style::default().fg(MINERAL).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("// OPERATOR SANDBOX", Style::default().fg(AMBER)),
+            Span::styled(mode, Style::default().fg(AMBER)),
             Span::styled("  PP-0.1  DETERMINISTIC", Style::default().fg(PURPLE)),
             Span::styled("  NO AI / NO LLM", Style::default().fg(MUTED)),
         ]))
@@ -809,8 +915,144 @@ impl OperatorState {
         frame.render_widget(widget, area);
     }
 
+    fn draw_run_history(&self, frame: &mut Frame, area: Rect) {
+        let Some(history) = self.run_history.as_ref() else {
+            let widget = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "NO RUN HISTORY LOADED",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press H to load authoritative finalized-run metadata.",
+                    Style::default().fg(TEXT),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .title(" FINALIZED RUN HISTORY ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+            frame.render_widget(widget, area);
+            return;
+        };
+
+        if history.runs.is_empty() {
+            let widget = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Draft  ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        history.draft_id.as_str(),
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("NO FINALIZED RUNS", Style::default().fg(TEXT))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authoritative history is currently empty.",
+                    Style::default().fg(MUTED),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .title(" FINALIZED RUN HISTORY ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+            frame.render_widget(widget, area);
+            return;
+        }
+
+        let header = Row::new(vec![
+            "REV",
+            "RUN",
+            "FINALIZED",
+            "PROTOCOL",
+            "ENGINE",
+            "MANUAL",
+        ])
+        .style(Style::default().fg(PURPLE).add_modifier(Modifier::BOLD))
+        .bottom_margin(1);
+
+        let rows = history.runs.iter().enumerate().map(|(index, run)| {
+            let marker = if index == self.history_selected {
+                "▶"
+            } else {
+                " "
+            };
+
+            let style = if index == self.history_selected {
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+
+            Row::new(vec![
+                format!("{marker} {}", run.source_revision),
+                run.id.to_string(),
+                run.finalized_at.clone(),
+                run.protocol_version.clone(),
+                run.engine_version.clone(),
+                run.manual_version.clone(),
+            ])
+            .style(style)
+        });
+
+        let title = Line::from(vec![
+            Span::styled(" FINALIZED RUN HISTORY · ", Style::default().fg(MINERAL)),
+            Span::styled(
+                history.draft_id.clone(),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+        ]);
+
+        let widget = Table::new(
+            rows,
+            [
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(28),
+                Constraint::Length(16),
+                Constraint::Min(24),
+                Constraint::Length(20),
+            ],
+        )
+        .header(header)
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MINERAL)),
+        );
+
+        frame.render_widget(widget, area);
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let lines = if self.editing {
+        let lines = if self.view == OperatorView::RunHistory {
+            vec![
+                Line::from(vec![
+                    Span::styled("[↑/↓]", Style::default().fg(AMBER)),
+                    Span::raw(" Select   "),
+                    Span::styled("[H]", Style::default().fg(MINERAL)),
+                    Span::raw(" Refresh   "),
+                    Span::styled("[Esc]", Style::default().fg(PURPLE)),
+                    Span::raw(" Sandbox   "),
+                    Span::styled("[Q]", Style::default().fg(MUTED)),
+                    Span::raw(" Quit"),
+                ]),
+                Line::from(Span::styled(
+                    self.message.as_str(),
+                    Style::default().fg(PURPLE),
+                )),
+            ]
+        } else if self.editing {
             vec![
                 Line::from(vec![
                     Span::styled("[0-9/.]", Style::default().fg(AMBER)),
@@ -842,6 +1084,8 @@ impl OperatorState {
                     Span::raw(" Edit number   "),
                     Span::styled("[C]", Style::default().fg(AMBER)),
                     Span::raw(" Contributor   "),
+                    Span::styled("[H]", Style::default().fg(MINERAL)),
+                    Span::raw(" Run history   "),
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
@@ -898,7 +1142,7 @@ fn format_money(value: f64) -> String {
 
 fn main() -> io::Result<()> {
     ratatui::run(|terminal| {
-        let mut app = OperatorState::new();
+        let mut app = OperatorState::from_environment();
         app.run(terminal)
     })
 }
@@ -938,5 +1182,51 @@ mod tests {
         state.weights.criticality += 0.01;
 
         assert!(state.preview().is_err());
+    }
+
+    #[test]
+    fn history_without_configured_draft_does_not_send_request() {
+        let mut state = OperatorState::new();
+
+        state.load_run_history();
+
+        assert_eq!(state.view, OperatorView::Sandbox);
+        assert!(state.run_history.is_none());
+        assert!(state.message.contains("DISTRIBUTION_ENGINE_DRAFT_ID"));
+    }
+
+    #[test]
+    fn history_selection_is_bounded_by_authoritative_rows() {
+        use distribution_machine::operator_api::OperatorRunMetadata;
+
+        let run = |id, revision| OperatorRunMetadata {
+            id,
+            source_revision: revision,
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+        };
+
+        let mut state = OperatorState::new();
+
+        state.run_history = Some(OperatorRunHistory {
+            draft_id: "history-proof".into(),
+            runs: vec![run(2, 1), run(1, 0)],
+        });
+
+        state.view = OperatorView::RunHistory;
+
+        state.next_history_run();
+        assert_eq!(state.history_selected, 1);
+
+        state.next_history_run();
+        assert_eq!(state.history_selected, 1);
+
+        state.previous_history_run();
+        assert_eq!(state.history_selected, 0);
+
+        state.previous_history_run();
+        assert_eq!(state.history_selected, 0);
     }
 }
