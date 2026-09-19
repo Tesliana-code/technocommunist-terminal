@@ -304,3 +304,155 @@ async fn duplicate_create_is_json_conflict() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn postgres_domain_not_found_and_stale_update_are_json_contracts() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let missing_id = "api-contract-domain-missing";
+    let update_id = "api-contract-stale-update";
+
+    for id in [missing_id, update_id] {
+        sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/drafts/{missing_id}"), "", false),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::NOT_FOUND).await;
+
+    assert_eq!(body["error"], format!("draft not found: {missing_id}"));
+
+    let create_body = serde_json::to_vec(&draft_payload(update_id)).unwrap();
+
+    let response = call(
+        &app,
+        request(Method::POST, "/api/drafts", create_body, true),
+    )
+    .await;
+
+    let created = json_response(response, StatusCode::CREATED).await;
+    assert_eq!(created["revision"], 0);
+
+    let first_update = serde_json::to_vec(&update_payload(0)).unwrap();
+
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{update_id}"),
+            first_update.clone(),
+            true,
+        ),
+    )
+    .await;
+
+    let updated = json_response(response, StatusCode::OK).await;
+    assert_eq!(updated["revision"], 1);
+    assert_eq!(updated["money"]["revenue"], 125000.0);
+
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{update_id}"),
+            first_update,
+            true,
+        ),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::CONFLICT).await;
+
+    assert_eq!(
+        body["error"],
+        format!("draft revision conflict for {update_id}: expected revision 0")
+    );
+
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT revision
+         FROM distribution_drafts
+         WHERE id = $1",
+    )
+    .bind(update_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(revision, 1);
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(update_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn corrupt_persisted_draft_is_sanitized_at_api_boundary() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-corrupt-persisted-draft";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut corrupt_body = draft_payload(id);
+    corrupt_body.as_object_mut().unwrap().remove("id");
+
+    corrupt_body["money"]["revenue"] = json!(-1.0);
+
+    sqlx::query(
+        r#"
+        INSERT INTO distribution_drafts (id, revision, body)
+        VALUES ($1, 0, $2)
+        "#,
+    )
+    .bind(id)
+    .bind(sqlx::types::Json(corrupt_body))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/drafts/{id}"), "", false),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+
+    assert_eq!(body["error"], "internal server error");
+
+    let serialized = serde_json::to_string(&body).unwrap();
+
+    assert!(!serialized.contains("negative"));
+    assert!(!serialized.contains("database contains invalid draft"));
+    assert!(!serialized.contains(id));
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
