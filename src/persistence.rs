@@ -21,6 +21,7 @@ pub enum DraftStoreError {
     RevisionOutOfRange(u64),
     CorruptRevision(i64),
     NotFound(String),
+    RunNotFound(i64),
     Conflict { id: String, expected_revision: u64 },
     Serialization(serde_json::Error),
     Database(sqlx::Error),
@@ -47,6 +48,7 @@ impl fmt::Display for DraftStoreError {
                 write!(f, "database contains invalid negative revision {revision}")
             }
             Self::NotFound(id) => write!(f, "draft not found: {id}"),
+            Self::RunNotFound(id) => write!(f, "distribution run not found: {id}"),
             Self::Conflict {
                 id,
                 expected_revision,
@@ -116,6 +118,19 @@ pub struct FinalizedRun {
     pub protocol_version: String,
     pub engine_version: String,
     pub manual_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedRunRecord {
+    pub id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub draft_snapshot: Value,
+    pub preview_snapshot: Value,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +290,57 @@ impl DraftStore {
             pools: body.pools,
             contribution_weights: body.contribution_weights,
             contributors: body.contributors,
+        }))
+    }
+
+    pub async fn load_finalized_run(
+        &self,
+        id: i64,
+    ) -> Result<Option<FinalizedRunRecord>, DraftStoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                source_draft_id,
+                source_revision,
+                draft_snapshot,
+                preview_snapshot,
+                protocol_version,
+                engine_version,
+                manual_version,
+                finalized_at::text AS finalized_at
+            FROM distribution_runs
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let run_id: i64 = row.try_get("id")?;
+        let source_draft_id: String = row.try_get("source_draft_id")?;
+        let source_revision: i64 = row.try_get("source_revision")?;
+        let Json(draft_snapshot): Json<Value> = row.try_get("draft_snapshot")?;
+        let Json(preview_snapshot): Json<Value> = row.try_get("preview_snapshot")?;
+        let protocol_version: String = row.try_get("protocol_version")?;
+        let engine_version: String = row.try_get("engine_version")?;
+        let manual_version: String = row.try_get("manual_version")?;
+        let finalized_at: String = row.try_get("finalized_at")?;
+
+        Ok(Some(FinalizedRunRecord {
+            id: run_id,
+            source_draft_id,
+            source_revision: revision_from_db(source_revision)?,
+            draft_snapshot,
+            preview_snapshot,
+            protocol_version,
+            engine_version,
+            manual_version,
+            finalized_at,
         }))
     }
 

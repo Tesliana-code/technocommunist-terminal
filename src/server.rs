@@ -6,11 +6,14 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     contribution::ContributionWeights,
     ledger::MoneyLedger,
-    persistence::{DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun},
+    persistence::{
+        DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun, FinalizedRunRecord,
+    },
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
 };
@@ -27,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts/{id}", get(get_draft).put(update_draft))
         .route("/api/drafts/{id}/preview", post(preview_draft))
         .route("/api/drafts/{id}/finalize", post(finalize_draft))
+        .route("/api/runs/{id}", get(get_finalized_run))
         .with_state(state)
 }
 
@@ -73,6 +77,35 @@ impl From<FinalizedRun> for FinalizedRunResponse {
             protocol_version: run.protocol_version,
             engine_version: run.engine_version,
             manual_version: run.manual_version,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunDetailResponse {
+    pub id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub draft_snapshot: Value,
+    pub preview_snapshot: Value,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
+impl From<FinalizedRunRecord> for FinalizedRunDetailResponse {
+    fn from(run: FinalizedRunRecord) -> Self {
+        Self {
+            id: run.id,
+            source_draft_id: run.source_draft_id,
+            source_revision: run.source_revision,
+            draft_snapshot: run.draft_snapshot,
+            preview_snapshot: run.preview_snapshot,
+            protocol_version: run.protocol_version,
+            engine_version: run.engine_version,
+            manual_version: run.manual_version,
+            finalized_at: run.finalized_at,
         }
     }
 }
@@ -212,6 +245,19 @@ async fn get_draft(
     Ok(Json(draft.into()))
 }
 
+async fn get_finalized_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<FinalizedRunDetailResponse>, ApiError> {
+    let run = state
+        .store
+        .load_finalized_run(id)
+        .await?
+        .ok_or(DraftStoreError::RunNotFound(id))?;
+
+    Ok(Json(run.into()))
+}
+
 async fn preview_draft(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -303,7 +349,9 @@ impl IntoResponse for ApiError {
                     | DraftStoreError::AlreadyFinalized { .. }
                     | DraftStoreError::Conflict { .. } => StatusCode::CONFLICT,
 
-                    DraftStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                    DraftStoreError::NotFound(_) | DraftStoreError::RunNotFound(_) => {
+                        StatusCode::NOT_FOUND
+                    }
 
                     DraftStoreError::CorruptRevision(_)
                     | DraftStoreError::Serialization(_)
