@@ -34,6 +34,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts/{id}/preview", post(preview_draft))
         .route("/api/drafts/{id}/finalize", post(finalize_draft))
         .route("/api/runs/{id}", get(get_finalized_run))
+        .fallback(api_route_not_found)
+        .method_not_allowed_fallback(api_method_not_allowed)
         .with_state(state)
 }
 
@@ -203,6 +205,24 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+async fn api_route_not_found() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "route not found".to_string(),
+        }),
+    )
+}
+
+async fn api_method_not_allowed() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(ErrorResponse {
+            error: "method not allowed".to_string(),
+        }),
+    )
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
