@@ -241,9 +241,9 @@ impl IntoResponse for ApiError {
                     | DraftStoreError::InitialRevisionMustBeZero(_)
                     | DraftStoreError::RevisionOutOfRange(_) => StatusCode::UNPROCESSABLE_ENTITY,
 
-                    DraftStoreError::AlreadyExists(_) | DraftStoreError::Conflict { .. } => {
-                        StatusCode::CONFLICT
-                    }
+                    DraftStoreError::AlreadyExists(_)
+                    | DraftStoreError::AlreadyFinalized { .. }
+                    | DraftStoreError::Conflict { .. } => StatusCode::CONFLICT,
 
                     DraftStoreError::NotFound(_) => StatusCode::NOT_FOUND,
 

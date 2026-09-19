@@ -6,9 +6,10 @@ use sqlx::{PgPool, Row, types::Json};
 
 use crate::{
     contribution::ContributionWeights,
+    distribution::ContributionAllocation,
     ledger::MoneyLedger,
-    protocol::DistributionPools,
-    run::{ContributorMeasurement, DistributionDraft},
+    protocol::{DistributionPools, PoolAmounts},
+    run::{ContributorMeasurement, DistributionDraft, DraftPreview},
 };
 
 #[derive(Debug)]
@@ -16,6 +17,7 @@ pub enum DraftStoreError {
     Validation(String),
     InitialRevisionMustBeZero(u64),
     AlreadyExists(String),
+    AlreadyFinalized { id: String, revision: u64 },
     RevisionOutOfRange(u64),
     CorruptRevision(i64),
     NotFound(String),
@@ -32,6 +34,9 @@ impl fmt::Display for DraftStoreError {
                 write!(f, "new draft revision must be 0, received {revision}")
             }
             Self::AlreadyExists(id) => write!(f, "draft already exists: {id}"),
+            Self::AlreadyFinalized { id, revision } => {
+                write!(f, "draft {id} revision {revision} is already finalized")
+            }
             Self::RevisionOutOfRange(revision) => {
                 write!(
                     f,
@@ -92,6 +97,103 @@ impl From<&DistributionDraft> for DistributionDraftBody {
             pools: draft.pools,
             contribution_weights: draft.contribution_weights,
             contributors: draft.contributors.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizationMetadata {
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedRun {
+    pub id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DistributionDraftSnapshot {
+    id: String,
+    revision: u64,
+
+    #[serde(flatten)]
+    body: DistributionDraftBody,
+}
+
+impl From<&DistributionDraft> for DistributionDraftSnapshot {
+    fn from(draft: &DistributionDraft) -> Self {
+        Self {
+            id: draft.id.clone(),
+            revision: draft.revision,
+            body: DistributionDraftBody::from(draft),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PoolAmountsSnapshot {
+    contribution: f64,
+    stewardship: f64,
+    capital: f64,
+    organizational_reserve: f64,
+}
+
+impl From<PoolAmounts> for PoolAmountsSnapshot {
+    fn from(amounts: PoolAmounts) -> Self {
+        Self {
+            contribution: amounts.contribution,
+            stewardship: amounts.stewardship,
+            capital: amounts.capital,
+            organizational_reserve: amounts.organizational_reserve,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ContributionAllocationSnapshot {
+    contributor_id: String,
+    contribution_id: String,
+    contribution_value: f64,
+    normalized_share: f64,
+    allocated_amount: f64,
+}
+
+impl From<ContributionAllocation> for ContributionAllocationSnapshot {
+    fn from(allocation: ContributionAllocation) -> Self {
+        Self {
+            contributor_id: allocation.contributor_id,
+            contribution_id: allocation.contribution_id,
+            contribution_value: allocation.contribution_value,
+            normalized_share: allocation.normalized_share,
+            allocated_amount: allocation.allocated_amount,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DraftPreviewSnapshot {
+    available_for_distribution: f64,
+    pool_amounts: PoolAmountsSnapshot,
+    contribution_allocations: Vec<ContributionAllocationSnapshot>,
+}
+
+impl From<DraftPreview> for DraftPreviewSnapshot {
+    fn from(preview: DraftPreview) -> Self {
+        Self {
+            available_for_distribution: preview.available_for_distribution,
+            pool_amounts: preview.pool_amounts.into(),
+            contribution_allocations: preview
+                .contribution_allocations
+                .into_iter()
+                .map(ContributionAllocationSnapshot::from)
+                .collect(),
         }
     }
 }
@@ -176,6 +278,107 @@ impl DraftStore {
         }))
     }
 
+    pub async fn finalize(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        metadata: &FinalizationMetadata,
+    ) -> Result<FinalizedRun, DraftStoreError> {
+        validate_finalization_metadata(metadata)?;
+
+        let expected_db_revision = revision_to_db(expected_revision)?;
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, revision, body
+            FROM distribution_drafts
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(DraftStoreError::NotFound(id.to_string()));
+        };
+
+        let stored_id: String = row.try_get("id")?;
+        let stored_revision: i64 = row.try_get("revision")?;
+        let Json(body): Json<Value> = row.try_get("body")?;
+
+        let body: DistributionDraftBody = serde_json::from_value(body)?;
+        let revision = revision_from_db(stored_revision)?;
+
+        if revision != expected_revision {
+            return Err(DraftStoreError::Conflict {
+                id: stored_id,
+                expected_revision,
+            });
+        }
+
+        let draft = DistributionDraft {
+            id: stored_id,
+            revision,
+            money: body.money,
+            pools: body.pools,
+            contribution_weights: body.contribution_weights,
+            contributors: body.contributors,
+        };
+
+        let preview = draft.preview().map_err(DraftStoreError::Validation)?;
+
+        let draft_snapshot = serde_json::to_value(DistributionDraftSnapshot::from(&draft))?;
+
+        let preview_snapshot = serde_json::to_value(DraftPreviewSnapshot::from(preview))?;
+
+        let run_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO distribution_runs (
+                source_draft_id,
+                source_revision,
+                draft_snapshot,
+                preview_snapshot,
+                protocol_version,
+                engine_version,
+                manual_version
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (source_draft_id, source_revision) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(&draft.id)
+        .bind(expected_db_revision)
+        .bind(Json(draft_snapshot))
+        .bind(Json(preview_snapshot))
+        .bind(&metadata.protocol_version)
+        .bind(&metadata.engine_version)
+        .bind(&metadata.manual_version)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(run_id) = run_id else {
+            return Err(DraftStoreError::AlreadyFinalized {
+                id: draft.id,
+                revision: draft.revision,
+            });
+        };
+
+        tx.commit().await?;
+
+        Ok(FinalizedRun {
+            id: run_id,
+            source_draft_id: draft.id,
+            source_revision: draft.revision,
+            protocol_version: metadata.protocol_version.clone(),
+            engine_version: metadata.engine_version.clone(),
+            manual_version: metadata.manual_version.clone(),
+        })
+    }
+
     pub async fn update(
         &self,
         draft: &DistributionDraft,
@@ -238,6 +441,22 @@ impl DraftStore {
             Err(DraftStoreError::NotFound(draft.id.clone()))
         }
     }
+}
+
+fn validate_finalization_metadata(metadata: &FinalizationMetadata) -> Result<(), DraftStoreError> {
+    for (label, value) in [
+        ("protocol_version", metadata.protocol_version.as_str()),
+        ("engine_version", metadata.engine_version.as_str()),
+        ("manual_version", metadata.manual_version.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(DraftStoreError::Validation(format!(
+                "{label} cannot be empty"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn body_to_json(draft: &DistributionDraft) -> Result<Value, DraftStoreError> {
