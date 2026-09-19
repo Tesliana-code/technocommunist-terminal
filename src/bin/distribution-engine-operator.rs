@@ -10,10 +10,13 @@ use distribution_machine::{
 };
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, Wrap},
+    widgets::{
+        Block, Borders, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Table, Tabs, Wrap,
+    },
 };
 
 const MINERAL: Color = Color::Rgb(108, 148, 132);
@@ -138,6 +141,12 @@ enum OperatorView {
     RunDetail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotPane {
+    Draft,
+    Preview,
+}
+
 struct OperatorState {
     ledger: MoneyLedger,
     pools: DistributionPools,
@@ -152,6 +161,9 @@ struct OperatorState {
     run_history: Option<OperatorRunHistory>,
     history_selected: usize,
     run_detail: Option<OperatorRunDetail>,
+    snapshot_pane: SnapshotPane,
+    draft_snapshot_scroll: u16,
+    preview_snapshot_scroll: u16,
     message: String,
     quit: bool,
 }
@@ -219,6 +231,9 @@ impl OperatorState {
             run_history: None,
             history_selected: 0,
             run_detail: None,
+            snapshot_pane: SnapshotPane::Draft,
+            draft_snapshot_scroll: 0,
+            preview_snapshot_scroll: 0,
             message: "SANDBOX READY · deterministic preview · no writes".into(),
             quit: false,
         }
@@ -314,6 +329,9 @@ impl OperatorState {
             run.id, run.source_draft_id, run.source_revision
         );
         self.run_detail = Some(run);
+        self.snapshot_pane = SnapshotPane::Draft;
+        self.draft_snapshot_scroll = 0;
+        self.preview_snapshot_scroll = 0;
         self.view = OperatorView::RunDetail;
         true
     }
@@ -342,12 +360,66 @@ impl OperatorState {
         }
     }
 
+    fn snapshot_scroll_limit(&self, pane: SnapshotPane) -> u16 {
+        let Some(run) = self.run_detail.as_ref() else {
+            return 0;
+        };
+
+        let value = match pane {
+            SnapshotPane::Draft => &run.draft_snapshot,
+            SnapshotPane::Preview => &run.preview_snapshot,
+        };
+
+        let line_count = serde_json::to_string_pretty(value)
+            .map(|text| text.lines().count())
+            .unwrap_or(1);
+
+        line_count.saturating_sub(1).min(u16::MAX as usize) as u16
+    }
+
+    fn scroll_run_detail(&mut self, delta: i32) {
+        let limit = self.snapshot_scroll_limit(self.snapshot_pane);
+        let amount = delta.unsigned_abs().min(u16::MAX as u32) as u16;
+
+        let scroll = match self.snapshot_pane {
+            SnapshotPane::Draft => &mut self.draft_snapshot_scroll,
+            SnapshotPane::Preview => &mut self.preview_snapshot_scroll,
+        };
+
+        if delta < 0 {
+            *scroll = scroll.saturating_sub(amount);
+        } else {
+            *scroll = scroll.saturating_add(amount).min(limit);
+        }
+    }
+
+    fn toggle_snapshot_pane(&mut self) {
+        self.snapshot_pane = match self.snapshot_pane {
+            SnapshotPane::Draft => SnapshotPane::Preview,
+            SnapshotPane::Preview => SnapshotPane::Draft,
+        };
+
+        self.message = match self.snapshot_pane {
+            SnapshotPane::Draft => "IMMUTABLE RUN · DRAFT SNAPSHOT active".into(),
+            SnapshotPane::Preview => "IMMUTABLE RUN · PREVIEW SNAPSHOT active".into(),
+        };
+    }
+
     fn handle_run_detail_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
                 self.view = OperatorView::RunHistory;
                 self.message = "RUN HISTORY · immutable detail closed".into();
             }
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_snapshot_pane(),
+            KeyCode::Up => self.scroll_run_detail(-1),
+            KeyCode::Down => self.scroll_run_detail(1),
+            KeyCode::PageUp => self.scroll_run_detail(-10),
+            KeyCode::PageDown => self.scroll_run_detail(10),
+            KeyCode::Home => match self.snapshot_pane {
+                SnapshotPane::Draft => self.draft_snapshot_scroll = 0,
+                SnapshotPane::Preview => self.preview_snapshot_scroll = 0,
+            },
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
             _ => {}
         }
@@ -697,28 +769,34 @@ impl OperatorState {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let mode = match self.view {
-            OperatorView::Sandbox => "// OPERATOR SANDBOX",
-            OperatorView::RunHistory => "// RUN HISTORY",
-            OperatorView::RunDetail => "// IMMUTABLE RUN",
+        let selected = match self.view {
+            OperatorView::Sandbox => 0,
+            OperatorView::RunHistory => 1,
+            OperatorView::RunDetail => 2,
         };
 
-        let widget = Paragraph::new(Line::from(vec![
+        let title = Line::from(vec![
             Span::styled(
                 " DISTRIBUTION-ENGINE ",
                 Style::default().fg(MINERAL).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(mode, Style::default().fg(AMBER)),
-            Span::styled("  PP-0.1  DETERMINISTIC", Style::default().fg(PURPLE)),
-            Span::styled("  NO AI / NO LLM", Style::default().fg(MUTED)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MINERAL)),
-        );
+            Span::styled("// PP-0.1  DETERMINISTIC", Style::default().fg(PURPLE)),
+            Span::styled("  NO AI / NO LLM ", Style::default().fg(MUTED)),
+        ]);
 
-        frame.render_widget(widget, area);
+        let tabs = Tabs::new(vec!["SANDBOX", "HISTORY", "IMMUTABLE"])
+            .select(selected)
+            .style(Style::default().fg(MUTED))
+            .highlight_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            .divider(" │ ")
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+        frame.render_widget(tabs, area);
     }
 
     fn draw_money_and_pools(&self, frame: &mut Frame, area: Rect) {
@@ -777,28 +855,43 @@ impl OperatorState {
                 "Org Reserve",
                 self.pools.organizational_reserve,
             ),
-            Line::from(vec![
-                Span::styled("Pool total            ", Style::default().fg(MUTED)),
-                Span::styled(format!("{:.0}%", pool_total * 100.0), total_style),
-                Span::styled(
-                    if (pool_total - 1.0).abs() < 1e-9 {
-                        "  ✓ reconciled"
-                    } else {
-                        "  ! must equal 100%"
-                    },
-                    total_style,
-                ),
-            ]),
         ];
 
-        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" MONEY + POOLS ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MINERAL)),
-        );
+        let reconciled = (pool_total - 1.0).abs() < 1e-9;
 
-        frame.render_widget(widget, area);
+        let block = Block::default()
+            .title(" MONEY + POOLS ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MINERAL));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+
+        let ledger = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(ledger, sections[0]);
+
+        let gauge = LineGauge::default()
+            .ratio(pool_total.clamp(0.0, 1.0))
+            .label(format!(
+                "POOL TOTAL {:>3.0}% · {}",
+                pool_total * 100.0,
+                if reconciled {
+                    "RECONCILED"
+                } else {
+                    "MUST EQUAL 100%"
+                }
+            ))
+            .filled_style(total_style)
+            .unfilled_style(Style::default().fg(MUTED))
+            .filled_symbol("━")
+            .unfilled_symbol("─");
+
+        frame.render_widget(gauge, sections[1]);
     }
 
     fn draw_weights(&self, frame: &mut Frame, area: Rect) {
@@ -1207,34 +1300,93 @@ impl OperatorState {
         let preview_snapshot = serde_json::to_string_pretty(&run.preview_snapshot)
             .unwrap_or_else(|error| format!("snapshot rendering error: {error}"));
 
+        let draft_line_count = draft_snapshot.lines().count();
+        let preview_line_count = preview_snapshot.lines().count();
+
+        let draft_active = self.snapshot_pane == SnapshotPane::Draft;
+        let preview_active = self.snapshot_pane == SnapshotPane::Preview;
+
         let draft_widget = Paragraph::new(draft_snapshot)
+            .scroll((self.draft_snapshot_scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" DRAFT SNAPSHOT ")
+                    .title(if draft_active {
+                        " DRAFT SNAPSHOT · ACTIVE "
+                    } else {
+                        " DRAFT SNAPSHOT "
+                    })
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MINERAL)),
+                    .border_style(Style::default().fg(if draft_active { AMBER } else { MINERAL })),
             );
 
         let preview_widget = Paragraph::new(preview_snapshot)
+            .scroll((self.preview_snapshot_scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" PREVIEW SNAPSHOT ")
+                    .title(if preview_active {
+                        " PREVIEW SNAPSHOT · ACTIVE "
+                    } else {
+                        " PREVIEW SNAPSHOT "
+                    })
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(PURPLE)),
+                    .border_style(Style::default().fg(if preview_active { AMBER } else { PURPLE })),
             );
 
         frame.render_widget(draft_widget, snapshots[0]);
         frame.render_widget(preview_widget, snapshots[1]);
+
+        let scrollbar_margin = Margin {
+            vertical: 1,
+            horizontal: 0,
+        };
+
+        let mut draft_scrollbar_state =
+            ScrollbarState::new(draft_line_count).position(self.draft_snapshot_scroll as usize);
+
+        let draft_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .thumb_symbol("█")
+            .thumb_style(Style::default().fg(if draft_active { AMBER } else { MINERAL }));
+
+        frame.render_stateful_widget(
+            draft_scrollbar,
+            snapshots[0].inner(scrollbar_margin),
+            &mut draft_scrollbar_state,
+        );
+
+        let mut preview_scrollbar_state =
+            ScrollbarState::new(preview_line_count).position(self.preview_snapshot_scroll as usize);
+
+        let preview_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .thumb_symbol("█")
+            .thumb_style(Style::default().fg(if preview_active { AMBER } else { PURPLE }));
+
+        frame.render_stateful_widget(
+            preview_scrollbar,
+            snapshots[1].inner(scrollbar_margin),
+            &mut preview_scrollbar_state,
+        );
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let lines = if self.view == OperatorView::RunDetail {
             vec![
                 Line::from(vec![
+                    Span::styled("[Tab]", Style::default().fg(AMBER)),
+                    Span::raw(" Pane   "),
+                    Span::styled("[↑/↓]", Style::default().fg(MINERAL)),
+                    Span::raw(" Scroll   "),
+                    Span::styled("[PgUp/PgDn]", Style::default().fg(PURPLE)),
+                    Span::raw(" Page   "),
+                    Span::styled("[Home]", Style::default().fg(MUTED)),
+                    Span::raw(" Top   "),
                     Span::styled("[Esc]", Style::default().fg(PURPLE)),
-                    Span::raw(" Run history   "),
+                    Span::raw(" History   "),
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
@@ -1469,6 +1621,58 @@ mod tests {
         assert!(accepted);
         assert_eq!(state.view, OperatorView::RunDetail);
         assert_eq!(state.run_detail.as_ref().unwrap().id, 42);
+    }
+
+    #[test]
+    fn snapshot_panes_scroll_independently_and_bound_position() {
+        use serde_json::json;
+
+        let mut state = OperatorState::new();
+
+        state.run_detail = Some(OperatorRunDetail {
+            id: 42,
+            source_draft_id: "scroll-proof".into(),
+            source_revision: 3,
+            draft_snapshot: json!({
+                "a": 1,
+                "b": {
+                    "c": 2,
+                    "d": 3
+                }
+            }),
+            preview_snapshot: json!({
+                "available": 30000.0,
+                "pool": {
+                    "contribution": 10500.0,
+                    "capital": 7500.0
+                }
+            }),
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 18:00:00+00".into(),
+        });
+
+        state.view = OperatorView::RunDetail;
+        state.snapshot_pane = SnapshotPane::Draft;
+
+        state.scroll_run_detail(10_000);
+
+        let draft_limit = state.snapshot_scroll_limit(SnapshotPane::Draft);
+
+        assert_eq!(state.draft_snapshot_scroll, draft_limit);
+        assert_eq!(state.preview_snapshot_scroll, 0);
+
+        state.toggle_snapshot_pane();
+        assert_eq!(state.snapshot_pane, SnapshotPane::Preview);
+
+        state.scroll_run_detail(2);
+
+        assert_eq!(state.preview_snapshot_scroll, 2);
+        assert_eq!(state.draft_snapshot_scroll, draft_limit);
+
+        state.scroll_run_detail(-10_000);
+        assert_eq!(state.preview_snapshot_scroll, 0);
     }
 
     #[test]
