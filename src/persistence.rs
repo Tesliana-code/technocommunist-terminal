@@ -144,6 +144,16 @@ pub struct FinalizedRunRecord {
     pub finalized_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedRunMetadata {
+    pub id: i64,
+    pub source_revision: u64,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DistributionDraftSnapshot {
     id: String,
@@ -356,6 +366,64 @@ impl DraftStore {
             manual_version,
             finalized_at,
         }))
+    }
+
+    pub async fn list_finalized_runs_for_draft(
+        &self,
+        id: &str,
+    ) -> Result<Option<Vec<FinalizedRunMetadata>>, DraftStoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                r.id AS run_id,
+                r.source_revision,
+                r.protocol_version,
+                r.engine_version,
+                r.manual_version,
+                r.finalized_at::text AS finalized_at
+            FROM distribution_drafts d
+            LEFT JOIN distribution_runs r
+                ON r.source_draft_id = d.id
+            WHERE d.id = $1
+            ORDER BY
+                r.source_revision DESC NULLS LAST,
+                r.id DESC NULLS LAST
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut runs = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let run_id: Option<i64> = row.try_get("run_id")?;
+
+            let Some(run_id) = run_id else {
+                continue;
+            };
+
+            let source_revision: i64 = row.try_get("source_revision")?;
+            let protocol_version: String = row.try_get("protocol_version")?;
+            let engine_version: String = row.try_get("engine_version")?;
+            let manual_version: String = row.try_get("manual_version")?;
+            let finalized_at: String = row.try_get("finalized_at")?;
+
+            runs.push(FinalizedRunMetadata {
+                id: run_id,
+                source_revision: revision_from_db(source_revision)?,
+                protocol_version,
+                engine_version,
+                manual_version,
+                finalized_at,
+            });
+        }
+
+        Ok(Some(runs))
     }
 
     pub async fn finalize(

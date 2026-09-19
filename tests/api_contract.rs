@@ -642,3 +642,182 @@ async fn finalized_run_http_round_trip_preserves_authoritative_snapshot() {
 
     cleanup_finalized_api_contract(&pool, id).await;
 }
+
+fn finalizable_update_payload(expected_revision: u64, revenue: f64) -> Value {
+    let mut payload = finalizable_draft_payload("body-id-not-authoritative");
+
+    payload.as_object_mut().unwrap().remove("id");
+    payload["expected_revision"] = json!(expected_revision);
+    payload["money"]["revenue"] = json!(revenue);
+
+    payload
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn finalized_run_history_is_metadata_only_and_newest_revision_first() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let missing_id = "api-contract-run-history-missing";
+    let empty_id = "api-contract-run-history-empty";
+    let history_id = "api-contract-run-history";
+
+    for id in [missing_id, empty_id, history_id] {
+        cleanup_finalized_api_contract(&pool, id).await;
+    }
+
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/drafts/{missing_id}/runs"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::NOT_FOUND).await;
+
+    assert_eq!(body["error"], format!("draft not found: {missing_id}"));
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&draft_payload(empty_id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/drafts/{empty_id}/runs"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    let empty = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(empty["draft_id"], empty_id);
+    assert_eq!(empty["runs"], json!([]));
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&finalizable_draft_payload(history_id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{history_id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let revision_zero = json_response(response, StatusCode::CREATED).await;
+    let revision_zero_run_id = revision_zero["id"].as_i64().unwrap();
+
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{history_id}"),
+            serde_json::to_vec(&finalizable_update_payload(0, 125000.0)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    let updated = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(updated["revision"], 1);
+    assert_eq!(updated["money"]["revenue"], 125000.0);
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{history_id}/finalize"),
+            r#"{"expected_revision":1}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let revision_one = json_response(response, StatusCode::CREATED).await;
+    let revision_one_run_id = revision_one["id"].as_i64().unwrap();
+
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/drafts/{history_id}/runs"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    let history = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(history["draft_id"], history_id);
+
+    let runs = history["runs"]
+        .as_array()
+        .expect("run history must expose a runs array");
+
+    assert_eq!(runs.len(), 2);
+
+    assert_eq!(runs[0]["id"], revision_one_run_id);
+    assert_eq!(runs[0]["source_revision"], 1);
+
+    assert_eq!(runs[1]["id"], revision_zero_run_id);
+    assert_eq!(runs[1]["source_revision"], 0);
+
+    for run in runs {
+        assert_eq!(run["protocol_version"], "PP-0.1-draft");
+        assert_eq!(
+            run["engine_version"],
+            concat!("distribution-machine/", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(run["manual_version"], "manual/0.1-draft");
+
+        assert!(
+            run["finalized_at"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        assert!(run.get("draft_snapshot").is_none());
+        assert!(run.get("preview_snapshot").is_none());
+        assert!(run.get("source_draft_id").is_none());
+    }
+
+    for id in [empty_id, history_id] {
+        cleanup_finalized_api_contract(&pool, id).await;
+    }
+}

@@ -15,7 +15,8 @@ use crate::{
     contribution::ContributionWeights,
     ledger::MoneyLedger,
     persistence::{
-        DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun, FinalizedRunRecord,
+        DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun, FinalizedRunMetadata,
+        FinalizedRunRecord,
     },
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts/{id}", get(get_draft).put(update_draft))
         .route("/api/drafts/{id}/preview", post(preview_draft))
         .route("/api/drafts/{id}/finalize", post(finalize_draft))
+        .route("/api/drafts/{id}/runs", get(list_finalized_runs))
         .route("/api/runs/{id}", get(get_finalized_run))
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -109,6 +111,35 @@ impl From<FinalizedRunRecord> for FinalizedRunDetailResponse {
             source_revision: run.source_revision,
             draft_snapshot: run.draft_snapshot,
             preview_snapshot: run.preview_snapshot,
+            protocol_version: run.protocol_version,
+            engine_version: run.engine_version,
+            manual_version: run.manual_version,
+            finalized_at: run.finalized_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunHistoryResponse {
+    pub draft_id: String,
+    pub runs: Vec<FinalizedRunMetadataResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunMetadataResponse {
+    pub id: i64,
+    pub source_revision: u64,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
+impl From<FinalizedRunMetadata> for FinalizedRunMetadataResponse {
+    fn from(run: FinalizedRunMetadata) -> Self {
+        Self {
+            id: run.id,
+            source_revision: run.source_revision,
             protocol_version: run.protocol_version,
             engine_version: run.engine_version,
             manual_version: run.manual_version,
@@ -282,6 +313,22 @@ async fn get_finalized_run(
         .ok_or(DraftStoreError::RunNotFound(id))?;
 
     Ok(Json(run.into()))
+}
+
+async fn list_finalized_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FinalizedRunHistoryResponse>, ApiError> {
+    let runs = state
+        .store
+        .list_finalized_runs_for_draft(&id)
+        .await?
+        .ok_or_else(|| DraftStoreError::NotFound(id.clone()))?;
+
+    Ok(Json(FinalizedRunHistoryResponse {
+        draft_id: id,
+        runs: runs.into_iter().map(Into::into).collect(),
+    }))
 }
 
 async fn preview_draft(
