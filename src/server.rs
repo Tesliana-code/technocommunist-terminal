@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     contribution::ContributionWeights,
     ledger::MoneyLedger,
-    persistence::{DraftStore, DraftStoreError},
+    persistence::{DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun},
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
 };
@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts", post(create_draft))
         .route("/api/drafts/{id}", get(get_draft).put(update_draft))
         .route("/api/drafts/{id}/preview", post(preview_draft))
+        .route("/api/drafts/{id}/finalize", post(finalize_draft))
         .with_state(state)
 }
 
@@ -45,6 +46,35 @@ pub struct UpdateDraftRequest {
     pub pools: DistributionPools,
     pub contribution_weights: ContributionWeights,
     pub contributors: Vec<ContributorMeasurement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeDraftRequest {
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunResponse {
+    pub id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+}
+
+impl From<FinalizedRun> for FinalizedRunResponse {
+    fn from(run: FinalizedRun) -> Self {
+        Self {
+            id: run.id,
+            source_draft_id: run.source_draft_id,
+            source_revision: run.source_revision,
+            protocol_version: run.protocol_version,
+            engine_version: run.engine_version,
+            manual_version: run.manual_version,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +227,23 @@ async fn preview_draft(
     Ok(Json(DraftPreviewResponse::from_domain(&draft, preview)))
 }
 
+async fn finalize_draft(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<FinalizeDraftRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<FinalizedRunResponse>), ApiError> {
+    let Json(request) = payload.map_err(|error| ApiError::Request(error.body_text()))?;
+
+    let metadata = authoritative_finalization_metadata();
+
+    let run = state
+        .store
+        .finalize(&id, request.expected_revision, &metadata)
+        .await?;
+
+    Ok((StatusCode::CREATED, Json(run.into())))
+}
+
 async fn update_draft(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -219,9 +266,18 @@ async fn update_draft(
     Ok(Json(updated.into()))
 }
 
+fn authoritative_finalization_metadata() -> FinalizationMetadata {
+    FinalizationMetadata {
+        protocol_version: "PP-0.1-draft".to_string(),
+        engine_version: concat!("distribution-machine/", env!("CARGO_PKG_VERSION")).to_string(),
+        manual_version: "manual/0.1-draft".to_string(),
+    }
+}
+
 enum ApiError {
     Store(DraftStoreError),
     Preview(String),
+    Request(String),
 }
 
 impl From<DraftStoreError> for ApiError {
@@ -233,7 +289,9 @@ impl From<DraftStoreError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
-            Self::Preview(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
+            Self::Preview(error) | Self::Request(error) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, error)
+            }
 
             Self::Store(error) => {
                 let status = match &error {
