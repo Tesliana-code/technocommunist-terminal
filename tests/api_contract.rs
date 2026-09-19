@@ -456,3 +456,189 @@ async fn corrupt_persisted_draft_is_sanitized_at_api_boundary() {
         .await
         .unwrap();
 }
+
+fn finalizable_draft_payload(id: &str) -> Value {
+    let mut payload = draft_payload(id);
+
+    payload["contributors"] = json!([
+        {
+            "contributor_id": "backend",
+            "contribution_id": "backend-engineering",
+            "base_work_value": 1.0,
+            "factors": {
+                "responsibility": 1.0,
+                "criticality": 1.0,
+                "deal_impact": 1.0,
+                "stewardship": 0.0,
+                "dependency_reach": 1.0,
+                "evidence_confidence": 1.0
+            }
+        }
+    ]);
+
+    payload
+}
+
+async fn cleanup_finalized_api_contract(pool: &PgPool, id: &str) {
+    let mut tx = pool.begin().await.unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         DISABLE TRIGGER distribution_runs_reject_delete",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "DELETE FROM distribution_runs
+         WHERE source_draft_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         ENABLE TRIGGER distribution_runs_reject_delete",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn finalized_run_http_round_trip_preserves_authoritative_snapshot() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-finalized-round-trip";
+
+    cleanup_finalized_api_contract(&pool, id).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&finalizable_draft_payload(id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    let created = json_response(response, StatusCode::CREATED).await;
+
+    assert_eq!(created["id"], id);
+    assert_eq!(created["revision"], 0);
+    assert_eq!(created["money"]["revenue"], 120000.0);
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let finalized = json_response(response, StatusCode::CREATED).await;
+
+    assert_eq!(finalized["source_draft_id"], id);
+    assert_eq!(finalized["source_revision"], 0);
+    assert_eq!(finalized["protocol_version"], "PP-0.1-draft");
+    assert_eq!(
+        finalized["engine_version"],
+        concat!("distribution-machine/", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(finalized["manual_version"], "manual/0.1-draft");
+
+    let run_id = finalized["id"]
+        .as_i64()
+        .expect("finalized response must expose numeric run id");
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/runs/{run_id}"), "", false),
+    )
+    .await;
+
+    let run = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(run["id"], run_id);
+    assert_eq!(run["source_draft_id"], id);
+    assert_eq!(run["source_revision"], 0);
+    assert_eq!(run["protocol_version"], "PP-0.1-draft");
+    assert_eq!(
+        run["engine_version"],
+        concat!("distribution-machine/", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(run["manual_version"], "manual/0.1-draft");
+
+    assert_eq!(run["draft_snapshot"]["id"], id);
+    assert_eq!(run["draft_snapshot"]["revision"], 0);
+    assert_eq!(run["draft_snapshot"]["money"]["revenue"], 120000.0);
+
+    assert_eq!(
+        run["preview_snapshot"]["available_for_distribution"],
+        30000.0
+    );
+    assert_eq!(
+        run["preview_snapshot"]["pool_amounts"]["contribution"],
+        10500.0
+    );
+
+    assert!(
+        run["finalized_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{id}"),
+            serde_json::to_vec(&update_payload(0)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    let updated = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(updated["revision"], 1);
+    assert_eq!(updated["money"]["revenue"], 125000.0);
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/runs/{run_id}"), "", false),
+    )
+    .await;
+
+    let historical = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(historical["source_revision"], 0);
+    assert_eq!(historical["draft_snapshot"]["money"]["revenue"], 120000.0);
+    assert_eq!(
+        historical["preview_snapshot"]["available_for_distribution"],
+        30000.0
+    );
+
+    cleanup_finalized_api_contract(&pool, id).await;
+}
