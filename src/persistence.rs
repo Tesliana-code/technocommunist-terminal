@@ -20,6 +20,7 @@ pub enum DraftStoreError {
     AlreadyFinalized { id: String, revision: u64 },
     RevisionOutOfRange(u64),
     CorruptRevision(i64),
+    CorruptDraft { id: String, reason: String },
     NotFound(String),
     RunNotFound(i64),
     Conflict { id: String, expected_revision: u64 },
@@ -46,6 +47,9 @@ impl fmt::Display for DraftStoreError {
             }
             Self::CorruptRevision(revision) => {
                 write!(f, "database contains invalid negative revision {revision}")
+            }
+            Self::CorruptDraft { id, reason } => {
+                write!(f, "database contains invalid draft {id}: {reason}")
             }
             Self::NotFound(id) => write!(f, "draft not found: {id}"),
             Self::RunNotFound(id) => write!(f, "distribution run not found: {id}"),
@@ -281,16 +285,9 @@ impl DraftStore {
         let revision: i64 = row.try_get("revision")?;
         let Json(body): Json<Value> = row.try_get("body")?;
 
-        let body: DistributionDraftBody = serde_json::from_value(body)?;
+        let revision = revision_from_db(revision)?;
 
-        Ok(Some(DistributionDraft {
-            id,
-            revision: revision_from_db(revision)?,
-            money: body.money,
-            pools: body.pools,
-            contribution_weights: body.contribution_weights,
-            contributors: body.contributors,
-        }))
+        Ok(Some(draft_from_storage(id, revision, body)?))
     }
 
     pub async fn load_finalized_run(
@@ -375,7 +372,6 @@ impl DraftStore {
         let stored_revision: i64 = row.try_get("revision")?;
         let Json(body): Json<Value> = row.try_get("body")?;
 
-        let body: DistributionDraftBody = serde_json::from_value(body)?;
         let revision = revision_from_db(stored_revision)?;
 
         if revision != expected_revision {
@@ -385,14 +381,7 @@ impl DraftStore {
             });
         }
 
-        let draft = DistributionDraft {
-            id: stored_id,
-            revision,
-            money: body.money,
-            pools: body.pools,
-            contribution_weights: body.contribution_weights,
-            contributors: body.contributors,
-        };
+        let draft = draft_from_storage(stored_id, revision, body)?;
 
         let preview = draft.preview().map_err(DraftStoreError::Validation)?;
 
@@ -507,6 +496,32 @@ impl DraftStore {
             Err(DraftStoreError::NotFound(draft.id.clone()))
         }
     }
+}
+
+fn draft_from_storage(
+    id: String,
+    revision: u64,
+    body: Value,
+) -> Result<DistributionDraft, DraftStoreError> {
+    let body: DistributionDraftBody = serde_json::from_value(body)?;
+
+    let draft = DistributionDraft {
+        id,
+        revision,
+        money: body.money,
+        pools: body.pools,
+        contribution_weights: body.contribution_weights,
+        contributors: body.contributors,
+    };
+
+    draft
+        .validate_persistable()
+        .map_err(|reason| DraftStoreError::CorruptDraft {
+            id: draft.id.clone(),
+            reason,
+        })?;
+
+    Ok(draft)
 }
 
 fn validate_finalization_metadata(metadata: &FinalizationMetadata) -> Result<(), DraftStoreError> {

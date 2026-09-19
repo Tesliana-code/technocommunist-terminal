@@ -354,11 +354,17 @@ impl IntoResponse for ApiError {
                     }
 
                     DraftStoreError::CorruptRevision(_)
+                    | DraftStoreError::CorruptDraft { .. }
                     | DraftStoreError::Serialization(_)
                     | DraftStoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
 
-                (status, error.to_string())
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    eprintln!("internal API error: {error}");
+                    (status, "internal server error".to_string())
+                } else {
+                    (status, error.to_string())
+                }
             }
         };
 
