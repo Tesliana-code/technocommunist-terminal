@@ -234,7 +234,10 @@ impl DraftStore {
         Self { pool }
     }
 
-    pub async fn insert(&self, draft: &DistributionDraft) -> Result<(), DraftStoreError> {
+    pub async fn insert(
+        &self,
+        draft: &DistributionDraft,
+    ) -> Result<DistributionDraft, DraftStoreError> {
         draft
             .validate_persistable()
             .map_err(DraftStoreError::Validation)?;
@@ -245,23 +248,30 @@ impl DraftStore {
 
         let body = body_to_json(draft)?;
 
-        let result = sqlx::query(
+        let row = sqlx::query(
             r#"
             INSERT INTO distribution_drafts (id, body)
             VALUES ($1, $2)
             ON CONFLICT (id) DO NOTHING
+            RETURNING id, revision, body
             "#,
         )
         .bind(&draft.id)
         .bind(Json(body))
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(row) = row else {
             return Err(DraftStoreError::AlreadyExists(draft.id.clone()));
-        }
+        };
 
-        Ok(())
+        let id: String = row.try_get("id")?;
+        let revision: i64 = row.try_get("revision")?;
+        let Json(body): Json<Value> = row.try_get("body")?;
+
+        let revision = revision_from_db(revision)?;
+
+        draft_from_storage(id, revision, body)
     }
 
     pub async fn ping(&self) -> Result<(), DraftStoreError> {

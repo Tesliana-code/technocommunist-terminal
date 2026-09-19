@@ -375,3 +375,93 @@ async fn missing_draft_at_max_revision_is_not_misclassified_as_exhausted() {
             if missing_id == "test-store-missing-max-revision"
     ));
 }
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn insert_returns_authoritative_persisted_draft() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL persistence test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let store = DraftStore::new(pool.clone());
+
+    let id = "test-store-insert-returning";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let original = draft(id);
+
+    let inserted = store.insert(&original).await.unwrap();
+
+    assert_eq!(inserted, original);
+    assert_eq!(inserted.revision, 0);
+
+    let stored = store.load(id).await.unwrap().unwrap();
+    assert_eq!(stored, inserted);
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn concurrent_inserts_have_one_authoritative_winner() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL persistence test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let store = DraftStore::new(pool.clone());
+
+    let id = "test-store-concurrent-insert";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let candidate = draft(id);
+
+    let (first, second) = tokio::join!(store.insert(&candidate), store.insert(&candidate),);
+
+    let outcomes = [&first, &second];
+
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(DraftStoreError::AlreadyExists(existing_id))
+                        if existing_id == id
+                )
+            })
+            .count(),
+        1
+    );
+
+    let winner = outcomes
+        .iter()
+        .find_map(|result| result.as_ref().ok())
+        .unwrap();
+
+    assert_eq!(winner, &candidate);
+
+    let stored = store.load(id).await.unwrap().unwrap();
+    assert_eq!(stored, candidate);
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

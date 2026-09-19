@@ -221,13 +221,7 @@ async fn create_draft(
         contributors: request.contributors,
     };
 
-    state.store.insert(&draft).await?;
-
-    let stored = state
-        .store
-        .load(&draft.id)
-        .await?
-        .ok_or_else(|| DraftStoreError::NotFound(draft.id.clone()))?;
+    let stored = state.store.insert(&draft).await?;
 
     Ok((StatusCode::CREATED, Json(stored.into())))
 }
