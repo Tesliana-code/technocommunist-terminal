@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     contribution::{ContributionEvent, ContributionFactors, ContributionWeights},
     distribution::{ContributionAllocation, allocate_contribution_pool},
@@ -7,7 +9,7 @@ use crate::{
     protocol::{DistributionPools, PoolAmounts},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContributorMeasurement {
     pub contributor_id: String,
     pub contribution_id: String,

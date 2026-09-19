@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ContributionWeights {
     pub responsibility: f64,
     pub criticality: f64,
@@ -33,7 +35,7 @@ impl ContributionWeights {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ContributionFactors {
     pub responsibility: f64,
     pub criticality: f64,

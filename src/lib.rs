@@ -3,6 +3,7 @@ pub mod contribution;
 pub mod distribution;
 pub mod ledger;
 pub mod measurement;
+pub mod persistence;
 pub mod protocol;
 pub mod run;
 pub mod statement;

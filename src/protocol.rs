@@ -9,7 +9,9 @@ impl ProtocolVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DistributionPools {
     pub contribution: f64,
     pub stewardship: f64,
