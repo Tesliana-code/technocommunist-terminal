@@ -2,6 +2,7 @@ use std::{error::Error, fmt};
 
 use reqwest::{StatusCode, Url, blocking::Client};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OperatorRunMetadata {
@@ -17,6 +18,19 @@ pub struct OperatorRunMetadata {
 pub struct OperatorRunHistory {
     pub draft_id: String,
     pub runs: Vec<OperatorRunMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorRunDetail {
+    pub id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub draft_snapshot: Value,
+    pub preview_snapshot: Value,
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
 }
 
 #[derive(Debug)]
@@ -122,6 +136,26 @@ impl OperatorApiClient {
         Ok(response.json::<OperatorRunHistory>()?)
     }
 
+    pub fn get_finalized_run(&self, run_id: i64) -> Result<OperatorRunDetail, OperatorApiError> {
+        let url = self.run_detail_url(run_id)?;
+
+        let response = self.client.get(url).send()?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let fallback = format!("request failed with HTTP {}", status.as_u16());
+
+            let error = response
+                .json::<ErrorEnvelope>()
+                .map(|body| body.error)
+                .unwrap_or(fallback);
+
+            return Err(OperatorApiError::Http { status, error });
+        }
+
+        Ok(response.json::<OperatorRunDetail>()?)
+    }
+
     fn run_history_url(&self, draft_id: &str) -> Result<Url, OperatorApiError> {
         let mut url = self.base_url.clone();
 
@@ -135,6 +169,24 @@ impl OperatorApiClient {
             segments.push("drafts");
             segments.push(draft_id);
             segments.push("runs");
+        }
+
+        Ok(url)
+    }
+
+    fn run_detail_url(&self, run_id: i64) -> Result<Url, OperatorApiError> {
+        let mut url = self.base_url.clone();
+        let run_id = run_id.to_string();
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                OperatorApiError::Configuration("base URL cannot accept path segments".to_string())
+            })?;
+
+            segments.clear();
+            segments.push("api");
+            segments.push("runs");
+            segments.push(&run_id);
         }
 
         Ok(url)
@@ -234,6 +286,73 @@ mod tests {
 
         assert!(
             request.starts_with("GET /api/drafts/operator-proof/runs HTTP/1.1"),
+            "unexpected request: {request}"
+        );
+    }
+
+    #[test]
+    fn client_reads_authoritative_immutable_run_detail_over_http() {
+        let body = r#"{
+            "id": 42,
+            "source_draft_id": "operator-proof",
+            "source_revision": 3,
+            "draft_snapshot": {
+                "id": "operator-proof",
+                "revision": 3,
+                "money": {
+                    "revenue": 125000.0
+                }
+            },
+            "preview_snapshot": {
+                "available_for_distribution": 35000.0
+            },
+            "protocol_version": "PP-0.1-draft",
+            "engine_version": "distribution-machine/0.1.0",
+            "manual_version": "manual/0.1-draft",
+            "finalized_at": "2026-09-19 16:00:00+00"
+        }"#;
+
+        let (base_url, server) = serve_once("200 OK", body);
+        let client = OperatorApiClient::new(&base_url).unwrap();
+
+        let run = client.get_finalized_run(42).unwrap();
+
+        assert_eq!(run.id, 42);
+        assert_eq!(run.source_draft_id, "operator-proof");
+        assert_eq!(run.source_revision, 3);
+        assert_eq!(run.draft_snapshot["revision"], 3);
+        assert_eq!(run.draft_snapshot["money"]["revenue"], 125000.0);
+        assert_eq!(run.preview_snapshot["available_for_distribution"], 35000.0);
+
+        let request = server.join().unwrap();
+
+        assert!(
+            request.starts_with("GET /api/runs/42 HTTP/1.1"),
+            "unexpected request: {request}"
+        );
+    }
+
+    #[test]
+    fn run_detail_preserves_api_error_status_and_message() {
+        let body = r#"{"error":"distribution run not found: 9223372036854775807"}"#;
+
+        let (base_url, server) = serve_once("404 Not Found", body);
+        let client = OperatorApiClient::new(&base_url).unwrap();
+
+        let error = client.get_finalized_run(i64::MAX).unwrap_err();
+
+        match error {
+            OperatorApiError::Http { status, error } => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(error, "distribution run not found: 9223372036854775807");
+            }
+            other => panic!("unexpected operator API error: {other}"),
+        }
+
+        let request = server.join().unwrap();
+
+        assert!(
+            request.starts_with("GET /api/runs/9223372036854775807 HTTP/1.1"),
             "unexpected request: {request}"
         );
     }
