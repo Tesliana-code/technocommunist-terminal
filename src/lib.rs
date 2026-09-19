@@ -4,5 +4,6 @@ pub mod distribution;
 pub mod ledger;
 pub mod measurement;
 pub mod protocol;
+pub mod run;
 pub mod statement;
 pub mod stewardship;
