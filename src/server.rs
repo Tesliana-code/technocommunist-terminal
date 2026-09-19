@@ -11,8 +11,8 @@ use crate::{
     contribution::ContributionWeights,
     ledger::MoneyLedger,
     persistence::{DraftStore, DraftStoreError},
-    protocol::DistributionPools,
-    run::{ContributorMeasurement, DistributionDraft},
+    protocol::{DistributionPools, PoolAmounts},
+    run::{ContributorMeasurement, DistributionDraft, DraftPreview},
 };
 
 #[derive(Clone)]
@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/drafts", post(create_draft))
         .route("/api/drafts/{id}", get(get_draft).put(update_draft))
+        .route("/api/drafts/{id}/preview", post(preview_draft))
         .with_state(state)
 }
 
@@ -65,6 +66,65 @@ impl From<DistributionDraft> for DraftResponse {
             pools: draft.pools,
             contribution_weights: draft.contribution_weights,
             contributors: draft.contributors,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DraftPreviewResponse {
+    pub id: String,
+    pub revision: u64,
+    pub available_for_distribution: f64,
+    pub pool_amounts: PoolAmountsResponse,
+    pub contribution_allocations: Vec<ContributionAllocationResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PoolAmountsResponse {
+    pub contribution: f64,
+    pub stewardship: f64,
+    pub capital: f64,
+    pub organizational_reserve: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContributionAllocationResponse {
+    pub contributor_id: String,
+    pub contribution_id: String,
+    pub contribution_value: f64,
+    pub normalized_share: f64,
+    pub allocated_amount: f64,
+}
+
+impl From<PoolAmounts> for PoolAmountsResponse {
+    fn from(amounts: PoolAmounts) -> Self {
+        Self {
+            contribution: amounts.contribution,
+            stewardship: amounts.stewardship,
+            capital: amounts.capital,
+            organizational_reserve: amounts.organizational_reserve,
+        }
+    }
+}
+
+impl DraftPreviewResponse {
+    fn from_domain(draft: &DistributionDraft, preview: DraftPreview) -> Self {
+        Self {
+            id: draft.id.clone(),
+            revision: draft.revision,
+            available_for_distribution: preview.available_for_distribution,
+            pool_amounts: preview.pool_amounts.into(),
+            contribution_allocations: preview
+                .contribution_allocations
+                .into_iter()
+                .map(|allocation| ContributionAllocationResponse {
+                    contributor_id: allocation.contributor_id,
+                    contribution_id: allocation.contribution_id,
+                    contribution_value: allocation.contribution_value,
+                    normalized_share: allocation.normalized_share,
+                    allocated_amount: allocation.allocated_amount,
+                })
+                .collect(),
         }
     }
 }
@@ -122,6 +182,21 @@ async fn get_draft(
     Ok(Json(draft.into()))
 }
 
+async fn preview_draft(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DraftPreviewResponse>, ApiError> {
+    let draft = state
+        .store
+        .load(&id)
+        .await?
+        .ok_or_else(|| DraftStoreError::NotFound(id))?;
+
+    let preview = draft.preview().map_err(ApiError::Preview)?;
+
+    Ok(Json(DraftPreviewResponse::from_domain(&draft, preview)))
+}
+
 async fn update_draft(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -144,38 +219,43 @@ async fn update_draft(
     Ok(Json(updated.into()))
 }
 
-struct ApiError(DraftStoreError);
+enum ApiError {
+    Store(DraftStoreError),
+    Preview(String),
+}
 
 impl From<DraftStoreError> for ApiError {
     fn from(error: DraftStoreError) -> Self {
-        Self(error)
+        Self::Store(error)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self.0 {
-            DraftStoreError::Validation(_)
-            | DraftStoreError::InitialRevisionMustBeZero(_)
-            | DraftStoreError::RevisionOutOfRange(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        let (status, error) = match self {
+            Self::Preview(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
 
-            DraftStoreError::AlreadyExists(_) | DraftStoreError::Conflict { .. } => {
-                StatusCode::CONFLICT
+            Self::Store(error) => {
+                let status = match &error {
+                    DraftStoreError::Validation(_)
+                    | DraftStoreError::InitialRevisionMustBeZero(_)
+                    | DraftStoreError::RevisionOutOfRange(_) => StatusCode::UNPROCESSABLE_ENTITY,
+
+                    DraftStoreError::AlreadyExists(_) | DraftStoreError::Conflict { .. } => {
+                        StatusCode::CONFLICT
+                    }
+
+                    DraftStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+
+                    DraftStoreError::CorruptRevision(_)
+                    | DraftStoreError::Serialization(_)
+                    | DraftStoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+
+                (status, error.to_string())
             }
-
-            DraftStoreError::NotFound(_) => StatusCode::NOT_FOUND,
-
-            DraftStoreError::CorruptRevision(_)
-            | DraftStoreError::Serialization(_)
-            | DraftStoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (
-            status,
-            Json(ErrorResponse {
-                error: self.0.to_string(),
-            }),
-        )
-            .into_response()
+        (status, Json(ErrorResponse { error })).into_response()
     }
 }
