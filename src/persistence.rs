@@ -455,15 +455,42 @@ impl DraftStore {
             .map_err(DraftStoreError::Validation)?;
 
         let expected_db_revision = revision_to_db(expected_revision)?;
+        let body = body_to_json(draft)?;
 
-        if expected_db_revision == i64::MAX {
-            return Err(DraftStoreError::RevisionExhausted {
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT revision
+            FROM distribution_drafts
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(&draft.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(DraftStoreError::NotFound(draft.id.clone()));
+        };
+
+        let stored_db_revision: i64 = row.try_get("revision")?;
+        let stored_revision = revision_from_db(stored_db_revision)?;
+
+        if stored_revision != expected_revision {
+            return Err(DraftStoreError::Conflict {
                 id: draft.id.clone(),
-                revision: expected_revision,
+                expected_revision,
             });
         }
 
-        let body = body_to_json(draft)?;
+        if stored_db_revision == i64::MAX {
+            return Err(DraftStoreError::RevisionExhausted {
+                id: draft.id.clone(),
+                revision: stored_revision,
+            });
+        }
 
         let row = sqlx::query(
             r#"
@@ -479,37 +506,17 @@ impl DraftStore {
         .bind(Json(body))
         .bind(&draft.id)
         .bind(expected_db_revision)
-        .fetch_optional(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        if let Some(row) = row {
-            let revision: i64 = row.try_get("revision")?;
-            let mut updated = draft.clone();
-            updated.revision = revision_from_db(revision)?;
-            return Ok(updated);
-        }
+        let revision: i64 = row.try_get("revision")?;
 
-        let exists: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS(
-                SELECT 1
-                FROM distribution_drafts
-                WHERE id = $1
-            )
-            "#,
-        )
-        .bind(&draft.id)
-        .fetch_one(&self.pool)
-        .await?;
+        tx.commit().await?;
 
-        if exists {
-            Err(DraftStoreError::Conflict {
-                id: draft.id.clone(),
-                expected_revision,
-            })
-        } else {
-            Err(DraftStoreError::NotFound(draft.id.clone()))
-        }
+        let mut updated = draft.clone();
+        updated.revision = revision_from_db(revision)?;
+
+        Ok(updated)
     }
 }
 

@@ -285,3 +285,93 @@ async fn maximum_database_revision_is_explicitly_exhausted_without_mutation() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn concurrent_updates_are_serialized_by_revision_lock() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL persistence test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let store = DraftStore::new(pool.clone());
+
+    let id = "test-store-concurrent-update-lock";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let original = draft(id);
+    store.insert(&original).await.unwrap();
+
+    let mut first = original.clone();
+    first.money.revenue = 125_000.0;
+
+    let mut second = original.clone();
+    second.money.revenue = 130_000.0;
+
+    let (first_result, second_result) =
+        tokio::join!(store.update(&first, 0), store.update(&second, 0),);
+
+    let outcomes = [&first_result, &second_result];
+
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(DraftStoreError::Conflict {
+                        expected_revision: 0,
+                        ..
+                    })
+                )
+            })
+            .count(),
+        1
+    );
+
+    let stored = store.load(id).await.unwrap().unwrap();
+
+    assert_eq!(stored.revision, 1);
+    assert!(stored.money.revenue == 125_000.0 || stored.money.revenue == 130_000.0);
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn missing_draft_at_max_revision_is_not_misclassified_as_exhausted() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL persistence test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let store = DraftStore::new(pool.clone());
+
+    let id = "test-store-missing-max-revision";
+
+    sqlx::query("DELETE FROM distribution_drafts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut missing = draft(id);
+    missing.revision = i64::MAX as u64;
+
+    let error = store.update(&missing, i64::MAX as u64).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        DraftStoreError::NotFound(ref missing_id)
+            if missing_id == "test-store-missing-max-revision"
+    ));
+}
