@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDraftRequest {
     pub id: String,
     pub money: MoneyLedger,
@@ -49,6 +50,7 @@ pub struct CreateDraftRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateDraftRequest {
     pub expected_revision: u64,
     pub money: MoneyLedger,
