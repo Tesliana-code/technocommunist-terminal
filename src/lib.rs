@@ -6,5 +6,6 @@ pub mod measurement;
 pub mod persistence;
 pub mod protocol;
 pub mod run;
+pub mod server;
 pub mod statement;
 pub mod stewardship;

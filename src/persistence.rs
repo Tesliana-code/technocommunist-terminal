@@ -15,6 +15,7 @@ use crate::{
 pub enum DraftStoreError {
     Validation(String),
     InitialRevisionMustBeZero(u64),
+    AlreadyExists(String),
     RevisionOutOfRange(u64),
     CorruptRevision(i64),
     NotFound(String),
@@ -30,6 +31,7 @@ impl fmt::Display for DraftStoreError {
             Self::InitialRevisionMustBeZero(revision) => {
                 write!(f, "new draft revision must be 0, received {revision}")
             }
+            Self::AlreadyExists(id) => write!(f, "draft already exists: {id}"),
             Self::RevisionOutOfRange(revision) => {
                 write!(
                     f,
@@ -94,6 +96,7 @@ impl From<&DistributionDraft> for DistributionDraftBody {
     }
 }
 
+#[derive(Clone)]
 pub struct DraftStore {
     pool: PgPool,
 }
@@ -114,16 +117,29 @@ impl DraftStore {
 
         let body = body_to_json(draft)?;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO distribution_drafts (id, body)
             VALUES ($1, $2)
+            ON CONFLICT (id) DO NOTHING
             "#,
         )
         .bind(&draft.id)
         .bind(Json(body))
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DraftStoreError::AlreadyExists(draft.id.clone()));
+        }
+
+        Ok(())
+    }
+
+    pub async fn ping(&self) -> Result<(), DraftStoreError> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
 
         Ok(())
     }
