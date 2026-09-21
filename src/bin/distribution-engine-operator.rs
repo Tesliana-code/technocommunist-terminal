@@ -10,12 +10,12 @@ use distribution_machine::{
 };
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, Block, Borders, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, Tabs, Wrap,
+        Block, Borders, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Sparkline, Table, Tabs, Wrap,
     },
 };
 
@@ -423,6 +423,8 @@ impl OperatorState {
                 SnapshotPane::Draft => self.draft_snapshot_scroll = 0,
                 SnapshotPane::Preview => self.preview_snapshot_scroll = 0,
             },
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => self.scroll_run_detail(-1),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'j') => self.scroll_run_detail(1),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
             _ => {}
         }
@@ -437,6 +439,8 @@ impl OperatorState {
             KeyCode::Up => self.previous_history_run(),
             KeyCode::Down => self.next_history_run(),
             KeyCode::Enter => self.open_selected_run(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => self.previous_history_run(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'j') => self.next_history_run(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => self.load_run_history(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
             _ => {}
@@ -1087,66 +1091,68 @@ impl OperatorState {
             sections[2],
         );
 
-        // Bar geometry (name + fill) on the left, a stable share/EUR column on the right.
-        // The numbers column never carries text_value inside the bar itself.
-        let rows = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(10),
-                Constraint::Length(ALLOCATION_NUMBERS_WIDTH),
-            ])
+        // Thin LineGauge geometry (name + gauge) on the left, a stable share/EUR column on the
+        // right. Each gauge's ratio is the contributor's own normalized_share against the full
+        // pool (0.0..=1.0) — never relative to the largest contributor — so a 38.43% share always
+        // renders as ~38% of the row, not as the tallest bar in the chart.
+        const ROW_PALETTE: [Color; 3] = [MINERAL, PURPLE, TEXT];
+
+        let allocation_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                preview
+                    .allocations
+                    .iter()
+                    .map(|_| Constraint::Length(1))
+                    .collect::<Vec<_>>(),
+            )
             .split(sections[3]);
 
-        let max_cents = preview
-            .allocations
-            .iter()
-            .map(|allocation| money_cents(allocation.allocated_amount))
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        for (index, allocation) in preview.allocations.iter().enumerate() {
+            let is_selected = allocation.contributor_id == selected;
+            let style = if is_selected {
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ROW_PALETTE[index % ROW_PALETTE.len()])
+            };
 
-        let bars: Vec<Bar> = preview
-            .allocations
-            .iter()
-            .map(|allocation| {
-                let is_selected = allocation.contributor_id == selected;
-                let style = if is_selected {
-                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(MINERAL)
-                };
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(12),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                    Constraint::Length(ALLOCATION_NUMBERS_WIDTH),
+                ])
+                .split(allocation_rows[index]);
 
-                Bar::default()
-                    .label(Line::styled(allocation.contributor_id.clone(), style))
-                    .value(money_cents(allocation.allocated_amount))
-                    .text_value("")
-                    .style(style)
-            })
-            .collect();
+            frame.render_widget(
+                Paragraph::new(Line::styled(allocation.contributor_id.clone(), style)),
+                columns[0],
+            );
 
-        let chart = BarChart::horizontal(bars)
-            .bar_width(1)
-            .bar_gap(0)
-            .max(max_cents);
+            let gauge = LineGauge::default()
+                .ratio(allocation.normalized_share.clamp(0.0, 1.0))
+                .label("")
+                .filled_style(style)
+                .unfilled_style(Style::default().fg(MUTED))
+                .filled_symbol("━")
+                .unfilled_symbol("─");
 
-        frame.render_widget(chart, rows[0]);
+            frame.render_widget(gauge, columns[1]);
 
-        let number_lines: Vec<Line> = preview
-            .allocations
-            .iter()
-            .map(|allocation| {
-                Line::from(Span::styled(
+            frame.render_widget(
+                Paragraph::new(Line::styled(
                     format!(
                         "{:>6.2}%   {:>13}",
                         allocation.normalized_share * 100.0,
                         format_money(allocation.allocated_amount),
                     ),
                     Style::default().fg(TEXT),
-                ))
-            })
-            .collect();
-
-        frame.render_widget(Paragraph::new(number_lines), rows[1]);
+                )),
+                columns[3],
+            );
+        }
 
         let status_style = if reconciled {
             Style::default().fg(MINERAL).add_modifier(Modifier::BOLD)
@@ -1238,6 +1244,15 @@ impl OperatorState {
             return;
         }
 
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(8)])
+            .split(area);
+
+        self.draw_black_box_telemetry(frame, sections[0], history);
+
+        let area = sections[1];
+
         let header = Row::new(vec![
             "REV",
             "RUN",
@@ -1303,6 +1318,115 @@ impl OperatorState {
         );
 
         frame.render_widget(widget, area);
+    }
+
+    /// Renders the immutable telemetry black box: chronological (oldest -> newest) sparklines
+    /// built from `history.runs.iter().rev()`, with the right-hand readout following whichever
+    /// row is currently selected in the table below, not necessarily the newest run.
+    fn draw_black_box_telemetry(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        history: &OperatorRunHistory,
+    ) {
+        let (surplus_series, pool_series) = history_telemetry_series(history);
+        let selected = &history.runs[self.history_selected].telemetry;
+
+        let block = Block::default()
+            .title(" BLACK BOX TELEMETRY · IMMUTABLE · OLDEST → NEWEST ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MINERAL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        self.draw_telemetry_row(
+            frame,
+            rows[0],
+            "SURPLUS",
+            &surplus_series,
+            selected.available_for_distribution,
+            MINERAL,
+        );
+
+        self.draw_telemetry_row(
+            frame,
+            rows[1],
+            "CONTRIBUTION POOL",
+            &pool_series,
+            selected.contribution_pool,
+            PURPLE,
+        );
+
+        let selected_run = &history.runs[self.history_selected];
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("RUNS ", Style::default().fg(MUTED)),
+                Span::styled(history.runs.len().to_string(), Style::default().fg(TEXT)),
+                Span::styled(" · SELECTED REV ", Style::default().fg(MUTED)),
+                Span::styled(
+                    selected_run.source_revision.to_string(),
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · RUN ", Style::default().fg(MUTED)),
+                Span::styled(selected_run.id.to_string(), Style::default().fg(TEXT)),
+                Span::styled(" · ALLOCATIONS ", Style::default().fg(MUTED)),
+                Span::styled(
+                    selected.allocation_count.to_string(),
+                    Style::default().fg(TEXT),
+                ),
+            ])),
+            rows[2],
+        );
+    }
+
+    fn draw_telemetry_row(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        series: &[u64],
+        selected_amount: f64,
+        accent: Color,
+    ) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(20),
+                Constraint::Min(10),
+                Constraint::Length(16),
+            ])
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(label, Style::default().fg(MUTED)))),
+            columns[0],
+        );
+
+        frame.render_widget(
+            Sparkline::default()
+                .data(series)
+                .style(Style::default().fg(accent)),
+            columns[1],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format_money(selected_amount),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Right),
+            columns[2],
+        );
     }
 
     fn draw_run_detail(&self, frame: &mut Frame, area: Rect) {
@@ -1466,7 +1590,7 @@ impl OperatorState {
                 Line::from(vec![
                     Span::styled("[Tab]", Style::default().fg(AMBER)),
                     Span::raw(" Pane   "),
-                    Span::styled("[↑/↓]", Style::default().fg(MINERAL)),
+                    Span::styled("[J/K]", Style::default().fg(MINERAL)),
                     Span::raw(" Scroll   "),
                     Span::styled("[PgUp/PgDn]", Style::default().fg(PURPLE)),
                     Span::raw(" Page   "),
@@ -1485,7 +1609,7 @@ impl OperatorState {
         } else if self.view == OperatorView::RunHistory {
             vec![
                 Line::from(vec![
-                    Span::styled("[↑/↓]", Style::default().fg(AMBER)),
+                    Span::styled("[J/K]", Style::default().fg(AMBER)),
                     Span::raw(" Select   "),
                     Span::styled("[Enter]", Style::default().fg(AMBER)),
                     Span::raw(" Inspect   "),
@@ -1589,11 +1713,29 @@ fn format_money(value: f64) -> String {
     format!("{sign}EUR {grouped}.{cents:02}")
 }
 
-/// `BarChart` bar magnitudes are `u64`. This converts an allocated EUR amount into whole cents
-/// for that purpose only; the textual EUR amount shown alongside a bar is always rendered
-/// separately from the original `f64` via `format_money`, never derived back from this value.
+/// `Sparkline` bar magnitudes are `u64`. This converts an EUR amount into whole cents for that
+/// purpose only; the textual EUR amount shown alongside a series is always rendered separately
+/// from the original `f64` via `format_money`, never derived back from this value.
 fn money_cents(value: f64) -> u64 {
     (value.max(0.0) * 100.0).round() as u64
+}
+
+/// Builds the black-box sparkline series in chronological (oldest -> newest) order from
+/// `OperatorRunHistory`, whose `runs` are authoritatively newest-first. Never sorts by value
+/// and never touches `draft_snapshot`/`preview_snapshot` or recomputes via the engine — the
+/// series is read straight off each run's already-persisted, typed telemetry.
+fn history_telemetry_series(history: &OperatorRunHistory) -> (Vec<u64>, Vec<u64>) {
+    history
+        .runs
+        .iter()
+        .rev()
+        .map(|run| {
+            (
+                money_cents(run.telemetry.available_for_distribution),
+                money_cents(run.telemetry.contribution_pool),
+            )
+        })
+        .unzip()
 }
 
 /// Renders `left` flush against the area's left edge and `right` flush against its right edge,
@@ -1722,6 +1864,86 @@ mod tests {
     }
 
     #[test]
+    fn vim_style_keys_alias_history_selection() {
+        use distribution_machine::operator_api::{OperatorRunMetadata, OperatorRunTelemetry};
+
+        let run = |id, revision| OperatorRunMetadata {
+            id,
+            source_revision: revision,
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+            telemetry: OperatorRunTelemetry {
+                available_for_distribution: 30_000.0,
+                contribution_pool: 10_500.0,
+                allocation_count: 1,
+            },
+        };
+
+        let mut state = OperatorState::new();
+
+        state.run_history = Some(OperatorRunHistory {
+            draft_id: "vim-keys-proof".into(),
+            runs: vec![run(2, 1), run(1, 0)],
+        });
+
+        state.view = OperatorView::RunHistory;
+
+        state.handle_history_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 1);
+
+        state.handle_history_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 1);
+
+        state.handle_history_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 0);
+
+        state.handle_history_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 0);
+
+        // Arrow keys keep working unmodified.
+        state.handle_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 1);
+
+        state.handle_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.history_selected, 0);
+    }
+
+    #[test]
+    fn history_telemetry_series_is_chronological_oldest_to_newest() {
+        use distribution_machine::operator_api::{OperatorRunMetadata, OperatorRunTelemetry};
+
+        let run = |id, revision, surplus, contribution| OperatorRunMetadata {
+            id,
+            source_revision: revision,
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+            telemetry: OperatorRunTelemetry {
+                available_for_distribution: surplus,
+                contribution_pool: contribution,
+                allocation_count: 1,
+            },
+        };
+
+        // OperatorRunHistory is authoritatively newest-first, matching the real API order.
+        let history = OperatorRunHistory {
+            draft_id: "chronology-proof".into(),
+            runs: vec![
+                run(48, 1, 35_000.0, 12_250.0),
+                run(47, 0, 30_000.0, 10_500.0),
+            ],
+        };
+
+        let (surplus_series, contribution_series) = history_telemetry_series(&history);
+
+        assert_eq!(surplus_series, vec![3_000_000, 3_500_000]);
+        assert_eq!(contribution_series, vec![1_050_000, 1_225_000]);
+    }
+
+    #[test]
     fn exact_run_detail_identity_opens_immutable_view() {
         use serde_json::json;
 
@@ -1802,6 +2024,53 @@ mod tests {
 
         state.scroll_run_detail(-10_000);
         assert_eq!(state.preview_snapshot_scroll, 0);
+    }
+
+    #[test]
+    fn vim_style_keys_alias_run_detail_scroll() {
+        use serde_json::json;
+
+        let mut state = OperatorState::new();
+
+        state.run_detail = Some(OperatorRunDetail {
+            id: 42,
+            source_draft_id: "vim-scroll-proof".into(),
+            source_revision: 3,
+            draft_snapshot: json!({
+                "a": 1,
+                "b": {
+                    "c": 2,
+                    "d": 3
+                }
+            }),
+            preview_snapshot: json!({}),
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 18:00:00+00".into(),
+        });
+
+        state.view = OperatorView::RunDetail;
+        state.snapshot_pane = SnapshotPane::Draft;
+
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 1);
+
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 2);
+
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 1);
+
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 0);
+
+        // Arrow keys keep working unmodified.
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 1);
+
+        state.handle_run_detail_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.draft_snapshot_scroll, 0);
     }
 
     #[test]
