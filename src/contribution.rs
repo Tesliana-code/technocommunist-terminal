@@ -76,8 +76,19 @@ pub struct ContributionEvent {
     pub factors: ContributionFactors,
 }
 
+/// Each term of the weighted-factor sum, computed once and preserved so the calculation trace
+/// that produced `evidence_adjusted_value` can be reconstructed later without recomputation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContributionFactorTerms {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContributionScore {
+    pub factor_terms: ContributionFactorTerms,
     pub weighted_factors: f64,
     pub evidence_adjusted_value: f64,
 }
@@ -98,15 +109,23 @@ impl ContributionEvent {
             return Err("base work value cannot be negative");
         }
 
-        let weighted_factors = weights.responsibility * self.factors.responsibility
-            + weights.criticality * self.factors.criticality
-            + weights.deal_impact * self.factors.deal_impact
-            + weights.dependency_reach * self.factors.dependency_reach;
+        let factor_terms = ContributionFactorTerms {
+            responsibility: weights.responsibility * self.factors.responsibility,
+            criticality: weights.criticality * self.factors.criticality,
+            deal_impact: weights.deal_impact * self.factors.deal_impact,
+            dependency_reach: weights.dependency_reach * self.factors.dependency_reach,
+        };
+
+        let weighted_factors = factor_terms.responsibility
+            + factor_terms.criticality
+            + factor_terms.deal_impact
+            + factor_terms.dependency_reach;
 
         let evidence_adjusted_value =
             self.base_work_value * weighted_factors * self.factors.evidence_confidence;
 
         Ok(ContributionScore {
+            factor_terms,
             weighted_factors,
             evidence_adjusted_value,
         })
@@ -207,6 +226,60 @@ mod tests {
         let score = event.calculate(&draft_weights()).unwrap();
 
         assert!(score.evidence_adjusted_value > 0.0);
+    }
+
+    #[test]
+    fn factor_terms_and_weighted_sum_satisfy_the_calculation_trace_equations() {
+        let weights = draft_weights();
+        let factors = ContributionFactors {
+            responsibility: 0.70,
+            criticality: 0.90,
+            deal_impact: 0.80,
+            stewardship: 0.40,
+            dependency_reach: 0.75,
+            evidence_confidence: 0.85,
+        };
+
+        let event = ContributionEvent {
+            contributor_id: "trace-proof".to_string(),
+            contribution_id: "trace-proof-contribution".to_string(),
+            base_work_value: 2.5,
+            factors,
+        };
+
+        let score = event.calculate(&weights).unwrap();
+
+        assert!(
+            (score.factor_terms.responsibility - weights.responsibility * factors.responsibility)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (score.factor_terms.criticality - weights.criticality * factors.criticality).abs()
+                < 1e-12
+        );
+        assert!(
+            (score.factor_terms.deal_impact - weights.deal_impact * factors.deal_impact).abs()
+                < 1e-12
+        );
+        assert!(
+            (score.factor_terms.dependency_reach
+                - weights.dependency_reach * factors.dependency_reach)
+                .abs()
+                < 1e-12
+        );
+
+        let term_sum = score.factor_terms.responsibility
+            + score.factor_terms.criticality
+            + score.factor_terms.deal_impact
+            + score.factor_terms.dependency_reach;
+
+        assert!((term_sum - score.weighted_factors).abs() < 1e-12);
+
+        let expected_evidence_adjusted_value =
+            event.base_work_value * score.weighted_factors * factors.evidence_confidence;
+
+        assert!((score.evidence_adjusted_value - expected_evidence_adjusted_value).abs() < 1e-12);
     }
 
     #[test]

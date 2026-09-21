@@ -603,6 +603,34 @@ async fn finalized_run_http_round_trip_preserves_authoritative_snapshot() {
         10500.0
     );
 
+    assert_eq!(
+        run["draft_snapshot"]["schema_version"],
+        "distribution-draft-snapshot/1"
+    );
+    assert_eq!(
+        run["preview_snapshot"]["schema_version"],
+        "draft-preview-snapshot/1"
+    );
+
+    // finalizable_draft_payload has exactly one contributor ("backend") with all factors at
+    // 1.0 against the draft's default weights (0.20/0.30/0.25/0.25 summing to 1.0), so the
+    // calculation trace resolves deterministically: weighted_factors == 1.0, contribution_value
+    // == base_work_value == 1.0, and — as the sole contributor — total_contribution_value == 1.0
+    // and normalized_share == 1.0, giving allocated_amount == the full 10,500.0 contribution pool.
+    let allocation = &run["preview_snapshot"]["contribution_allocations"][0];
+
+    assert_eq!(allocation["contributor_id"], "backend");
+    assert_eq!(allocation["contribution_id"], "backend-engineering");
+    assert_eq!(allocation["factor_terms"]["responsibility"], 0.20);
+    assert_eq!(allocation["factor_terms"]["criticality"], 0.30);
+    assert_eq!(allocation["factor_terms"]["deal_impact"], 0.25);
+    assert_eq!(allocation["factor_terms"]["dependency_reach"], 0.25);
+    assert_eq!(allocation["weighted_factors"], 1.0);
+    assert_eq!(allocation["contribution_value"], 1.0);
+    assert_eq!(allocation["total_contribution_value"], 1.0);
+    assert_eq!(allocation["normalized_share"], 1.0);
+    assert_eq!(allocation["allocated_amount"], 10500.0);
+
     assert!(
         run["finalized_at"]
             .as_str()
@@ -639,6 +667,37 @@ async fn finalized_run_http_round_trip_preserves_authoritative_snapshot() {
         historical["preview_snapshot"]["available_for_distribution"],
         30000.0
     );
+
+    // The draft was just updated to revenue 125000.0 (a would-be 35,000.0 surplus / 12,250.0
+    // pool if recomputed today), but this run's calculation trace must stay exactly what was
+    // finalized under revision 0 — proving it is stored historical evidence, not a recomputation.
+    assert_eq!(
+        historical["draft_snapshot"]["schema_version"],
+        "distribution-draft-snapshot/1"
+    );
+    assert_eq!(
+        historical["preview_snapshot"]["schema_version"],
+        "draft-preview-snapshot/1"
+    );
+
+    let historical_allocation = &historical["preview_snapshot"]["contribution_allocations"][0];
+
+    assert_eq!(historical_allocation["contributor_id"], "backend");
+    assert_eq!(
+        historical_allocation["factor_terms"]["responsibility"],
+        0.20
+    );
+    assert_eq!(historical_allocation["factor_terms"]["criticality"], 0.30);
+    assert_eq!(historical_allocation["factor_terms"]["deal_impact"], 0.25);
+    assert_eq!(
+        historical_allocation["factor_terms"]["dependency_reach"],
+        0.25
+    );
+    assert_eq!(historical_allocation["weighted_factors"], 1.0);
+    assert_eq!(historical_allocation["contribution_value"], 1.0);
+    assert_eq!(historical_allocation["total_contribution_value"], 1.0);
+    assert_eq!(historical_allocation["normalized_share"], 1.0);
+    assert_eq!(historical_allocation["allocated_amount"], 10500.0);
 
     cleanup_finalized_api_contract(&pool, id).await;
 }

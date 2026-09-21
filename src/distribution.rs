@@ -1,10 +1,13 @@
-use crate::contribution::{ContributionEvent, ContributionWeights};
+use crate::contribution::{ContributionEvent, ContributionFactorTerms, ContributionWeights};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContributionAllocation {
     pub contributor_id: String,
     pub contribution_id: String,
+    pub factor_terms: ContributionFactorTerms,
+    pub weighted_factors: f64,
     pub contribution_value: f64,
+    pub total_contribution_value: f64,
     pub normalized_share: f64,
     pub allocated_amount: f64,
 }
@@ -27,10 +30,13 @@ pub fn allocate_contribution_pool(
     for event in events {
         let score = event.calculate(weights)?;
 
-        scored.push((event, score.evidence_adjusted_value));
+        scored.push((event, score));
     }
 
-    let total_contribution: f64 = scored.iter().map(|(_, value)| *value).sum();
+    let total_contribution: f64 = scored
+        .iter()
+        .map(|(_, score)| score.evidence_adjusted_value)
+        .sum();
 
     if total_contribution <= 0.0 {
         if contribution_pool == 0.0 {
@@ -42,13 +48,17 @@ pub fn allocate_contribution_pool(
 
     let allocations = scored
         .into_iter()
-        .map(|(event, contribution_value)| {
+        .map(|(event, score)| {
+            let contribution_value = score.evidence_adjusted_value;
             let normalized_share = contribution_value / total_contribution;
 
             ContributionAllocation {
                 contributor_id: event.contributor_id.clone(),
                 contribution_id: event.contribution_id.clone(),
+                factor_terms: score.factor_terms,
+                weighted_factors: score.weighted_factors,
                 contribution_value,
+                total_contribution_value: total_contribution,
                 normalized_share,
                 allocated_amount: contribution_pool * normalized_share,
             }
@@ -139,6 +149,45 @@ mod tests {
         let total: f64 = allocations.iter().map(|a| a.allocated_amount).sum();
 
         assert!((total - 10_500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn allocation_trace_satisfies_share_and_amount_equations() {
+        let events = vec![
+            event("alice", "a", 1.0),
+            event("bob", "b", 2.0),
+            event("carol", "c", 3.0),
+        ];
+
+        let contribution_pool = 10_500.0;
+        let allocations =
+            allocate_contribution_pool(&events, &weights(), contribution_pool).unwrap();
+
+        let shared_denominator = allocations[0].total_contribution_value;
+
+        for allocation in &allocations {
+            assert!((allocation.total_contribution_value - shared_denominator).abs() < 1e-12);
+
+            let expected_share =
+                allocation.contribution_value / allocation.total_contribution_value;
+            assert!((allocation.normalized_share - expected_share).abs() < 1e-9);
+
+            let expected_amount = contribution_pool * allocation.normalized_share;
+            assert!((allocation.allocated_amount - expected_amount).abs() < 1e-9);
+
+            let term_sum = allocation.factor_terms.responsibility
+                + allocation.factor_terms.criticality
+                + allocation.factor_terms.deal_impact
+                + allocation.factor_terms.dependency_reach;
+            assert!((term_sum - allocation.weighted_factors).abs() < 1e-9);
+        }
+
+        // Existing allocation amounts must remain unchanged by the added provenance fields:
+        // total contribution value is 1.0 + 2.0 + 3.0 = 6.0, so the 10,500.0 pool splits into
+        // 1,750.0 / 3,500.0 / 5,250.0.
+        assert!((allocations[0].allocated_amount - 1_750.0).abs() < 1e-9);
+        assert!((allocations[1].allocated_amount - 3_500.0).abs() < 1e-9);
+        assert!((allocations[2].allocated_amount - 5_250.0).abs() < 1e-9);
     }
 
     #[test]

@@ -5,12 +5,20 @@ use serde_json::Value;
 use sqlx::{PgPool, Row, types::Json};
 
 use crate::{
-    contribution::ContributionWeights,
+    contribution::{ContributionFactorTerms, ContributionWeights},
     distribution::ContributionAllocation,
     ledger::MoneyLedger,
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
 };
+
+/// Schema identity for newly finalized `draft_snapshot` documents. Existing unversioned
+/// finalized runs remain valid legacy runs and are never rewritten or required to carry this.
+const DISTRIBUTION_DRAFT_SNAPSHOT_SCHEMA_VERSION: &str = "distribution-draft-snapshot/1";
+
+/// Schema identity for newly finalized `preview_snapshot` documents. Existing unversioned
+/// finalized runs remain valid legacy runs and are never rewritten or required to carry this.
+const DRAFT_PREVIEW_SNAPSHOT_SCHEMA_VERSION: &str = "draft-preview-snapshot/1";
 
 #[derive(Debug)]
 pub enum DraftStoreError {
@@ -173,6 +181,7 @@ pub struct FinalizedRunTelemetry {
 
 #[derive(Debug, Serialize)]
 struct DistributionDraftSnapshot {
+    schema_version: &'static str,
     id: String,
     revision: u64,
 
@@ -183,6 +192,7 @@ struct DistributionDraftSnapshot {
 impl From<&DistributionDraft> for DistributionDraftSnapshot {
     fn from(draft: &DistributionDraft) -> Self {
         Self {
+            schema_version: DISTRIBUTION_DRAFT_SNAPSHOT_SCHEMA_VERSION,
             id: draft.id.clone(),
             revision: draft.revision,
             body: DistributionDraftBody::from(draft),
@@ -210,10 +220,32 @@ impl From<PoolAmounts> for PoolAmountsSnapshot {
 }
 
 #[derive(Debug, Serialize)]
+struct ContributionFactorTermsSnapshot {
+    responsibility: f64,
+    criticality: f64,
+    deal_impact: f64,
+    dependency_reach: f64,
+}
+
+impl From<ContributionFactorTerms> for ContributionFactorTermsSnapshot {
+    fn from(terms: ContributionFactorTerms) -> Self {
+        Self {
+            responsibility: terms.responsibility,
+            criticality: terms.criticality,
+            deal_impact: terms.deal_impact,
+            dependency_reach: terms.dependency_reach,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct ContributionAllocationSnapshot {
     contributor_id: String,
     contribution_id: String,
+    factor_terms: ContributionFactorTermsSnapshot,
+    weighted_factors: f64,
     contribution_value: f64,
+    total_contribution_value: f64,
     normalized_share: f64,
     allocated_amount: f64,
 }
@@ -223,7 +255,10 @@ impl From<ContributionAllocation> for ContributionAllocationSnapshot {
         Self {
             contributor_id: allocation.contributor_id,
             contribution_id: allocation.contribution_id,
+            factor_terms: allocation.factor_terms.into(),
+            weighted_factors: allocation.weighted_factors,
             contribution_value: allocation.contribution_value,
+            total_contribution_value: allocation.total_contribution_value,
             normalized_share: allocation.normalized_share,
             allocated_amount: allocation.allocated_amount,
         }
@@ -232,6 +267,7 @@ impl From<ContributionAllocation> for ContributionAllocationSnapshot {
 
 #[derive(Debug, Serialize)]
 struct DraftPreviewSnapshot {
+    schema_version: &'static str,
     available_for_distribution: f64,
     pool_amounts: PoolAmountsSnapshot,
     contribution_allocations: Vec<ContributionAllocationSnapshot>,
@@ -240,6 +276,7 @@ struct DraftPreviewSnapshot {
 impl From<DraftPreview> for DraftPreviewSnapshot {
     fn from(preview: DraftPreview) -> Self {
         Self {
+            schema_version: DRAFT_PREVIEW_SNAPSHOT_SCHEMA_VERSION,
             available_for_distribution: preview.available_for_distribution,
             pool_amounts: preview.pool_amounts.into(),
             contribution_allocations: preview
