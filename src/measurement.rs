@@ -569,25 +569,100 @@ impl DependencyQualificationWeights {
     }
 }
 
-pub fn qualify_dependency(
+/// Identifies the exact experimental weighting rule implemented by
+/// [`qualify_dependency_trace`]. This slice does not change the qualification weights or the
+/// weighted-sum formula -- it only makes the existing rule inspectable. Bump this identifier if
+/// that rule itself ever changes.
+pub const DEPENDENCY_QUALIFICATION_RULE_VERSION: &str = "dependency-qualification/1";
+
+/// Each field is the stored result of `evidence field * corresponding qualification weight`,
+/// computed once by [`qualify_dependency_trace`] and never independently re-derived elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DependencyQualificationTerms {
+    pub blocking_relevance: f64,
+    pub failure_propagation: f64,
+    pub operational_reliance: f64,
+    pub business_path_relevance: f64,
+}
+
+/// An inspectable, versioned record of how [`DependencyEvidence`] was deterministically
+/// transformed into [`QualifiedDependency`] under [`DEPENDENCY_QUALIFICATION_RULE_VERSION`].
+/// Preserves the exact input evidence, exact qualification weights, exact qualified dependency,
+/// and exact weighted terms that produced `qualified_dependency.score`.
+///
+/// # Epistemic boundary
+///
+/// This trace proves only how the supplied normalized [`DependencyEvidence`] values were
+/// transformed into `QualifiedDependency.score` under rule version `dependency-qualification/1`.
+/// It does NOT establish:
+///
+/// - where those four evidence values came from
+/// - authenticity of source artifacts
+/// - completeness
+/// - freshness
+/// - independence
+/// - graph truth
+/// - causal attribution
+/// - suitability for economic allocation
+///
+/// `DependencyEvidence` is an existing model name in this codebase, not a claim that its fields
+/// are authenticated real-world evidence -- this slice does not reinterpret it as such, and does
+/// not invent any provenance or trust field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DependencyQualificationTrace {
+    pub rule_version: &'static str,
+    pub evidence: DependencyEvidence,
+    pub weights: DependencyQualificationWeights,
+    pub qualified_dependency: QualifiedDependency,
+    pub weighted_terms: DependencyQualificationTerms,
+}
+
+/// The one authoritative calculation path for dependency qualification: validates evidence and
+/// weights, computes each weighted term once, sums those stored terms once for
+/// `qualified_dependency.score`, and returns the full inspectable trace. [`qualify_dependency`]
+/// delegates here and returns only `trace.qualified_dependency`, so there is no second,
+/// independently drifting score formula.
+pub fn qualify_dependency_trace(
     evidence: DependencyEvidence,
     weights: DependencyQualificationWeights,
-) -> Result<QualifiedDependency, &'static str> {
+) -> Result<DependencyQualificationTrace, &'static str> {
     evidence.validate()?;
     weights.validate()?;
 
-    let score = evidence.blocking_relevance * weights.blocking_relevance
-        + evidence.failure_propagation * weights.failure_propagation
-        + evidence.operational_reliance * weights.operational_reliance
-        + evidence.business_path_relevance * weights.business_path_relevance;
+    let weighted_terms = DependencyQualificationTerms {
+        blocking_relevance: evidence.blocking_relevance * weights.blocking_relevance,
+        failure_propagation: evidence.failure_propagation * weights.failure_propagation,
+        operational_reliance: evidence.operational_reliance * weights.operational_reliance,
+        business_path_relevance: evidence.business_path_relevance * weights.business_path_relevance,
+    };
 
-    Ok(QualifiedDependency {
+    let score = weighted_terms.blocking_relevance
+        + weighted_terms.failure_propagation
+        + weighted_terms.operational_reliance
+        + weighted_terms.business_path_relevance;
+
+    let qualified_dependency = QualifiedDependency {
         blocking_relevance: evidence.blocking_relevance,
         failure_propagation: evidence.failure_propagation,
         operational_reliance: evidence.operational_reliance,
         business_path_relevance: evidence.business_path_relevance,
         score,
+    };
+
+    Ok(DependencyQualificationTrace {
+        rule_version: DEPENDENCY_QUALIFICATION_RULE_VERSION,
+        evidence,
+        weights,
+        qualified_dependency,
+        weighted_terms,
     })
+}
+
+pub fn qualify_dependency(
+    evidence: DependencyEvidence,
+    weights: DependencyQualificationWeights,
+) -> Result<QualifiedDependency, &'static str> {
+    Ok(qualify_dependency_trace(evidence, weights)?.qualified_dependency)
 }
 
 pub fn aggregate_dependency_weight(dependencies: &[QualifiedDependency]) -> f64 {
@@ -699,6 +774,158 @@ mod dependency_measurement_tests {
 
         assert!(aggregate <= 1.0);
         assert!(aggregate >= 0.0);
+    }
+
+    #[test]
+    fn trace_preserves_exact_evidence_and_weights() {
+        let evidence = DependencyEvidence {
+            blocking_relevance: 0.4,
+            failure_propagation: 0.6,
+            operational_reliance: 0.2,
+            business_path_relevance: 0.9,
+        };
+
+        let trace = qualify_dependency_trace(evidence, weights()).unwrap();
+
+        assert_eq!(trace.evidence, evidence);
+        assert_eq!(trace.weights, weights());
+    }
+
+    #[test]
+    fn trace_rule_version_is_dependency_qualification_v1() {
+        let trace = qualify_dependency_trace(
+            DependencyEvidence {
+                blocking_relevance: 0.5,
+                failure_propagation: 0.5,
+                operational_reliance: 0.5,
+                business_path_relevance: 0.5,
+            },
+            weights(),
+        )
+        .unwrap();
+
+        assert_eq!(trace.rule_version, "dependency-qualification/1");
+        assert_eq!(trace.rule_version, DEPENDENCY_QUALIFICATION_RULE_VERSION);
+    }
+
+    #[test]
+    fn weighted_terms_equal_evidence_times_weight() {
+        let evidence = DependencyEvidence {
+            blocking_relevance: 0.4,
+            failure_propagation: 0.6,
+            operational_reliance: 0.2,
+            business_path_relevance: 0.9,
+        };
+
+        let trace = qualify_dependency_trace(evidence, weights()).unwrap();
+
+        assert!(
+            (trace.weighted_terms.blocking_relevance
+                - evidence.blocking_relevance * weights().blocking_relevance)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.failure_propagation
+                - evidence.failure_propagation * weights().failure_propagation)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.operational_reliance
+                - evidence.operational_reliance * weights().operational_reliance)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.business_path_relevance
+                - evidence.business_path_relevance * weights().business_path_relevance)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn score_equals_sum_of_stored_weighted_terms() {
+        let evidence = DependencyEvidence {
+            blocking_relevance: 0.4,
+            failure_propagation: 0.6,
+            operational_reliance: 0.2,
+            business_path_relevance: 0.9,
+        };
+
+        let trace = qualify_dependency_trace(evidence, weights()).unwrap();
+
+        let expected_score = trace.weighted_terms.blocking_relevance
+            + trace.weighted_terms.failure_propagation
+            + trace.weighted_terms.operational_reliance
+            + trace.weighted_terms.business_path_relevance;
+
+        assert!((trace.qualified_dependency.score - expected_score).abs() < 1e-12);
+    }
+
+    #[test]
+    fn qualify_dependency_matches_trace_qualified_dependency() {
+        let evidence = DependencyEvidence {
+            blocking_relevance: 0.37,
+            failure_propagation: 0.81,
+            operational_reliance: 0.12,
+            business_path_relevance: 0.64,
+        };
+
+        let direct = qualify_dependency(evidence, weights()).unwrap();
+        let traced = qualify_dependency_trace(evidence, weights()).unwrap();
+
+        assert_eq!(direct, traced.qualified_dependency);
+    }
+
+    #[test]
+    fn same_inputs_produce_exactly_equal_traces() {
+        let evidence = DependencyEvidence {
+            blocking_relevance: 0.37,
+            failure_propagation: 0.81,
+            operational_reliance: 0.12,
+            business_path_relevance: 0.64,
+        };
+
+        let first = qualify_dependency_trace(evidence, weights()).unwrap();
+        let second = qualify_dependency_trace(evidence, weights()).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn invalid_inputs_return_identical_errors_through_both_apis() {
+        let out_of_range_evidence = DependencyEvidence {
+            blocking_relevance: 1.5,
+            failure_propagation: 0.5,
+            operational_reliance: 0.5,
+            business_path_relevance: 0.5,
+        };
+
+        let direct_error = qualify_dependency(out_of_range_evidence, weights()).unwrap_err();
+        let traced_error = qualify_dependency_trace(out_of_range_evidence, weights()).unwrap_err();
+
+        assert_eq!(direct_error, traced_error);
+
+        let valid_evidence = DependencyEvidence {
+            blocking_relevance: 0.5,
+            failure_propagation: 0.5,
+            operational_reliance: 0.5,
+            business_path_relevance: 0.5,
+        };
+
+        let invalid_weights = DependencyQualificationWeights {
+            blocking_relevance: 0.30,
+            failure_propagation: 0.30,
+            operational_reliance: 0.25,
+            business_path_relevance: 0.30,
+        };
+
+        let direct_error = qualify_dependency(valid_evidence, invalid_weights).unwrap_err();
+        let traced_error = qualify_dependency_trace(valid_evidence, invalid_weights).unwrap_err();
+
+        assert_eq!(direct_error, traced_error);
     }
 }
 
