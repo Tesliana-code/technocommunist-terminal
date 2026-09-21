@@ -15,8 +15,10 @@ use crate::{
     contribution::ContributionWeights,
     ledger::MoneyLedger,
     persistence::{
-        DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun, FinalizedRunMetadata,
-        FinalizedRunRecord, FinalizedRunTelemetry,
+        DraftStore, DraftStoreError, FinalizationMetadata, FinalizedAllocationExplanation,
+        FinalizedContributionFactorTerms, FinalizedContributionFactors,
+        FinalizedContributionWeights, FinalizedRun, FinalizedRunMetadata, FinalizedRunRecord,
+        FinalizedRunTelemetry,
     },
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
@@ -36,6 +38,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts/{id}/finalize", post(finalize_draft))
         .route("/api/drafts/{id}/runs", get(list_finalized_runs))
         .route("/api/runs/{id}", get(get_finalized_run))
+        .route(
+            "/api/runs/{run_id}/contributions/{contribution_id}/explanation",
+            get(get_finalized_allocation_explanation),
+        )
         .fallback(api_route_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
         .with_state(state)
@@ -165,6 +171,127 @@ impl From<FinalizedRunTelemetry> for FinalizedRunTelemetryResponse {
             available_for_distribution: telemetry.available_for_distribution,
             contribution_pool: telemetry.contribution_pool,
             allocation_count: telemetry.allocation_count,
+        }
+    }
+}
+
+/// A typed "why this amount?" read model for one contribution within one finalized run,
+/// combining ONLY that run's immutable `draft_snapshot` and `preview_snapshot`.
+#[derive(Debug, Serialize)]
+pub struct FinalizedAllocationExplanationResponse {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+
+    pub draft_snapshot_schema_version: String,
+    pub preview_snapshot_schema_version: String,
+
+    pub contributor_id: String,
+    pub contribution_id: String,
+
+    pub base_work_value: f64,
+
+    pub weights: FinalizedContributionWeightsResponse,
+    pub factors: FinalizedContributionFactorsResponse,
+    pub factor_terms: FinalizedContributionFactorTermsResponse,
+
+    pub weighted_factors: f64,
+    pub contribution_value: f64,
+    pub total_contribution_value: f64,
+    pub normalized_share: f64,
+
+    pub contribution_pool: f64,
+    pub allocated_amount: f64,
+
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedContributionWeightsResponse {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
+impl From<FinalizedContributionWeights> for FinalizedContributionWeightsResponse {
+    fn from(weights: FinalizedContributionWeights) -> Self {
+        Self {
+            responsibility: weights.responsibility,
+            criticality: weights.criticality,
+            deal_impact: weights.deal_impact,
+            dependency_reach: weights.dependency_reach,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedContributionFactorsResponse {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+    pub evidence_confidence: f64,
+}
+
+impl From<FinalizedContributionFactors> for FinalizedContributionFactorsResponse {
+    fn from(factors: FinalizedContributionFactors) -> Self {
+        Self {
+            responsibility: factors.responsibility,
+            criticality: factors.criticality,
+            deal_impact: factors.deal_impact,
+            dependency_reach: factors.dependency_reach,
+            evidence_confidence: factors.evidence_confidence,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedContributionFactorTermsResponse {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
+impl From<FinalizedContributionFactorTerms> for FinalizedContributionFactorTermsResponse {
+    fn from(terms: FinalizedContributionFactorTerms) -> Self {
+        Self {
+            responsibility: terms.responsibility,
+            criticality: terms.criticality,
+            deal_impact: terms.deal_impact,
+            dependency_reach: terms.dependency_reach,
+        }
+    }
+}
+
+impl From<FinalizedAllocationExplanation> for FinalizedAllocationExplanationResponse {
+    fn from(explanation: FinalizedAllocationExplanation) -> Self {
+        Self {
+            run_id: explanation.run_id,
+            source_draft_id: explanation.source_draft_id,
+            source_revision: explanation.source_revision,
+            draft_snapshot_schema_version: explanation.draft_snapshot_schema_version,
+            preview_snapshot_schema_version: explanation.preview_snapshot_schema_version,
+            contributor_id: explanation.contributor_id,
+            contribution_id: explanation.contribution_id,
+            base_work_value: explanation.base_work_value,
+            weights: explanation.weights.into(),
+            factors: explanation.factors.into(),
+            factor_terms: explanation.factor_terms.into(),
+            weighted_factors: explanation.weighted_factors,
+            contribution_value: explanation.contribution_value,
+            total_contribution_value: explanation.total_contribution_value,
+            normalized_share: explanation.normalized_share,
+            contribution_pool: explanation.contribution_pool,
+            allocated_amount: explanation.allocated_amount,
+            protocol_version: explanation.protocol_version,
+            engine_version: explanation.engine_version,
+            manual_version: explanation.manual_version,
+            finalized_at: explanation.finalized_at,
         }
     }
 }
@@ -336,6 +463,24 @@ async fn get_finalized_run(
     Ok(Json(run.into()))
 }
 
+async fn get_finalized_allocation_explanation(
+    State(state): State<AppState>,
+    path: Result<Path<(i64, String)>, PathRejection>,
+) -> Result<Json<FinalizedAllocationExplanationResponse>, ApiError> {
+    let Path((run_id, contribution_id)) = path.map_err(|rejection| ApiError::Request {
+        status: rejection.status(),
+        error: rejection.body_text(),
+    })?;
+
+    let explanation = state
+        .store
+        .explain_finalized_allocation(run_id, &contribution_id)
+        .await?
+        .ok_or(DraftStoreError::RunNotFound(run_id))?;
+
+    Ok(Json(explanation.into()))
+}
+
 async fn list_finalized_runs(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -454,11 +599,12 @@ impl IntoResponse for ApiError {
                     DraftStoreError::AlreadyExists(_)
                     | DraftStoreError::AlreadyFinalized { .. }
                     | DraftStoreError::RevisionExhausted { .. }
+                    | DraftStoreError::CalculationTraceUnavailable { .. }
                     | DraftStoreError::Conflict { .. } => StatusCode::CONFLICT,
 
-                    DraftStoreError::NotFound(_) | DraftStoreError::RunNotFound(_) => {
-                        StatusCode::NOT_FOUND
-                    }
+                    DraftStoreError::NotFound(_)
+                    | DraftStoreError::RunNotFound(_)
+                    | DraftStoreError::ContributionNotFound { .. } => StatusCode::NOT_FOUND,
 
                     DraftStoreError::CorruptRevision(_)
                     | DraftStoreError::CorruptDraft { .. }

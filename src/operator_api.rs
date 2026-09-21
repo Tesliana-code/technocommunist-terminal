@@ -43,6 +43,65 @@ pub struct OperatorRunDetail {
     pub finalized_at: String,
 }
 
+/// A typed "why this amount?" read model for one contribution within one finalized run,
+/// combining ONLY that run's immutable `draft_snapshot` and `preview_snapshot`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorAllocationExplanation {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+
+    pub draft_snapshot_schema_version: String,
+    pub preview_snapshot_schema_version: String,
+
+    pub contributor_id: String,
+    pub contribution_id: String,
+
+    pub base_work_value: f64,
+
+    pub weights: OperatorContributionWeights,
+    pub factors: OperatorContributionFactors,
+    pub factor_terms: OperatorContributionFactorTerms,
+
+    pub weighted_factors: f64,
+    pub contribution_value: f64,
+    pub total_contribution_value: f64,
+    pub normalized_share: f64,
+
+    pub contribution_pool: f64,
+    pub allocated_amount: f64,
+
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct OperatorContributionWeights {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct OperatorContributionFactors {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+    pub evidence_confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct OperatorContributionFactorTerms {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
 #[derive(Debug)]
 pub enum OperatorApiError {
     Configuration(String),
@@ -166,6 +225,30 @@ impl OperatorApiClient {
         Ok(response.json::<OperatorRunDetail>()?)
     }
 
+    pub fn get_allocation_explanation(
+        &self,
+        run_id: i64,
+        contribution_id: &str,
+    ) -> Result<OperatorAllocationExplanation, OperatorApiError> {
+        let url = self.allocation_explanation_url(run_id, contribution_id)?;
+
+        let response = self.client.get(url).send()?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let fallback = format!("request failed with HTTP {}", status.as_u16());
+
+            let error = response
+                .json::<ErrorEnvelope>()
+                .map(|body| body.error)
+                .unwrap_or(fallback);
+
+            return Err(OperatorApiError::Http { status, error });
+        }
+
+        Ok(response.json::<OperatorAllocationExplanation>()?)
+    }
+
     fn run_history_url(&self, draft_id: &str) -> Result<Url, OperatorApiError> {
         let mut url = self.base_url.clone();
 
@@ -197,6 +280,31 @@ impl OperatorApiClient {
             segments.push("api");
             segments.push("runs");
             segments.push(&run_id);
+        }
+
+        Ok(url)
+    }
+
+    fn allocation_explanation_url(
+        &self,
+        run_id: i64,
+        contribution_id: &str,
+    ) -> Result<Url, OperatorApiError> {
+        let mut url = self.base_url.clone();
+        let run_id = run_id.to_string();
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                OperatorApiError::Configuration("base URL cannot accept path segments".to_string())
+            })?;
+
+            segments.clear();
+            segments.push("api");
+            segments.push("runs");
+            segments.push(&run_id);
+            segments.push("contributions");
+            segments.push(contribution_id);
+            segments.push("explanation");
         }
 
         Ok(url)
@@ -261,6 +369,20 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:18080/api/drafts/draft%20one%2F%CE%B2/runs"
+        );
+    }
+
+    #[test]
+    fn allocation_explanation_url_preserves_contribution_identity_as_one_path_segment() {
+        let client = OperatorApiClient::new("http://127.0.0.1:18080").unwrap();
+
+        let url = client
+            .allocation_explanation_url(54, "backend/engine β")
+            .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:18080/api/runs/54/contributions/backend%2Fengine%20%CE%B2/explanation"
         );
     }
 
@@ -349,6 +471,88 @@ mod tests {
 
         assert!(
             request.starts_with("GET /api/runs/42 HTTP/1.1"),
+            "unexpected request: {request}"
+        );
+    }
+
+    #[test]
+    fn client_reads_authoritative_allocation_explanation_over_http() {
+        let body = r#"{
+            "run_id": 54,
+            "source_draft_id": "operator-proof",
+            "source_revision": 0,
+            "draft_snapshot_schema_version": "distribution-draft-snapshot/1",
+            "preview_snapshot_schema_version": "draft-preview-snapshot/1",
+            "contributor_id": "backend",
+            "contribution_id": "backend-engineering",
+            "base_work_value": 1.0,
+            "weights": {
+                "responsibility": 0.20,
+                "criticality": 0.30,
+                "deal_impact": 0.25,
+                "dependency_reach": 0.25
+            },
+            "factors": {
+                "responsibility": 1.0,
+                "criticality": 1.0,
+                "deal_impact": 1.0,
+                "dependency_reach": 1.0,
+                "evidence_confidence": 1.0
+            },
+            "factor_terms": {
+                "responsibility": 0.20,
+                "criticality": 0.30,
+                "deal_impact": 0.25,
+                "dependency_reach": 0.25
+            },
+            "weighted_factors": 1.0,
+            "contribution_value": 1.0,
+            "total_contribution_value": 1.0,
+            "normalized_share": 1.0,
+            "contribution_pool": 10500.0,
+            "allocated_amount": 10500.0,
+            "protocol_version": "PP-0.1-draft",
+            "engine_version": "distribution-machine/0.1.0",
+            "manual_version": "manual/0.1-draft",
+            "finalized_at": "2026-09-19 16:00:00+00"
+        }"#;
+
+        let (base_url, server) = serve_once("200 OK", body);
+        let client = OperatorApiClient::new(&base_url).unwrap();
+
+        let explanation = client
+            .get_allocation_explanation(54, "backend-engineering")
+            .unwrap();
+
+        assert_eq!(explanation.run_id, 54);
+        assert_eq!(explanation.source_draft_id, "operator-proof");
+        assert_eq!(
+            explanation.draft_snapshot_schema_version,
+            "distribution-draft-snapshot/1"
+        );
+        assert_eq!(
+            explanation.preview_snapshot_schema_version,
+            "draft-preview-snapshot/1"
+        );
+        assert_eq!(explanation.contributor_id, "backend");
+        assert_eq!(explanation.contribution_id, "backend-engineering");
+        assert_eq!(explanation.base_work_value, 1.0);
+        assert_eq!(explanation.weights.criticality, 0.30);
+        assert_eq!(explanation.factors.evidence_confidence, 1.0);
+        assert_eq!(explanation.factor_terms.responsibility, 0.20);
+        assert_eq!(explanation.weighted_factors, 1.0);
+        assert_eq!(explanation.contribution_value, 1.0);
+        assert_eq!(explanation.total_contribution_value, 1.0);
+        assert_eq!(explanation.normalized_share, 1.0);
+        assert_eq!(explanation.contribution_pool, 10500.0);
+        assert_eq!(explanation.allocated_amount, 10500.0);
+
+        let request = server.join().unwrap();
+
+        assert!(
+            request.starts_with(
+                "GET /api/runs/54/contributions/backend-engineering/explanation HTTP/1.1"
+            ),
             "unexpected request: {request}"
         );
     }

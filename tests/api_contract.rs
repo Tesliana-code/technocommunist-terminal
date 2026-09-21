@@ -989,3 +989,296 @@ async fn corrupt_finalized_run_telemetry_is_sanitized() {
 
     cleanup_finalized_api_contract(&pool, id).await;
 }
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn finalized_allocation_explanation_reads_only_immutable_trace() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-allocation-explanation";
+
+    cleanup_finalized_api_contract(&pool, id).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&finalizable_draft_payload(id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let finalized = json_response(response, StatusCode::CREATED).await;
+    let run_id = finalized["id"]
+        .as_i64()
+        .expect("finalized response must expose numeric run id");
+
+    let explanation_path =
+        format!("/api/runs/{run_id}/contributions/backend-engineering/explanation");
+
+    let response = call(&app, request(Method::GET, &explanation_path, "", false)).await;
+
+    let explanation = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(explanation["run_id"], run_id);
+    assert_eq!(explanation["source_draft_id"], id);
+    assert_eq!(explanation["source_revision"], 0);
+    assert_eq!(
+        explanation["draft_snapshot_schema_version"],
+        "distribution-draft-snapshot/1"
+    );
+    assert_eq!(
+        explanation["preview_snapshot_schema_version"],
+        "draft-preview-snapshot/1"
+    );
+    assert_eq!(explanation["contributor_id"], "backend");
+    assert_eq!(explanation["contribution_id"], "backend-engineering");
+    assert_eq!(explanation["base_work_value"], 1.0);
+
+    assert_eq!(explanation["weights"]["responsibility"], 0.20);
+    assert_eq!(explanation["weights"]["criticality"], 0.30);
+    assert_eq!(explanation["weights"]["deal_impact"], 0.25);
+    assert_eq!(explanation["weights"]["dependency_reach"], 0.25);
+
+    assert_eq!(explanation["factors"]["responsibility"], 1.0);
+    assert_eq!(explanation["factors"]["criticality"], 1.0);
+    assert_eq!(explanation["factors"]["deal_impact"], 1.0);
+    assert_eq!(explanation["factors"]["dependency_reach"], 1.0);
+    assert_eq!(explanation["factors"]["evidence_confidence"], 1.0);
+
+    assert_eq!(explanation["factor_terms"]["responsibility"], 0.20);
+    assert_eq!(explanation["factor_terms"]["criticality"], 0.30);
+    assert_eq!(explanation["factor_terms"]["deal_impact"], 0.25);
+    assert_eq!(explanation["factor_terms"]["dependency_reach"], 0.25);
+
+    assert_eq!(explanation["weighted_factors"], 1.0);
+    assert_eq!(explanation["contribution_value"], 1.0);
+    assert_eq!(explanation["total_contribution_value"], 1.0);
+    assert_eq!(explanation["normalized_share"], 1.0);
+    assert_eq!(explanation["contribution_pool"], 10500.0);
+    assert_eq!(explanation["allocated_amount"], 10500.0);
+
+    assert_eq!(explanation["protocol_version"], "PP-0.1-draft");
+    assert_eq!(
+        explanation["engine_version"],
+        concat!("distribution-machine/", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(explanation["manual_version"], "manual/0.1-draft");
+    assert!(
+        explanation["finalized_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    // Update the draft to revision 1 with different revenue (a would-be different
+    // surplus/pool if recomputed today) and re-fetch the SAME historical explanation: it
+    // must join the run's own immutable snapshots, never the newer draft.
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{id}"),
+            serde_json::to_vec(&finalizable_update_payload(0, 125000.0)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    let updated = json_response(response, StatusCode::OK).await;
+    assert_eq!(updated["revision"], 1);
+    assert_eq!(updated["money"]["revenue"], 125000.0);
+
+    let response = call(&app, request(Method::GET, &explanation_path, "", false)).await;
+
+    let historical_explanation = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(historical_explanation["contribution_pool"], 10500.0);
+    assert_eq!(historical_explanation["allocated_amount"], 10500.0);
+    assert_eq!(historical_explanation, explanation);
+
+    // A nonexistent contribution_id for this run returns 404.
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/runs/{run_id}/contributions/does-not-exist/explanation"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    error_response(response, StatusCode::NOT_FOUND).await;
+
+    cleanup_finalized_api_contract(&pool, id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn legacy_finalized_run_explanation_returns_conflict() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-legacy-run-explanation";
+
+    cleanup_finalized_api_contract(&pool, id).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&finalizable_draft_payload(id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let finalized = json_response(response, StatusCode::CREATED).await;
+    let run_id = finalized["id"]
+        .as_i64()
+        .expect("finalized response must expose numeric run id");
+
+    // Emulate a legitimate pre-IV-D1 row: strip both root schema_version fields and the
+    // per-allocation calculation-trace fields IV-D1 introduced, leaving an otherwise valid
+    // immutable snapshot pair.
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/runs/{run_id}"), "", false),
+    )
+    .await;
+
+    let run = json_response(response, StatusCode::OK).await;
+
+    let mut legacy_draft_snapshot = run["draft_snapshot"].clone();
+    legacy_draft_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+
+    let mut legacy_preview_snapshot = run["preview_snapshot"].clone();
+    legacy_preview_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+
+    for allocation in legacy_preview_snapshot["contribution_allocations"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let allocation = allocation.as_object_mut().unwrap();
+        allocation.remove("factor_terms");
+        allocation.remove("weighted_factors");
+        allocation.remove("total_contribution_value");
+    }
+
+    let mut tx = pool.begin().await.unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         DISABLE TRIGGER distribution_runs_reject_update",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE distribution_runs
+         SET draft_snapshot = $1, preview_snapshot = $2
+         WHERE id = $3",
+    )
+    .bind(sqlx::types::Json(legacy_draft_snapshot))
+    .bind(sqlx::types::Json(legacy_preview_snapshot))
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         ENABLE TRIGGER distribution_runs_reject_update",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/runs/{run_id}/contributions/backend-engineering/explanation"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::CONFLICT).await;
+
+    assert_eq!(
+        body["error"],
+        format!("calculation trace unavailable for legacy finalized run: {run_id}")
+    );
+
+    // Existing endpoints must continue to serve this now-legacy row.
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/runs/{run_id}"), "", false),
+    )
+    .await;
+
+    let legacy_run = json_response(response, StatusCode::OK).await;
+    assert_eq!(legacy_run["id"], run_id);
+    assert!(legacy_run["draft_snapshot"].get("schema_version").is_none());
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/drafts/{id}/runs"), "", false),
+    )
+    .await;
+
+    let history = json_response(response, StatusCode::OK).await;
+    let runs = history["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["id"], run_id);
+    assert_eq!(runs[0]["telemetry"]["allocation_count"], 1);
+
+    cleanup_finalized_api_contract(&pool, id).await;
+}

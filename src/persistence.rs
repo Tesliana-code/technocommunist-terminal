@@ -25,15 +25,38 @@ pub enum DraftStoreError {
     Validation(String),
     InitialRevisionMustBeZero(u64),
     AlreadyExists(String),
-    AlreadyFinalized { id: String, revision: u64 },
+    AlreadyFinalized {
+        id: String,
+        revision: u64,
+    },
     RevisionOutOfRange(u64),
-    RevisionExhausted { id: String, revision: u64 },
+    RevisionExhausted {
+        id: String,
+        revision: u64,
+    },
     CorruptRevision(i64),
-    CorruptDraft { id: String, reason: String },
-    CorruptRunSnapshot { id: i64, reason: String },
+    CorruptDraft {
+        id: String,
+        reason: String,
+    },
+    CorruptRunSnapshot {
+        id: i64,
+        reason: String,
+    },
     NotFound(String),
     RunNotFound(i64),
-    Conflict { id: String, expected_revision: u64 },
+    ContributionNotFound {
+        run_id: i64,
+        contribution_id: String,
+    },
+    CalculationTraceUnavailable {
+        id: i64,
+        reason: String,
+    },
+    Conflict {
+        id: String,
+        expected_revision: u64,
+    },
     Serialization(serde_json::Error),
     Database(sqlx::Error),
 }
@@ -70,11 +93,22 @@ impl fmt::Display for DraftStoreError {
             Self::CorruptRunSnapshot { id, reason } => {
                 write!(
                     f,
-                    "database contains invalid preview_snapshot for run {id}: {reason}"
+                    "database contains an invalid immutable snapshot for run {id}: {reason}"
                 )
             }
             Self::NotFound(id) => write!(f, "draft not found: {id}"),
             Self::RunNotFound(id) => write!(f, "distribution run not found: {id}"),
+            Self::ContributionNotFound {
+                run_id,
+                contribution_id,
+            } => write!(
+                f,
+                "contribution {contribution_id} not found for run {run_id}"
+            ),
+            Self::CalculationTraceUnavailable { id, .. } => write!(
+                f,
+                "calculation trace unavailable for legacy finalized run: {id}"
+            ),
             Self::Conflict {
                 id,
                 expected_revision,
@@ -177,6 +211,72 @@ pub struct FinalizedRunTelemetry {
     pub available_for_distribution: f64,
     pub contribution_pool: f64,
     pub allocation_count: u64,
+}
+
+/// A typed "why this amount?" read model for one contribution within one finalized run.
+/// Every field is read STRICTLY from the run's immutable `draft_snapshot`/`preview_snapshot` —
+/// never from the current draft, never from `DistributionDraft::preview()`, never recomputed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedAllocationExplanation {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+
+    pub draft_snapshot_schema_version: String,
+    pub preview_snapshot_schema_version: String,
+
+    pub contributor_id: String,
+    pub contribution_id: String,
+
+    pub base_work_value: f64,
+
+    pub weights: FinalizedContributionWeights,
+    pub factors: FinalizedContributionFactors,
+    pub factor_terms: FinalizedContributionFactorTerms,
+
+    pub weighted_factors: f64,
+    pub contribution_value: f64,
+    pub total_contribution_value: f64,
+    pub normalized_share: f64,
+
+    pub contribution_pool: f64,
+    pub allocated_amount: f64,
+
+    pub protocol_version: String,
+    pub engine_version: String,
+    pub manual_version: String,
+    pub finalized_at: String,
+}
+
+/// Mirrors `ContributionWeights` as read from `draft_snapshot.contribution_weights`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FinalizedContributionWeights {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+}
+
+/// Mirrors the matching contributor's `factors` as read from `draft_snapshot.contributors[]`.
+/// Deliberately excludes `stewardship`: it exists in the historical draft input structure but
+/// the contribution formula does not use it, so it has no place in a calculation explanation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FinalizedContributionFactors {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
+    pub evidence_confidence: f64,
+}
+
+/// Mirrors `ContributionFactorTerms` as read from the matching allocation's
+/// `preview_snapshot.contribution_allocations[].factor_terms`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FinalizedContributionFactorTerms {
+    pub responsibility: f64,
+    pub criticality: f64,
+    pub deal_impact: f64,
+    pub dependency_reach: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,6 +520,22 @@ impl DraftStore {
             manual_version,
             finalized_at,
         }))
+    }
+
+    /// Combines ONLY the immutable `draft_snapshot` and `preview_snapshot` already persisted
+    /// for `run_id` into a typed calculation-trace explanation for `contribution_id`. Never
+    /// loads the current draft and never recomputes via the Distribution Engine — reuses the
+    /// same single-row `load_finalized_run` lookup and reads straight off the frozen JSON.
+    pub async fn explain_finalized_allocation(
+        &self,
+        run_id: i64,
+        contribution_id: &str,
+    ) -> Result<Option<FinalizedAllocationExplanation>, DraftStoreError> {
+        let Some(run) = self.load_finalized_run(run_id).await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(extract_allocation_explanation(&run, contribution_id)?))
     }
 
     pub async fn list_finalized_runs_for_draft(
@@ -761,5 +877,278 @@ fn extract_run_telemetry(
         available_for_distribution,
         contribution_pool,
         allocation_count,
+    })
+}
+
+/// Reads a finite `f64` at a dot-separated path inside `value` (e.g. `"factors.responsibility"`),
+/// failing closed with `CorruptRunSnapshot` on any missing/non-numeric/non-finite field.
+fn json_f64(run_id: i64, value: &Value, path: &str) -> Result<f64, DraftStoreError> {
+    let mut cursor = value;
+
+    for part in path.split('.') {
+        cursor = cursor
+            .get(part)
+            .ok_or_else(|| DraftStoreError::CorruptRunSnapshot {
+                id: run_id,
+                reason: format!("missing {path}"),
+            })?;
+    }
+
+    let number = cursor
+        .as_f64()
+        .ok_or_else(|| DraftStoreError::CorruptRunSnapshot {
+            id: run_id,
+            reason: format!("non-numeric {path}"),
+        })?;
+
+    if !number.is_finite() {
+        return Err(DraftStoreError::CorruptRunSnapshot {
+            id: run_id,
+            reason: format!("{path} is not finite"),
+        });
+    }
+
+    Ok(number)
+}
+
+/// Same as [`json_f64`] but additionally fails closed if the value is negative, for fields that
+/// are contractually non-negative in the frozen calculation trace.
+fn json_f64_non_negative(run_id: i64, value: &Value, path: &str) -> Result<f64, DraftStoreError> {
+    let number = json_f64(run_id, value, path)?;
+
+    if number < 0.0 {
+        return Err(DraftStoreError::CorruptRunSnapshot {
+            id: run_id,
+            reason: format!("{path} is negative"),
+        });
+    }
+
+    Ok(number)
+}
+
+/// Combines ONLY the already-persisted `draft_snapshot` and `preview_snapshot` on `run` into a
+/// typed calculation-trace explanation for `contribution_id`. Never loads the current draft,
+/// never calls `DistributionDraft::preview()`, `ContributionEvent::calculate()`, or
+/// `allocate_contribution_pool()` — every numeric value is read straight off the stored JSON
+/// that IV-D1 froze at finalize time. Legacy/unversioned or unrecognized-version snapshots fail
+/// closed with `CalculationTraceUnavailable` (an expected compatibility state, not corruption);
+/// structurally malformed `/1` snapshots fail closed with `CorruptRunSnapshot`.
+fn extract_allocation_explanation(
+    run: &FinalizedRunRecord,
+    contribution_id: &str,
+) -> Result<FinalizedAllocationExplanation, DraftStoreError> {
+    let corrupt = |reason: String| DraftStoreError::CorruptRunSnapshot { id: run.id, reason };
+
+    let draft_schema_version = run
+        .draft_snapshot
+        .get("schema_version")
+        .and_then(Value::as_str);
+    let preview_schema_version = run
+        .preview_snapshot
+        .get("schema_version")
+        .and_then(Value::as_str);
+
+    if draft_schema_version != Some(DISTRIBUTION_DRAFT_SNAPSHOT_SCHEMA_VERSION)
+        || preview_schema_version != Some(DRAFT_PREVIEW_SNAPSHOT_SCHEMA_VERSION)
+    {
+        return Err(DraftStoreError::CalculationTraceUnavailable {
+            id: run.id,
+            reason: "draft_snapshot/preview_snapshot missing or unrecognized schema_version"
+                .to_string(),
+        });
+    }
+
+    // Identity/integrity gates: a versioned snapshot must agree with its own run row.
+    let draft_id = run
+        .draft_snapshot
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| corrupt("draft_snapshot.id missing or non-string".to_string()))?;
+
+    if draft_id != run.source_draft_id {
+        return Err(corrupt(format!(
+            "draft_snapshot.id {draft_id} does not match source_draft_id {}",
+            run.source_draft_id
+        )));
+    }
+
+    let draft_revision = run
+        .draft_snapshot
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt("draft_snapshot.revision missing or non-numeric".to_string()))?;
+
+    if draft_revision != run.source_revision {
+        return Err(corrupt(format!(
+            "draft_snapshot.revision {draft_revision} does not match source_revision {}",
+            run.source_revision
+        )));
+    }
+
+    let draft_contributors = run
+        .draft_snapshot
+        .get("contributors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| corrupt("draft_snapshot.contributors missing or non-array".to_string()))?;
+
+    let matching_contributors: Vec<&Value> = draft_contributors
+        .iter()
+        .filter(|contributor| {
+            contributor.get("contribution_id").and_then(Value::as_str) == Some(contribution_id)
+        })
+        .collect();
+
+    let contributor = match matching_contributors.as_slice() {
+        [] => {
+            return Err(DraftStoreError::ContributionNotFound {
+                run_id: run.id,
+                contribution_id: contribution_id.to_string(),
+            });
+        }
+        [only] => *only,
+        multiple => {
+            return Err(corrupt(format!(
+                "draft_snapshot.contributors has {} entries for contribution_id {contribution_id}",
+                multiple.len()
+            )));
+        }
+    };
+
+    let preview_allocations = run
+        .preview_snapshot
+        .get("contribution_allocations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            corrupt("preview_snapshot.contribution_allocations missing or non-array".to_string())
+        })?;
+
+    let matching_allocations: Vec<&Value> = preview_allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.get("contribution_id").and_then(Value::as_str) == Some(contribution_id)
+        })
+        .collect();
+
+    let allocation = match matching_allocations.as_slice() {
+        [] => {
+            return Err(corrupt(format!(
+                "contribution_id {contribution_id} present in draft_snapshot but absent from preview_snapshot"
+            )));
+        }
+        [only] => *only,
+        multiple => {
+            return Err(corrupt(format!(
+                "preview_snapshot.contribution_allocations has {} entries for contribution_id {contribution_id}",
+                multiple.len()
+            )));
+        }
+    };
+
+    let contributor_id = contributor
+        .get("contributor_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            corrupt("draft contributor.contributor_id missing or non-string".to_string())
+        })?;
+
+    let allocation_contributor_id = allocation
+        .get("contributor_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            corrupt("preview allocation.contributor_id missing or non-string".to_string())
+        })?;
+
+    if contributor_id != allocation_contributor_id {
+        return Err(corrupt(format!(
+            "draft contributor_id {contributor_id} does not match preview allocation contributor_id {allocation_contributor_id}"
+        )));
+    }
+
+    let base_work_value = json_f64_non_negative(run.id, contributor, "base_work_value")?;
+
+    let weights = FinalizedContributionWeights {
+        responsibility: json_f64_non_negative(
+            run.id,
+            &run.draft_snapshot,
+            "contribution_weights.responsibility",
+        )?,
+        criticality: json_f64_non_negative(
+            run.id,
+            &run.draft_snapshot,
+            "contribution_weights.criticality",
+        )?,
+        deal_impact: json_f64_non_negative(
+            run.id,
+            &run.draft_snapshot,
+            "contribution_weights.deal_impact",
+        )?,
+        dependency_reach: json_f64_non_negative(
+            run.id,
+            &run.draft_snapshot,
+            "contribution_weights.dependency_reach",
+        )?,
+    };
+
+    let factors = FinalizedContributionFactors {
+        responsibility: json_f64_non_negative(run.id, contributor, "factors.responsibility")?,
+        criticality: json_f64_non_negative(run.id, contributor, "factors.criticality")?,
+        deal_impact: json_f64_non_negative(run.id, contributor, "factors.deal_impact")?,
+        dependency_reach: json_f64_non_negative(run.id, contributor, "factors.dependency_reach")?,
+        evidence_confidence: json_f64_non_negative(
+            run.id,
+            contributor,
+            "factors.evidence_confidence",
+        )?,
+    };
+
+    let factor_terms = FinalizedContributionFactorTerms {
+        responsibility: json_f64_non_negative(run.id, allocation, "factor_terms.responsibility")?,
+        criticality: json_f64_non_negative(run.id, allocation, "factor_terms.criticality")?,
+        deal_impact: json_f64_non_negative(run.id, allocation, "factor_terms.deal_impact")?,
+        dependency_reach: json_f64_non_negative(
+            run.id,
+            allocation,
+            "factor_terms.dependency_reach",
+        )?,
+    };
+
+    let weighted_factors = json_f64_non_negative(run.id, allocation, "weighted_factors")?;
+    let contribution_value = json_f64_non_negative(run.id, allocation, "contribution_value")?;
+    let total_contribution_value =
+        json_f64_non_negative(run.id, allocation, "total_contribution_value")?;
+    let normalized_share = json_f64(run.id, allocation, "normalized_share")?;
+
+    if !(0.0..=1.0).contains(&normalized_share) {
+        return Err(corrupt(format!(
+            "normalized_share {normalized_share} is outside 0.0..=1.0"
+        )));
+    }
+
+    let contribution_pool =
+        json_f64_non_negative(run.id, &run.preview_snapshot, "pool_amounts.contribution")?;
+    let allocated_amount = json_f64_non_negative(run.id, allocation, "allocated_amount")?;
+
+    Ok(FinalizedAllocationExplanation {
+        run_id: run.id,
+        source_draft_id: run.source_draft_id.clone(),
+        source_revision: run.source_revision,
+        draft_snapshot_schema_version: DISTRIBUTION_DRAFT_SNAPSHOT_SCHEMA_VERSION.to_string(),
+        preview_snapshot_schema_version: DRAFT_PREVIEW_SNAPSHOT_SCHEMA_VERSION.to_string(),
+        contributor_id: contributor_id.to_string(),
+        contribution_id: contribution_id.to_string(),
+        base_work_value,
+        weights,
+        factors,
+        factor_terms,
+        weighted_factors,
+        contribution_value,
+        total_contribution_value,
+        normalized_share,
+        contribution_pool,
+        allocated_amount,
+        protocol_version: run.protocol_version.clone(),
+        engine_version: run.engine_version.clone(),
+        manual_version: run.manual_version.clone(),
+        finalized_at: run.finalized_at.clone(),
     })
 }
