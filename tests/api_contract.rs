@@ -479,6 +479,37 @@ fn finalizable_draft_payload(id: &str) -> Value {
     payload
 }
 
+/// Two equal contributors so the pool splits exactly 0.5/0.5 — both `normalized_share` and
+/// `allocated_amount` are then bit-exact (IEEE 754 correctly-rounds `x/(2x)` to `0.5` and any
+/// finite value times `0.5` exactly), letting the selector contract assert exact JSON values
+/// without floating-point tolerance handling.
+fn two_contributor_finalizable_draft_payload(id: &str) -> Value {
+    let mut payload = draft_payload(id);
+
+    let contributor = |contributor_id: &str, contribution_id: &str| {
+        json!({
+            "contributor_id": contributor_id,
+            "contribution_id": contribution_id,
+            "base_work_value": 1.0,
+            "factors": {
+                "responsibility": 1.0,
+                "criticality": 1.0,
+                "deal_impact": 1.0,
+                "stewardship": 0.0,
+                "dependency_reach": 1.0,
+                "evidence_confidence": 1.0
+            }
+        })
+    };
+
+    payload["contributors"] = json!([
+        contributor("operations", "operations-delivery"),
+        contributor("backend", "backend-engineering"),
+    ]);
+
+    payload
+}
+
 async fn cleanup_finalized_api_contract(pool: &PgPool, id: &str) {
     let mut tx = pool.begin().await.unwrap();
 
@@ -1257,6 +1288,25 @@ async fn legacy_finalized_run_explanation_returns_conflict() {
         format!("calculation trace unavailable for legacy finalized run: {run_id}")
     );
 
+    // The IV-D2B contribution selector shares the same legacy compatibility gate.
+    let response = call(
+        &app,
+        request(
+            Method::GET,
+            &format!("/api/runs/{run_id}/contributions"),
+            "",
+            false,
+        ),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::CONFLICT).await;
+
+    assert_eq!(
+        body["error"],
+        format!("calculation trace unavailable for legacy finalized run: {run_id}")
+    );
+
     // Existing endpoints must continue to serve this now-legacy row.
     let response = call(
         &app,
@@ -1279,6 +1329,103 @@ async fn legacy_finalized_run_explanation_returns_conflict() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["id"], run_id);
     assert_eq!(runs[0]["telemetry"]["allocation_count"], 1);
+
+    cleanup_finalized_api_contract(&pool, id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn finalized_run_contribution_selector_reads_immutable_allocations() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-run-contribution-selector";
+
+    cleanup_finalized_api_contract(&pool, id).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&two_contributor_finalizable_draft_payload(id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let finalized = json_response(response, StatusCode::CREATED).await;
+    let run_id = finalized["id"]
+        .as_i64()
+        .expect("finalized response must expose numeric run id");
+
+    let selector_path = format!("/api/runs/{run_id}/contributions");
+
+    let response = call(&app, request(Method::GET, &selector_path, "", false)).await;
+
+    let selector = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(selector["run_id"], run_id);
+    assert_eq!(selector["source_draft_id"], id);
+    assert_eq!(selector["source_revision"], 0);
+
+    let contributions = selector["contributions"]
+        .as_array()
+        .expect("selector must expose a contributions array");
+
+    assert_eq!(contributions.len(), 2);
+
+    assert_eq!(contributions[0]["contributor_id"], "operations");
+    assert_eq!(contributions[0]["contribution_id"], "operations-delivery");
+    assert_eq!(contributions[0]["normalized_share"], 0.5);
+    assert_eq!(contributions[0]["allocated_amount"], 5250.0);
+
+    assert_eq!(contributions[1]["contributor_id"], "backend");
+    assert_eq!(contributions[1]["contribution_id"], "backend-engineering");
+    assert_eq!(contributions[1]["normalized_share"], 0.5);
+    assert_eq!(contributions[1]["allocated_amount"], 5250.0);
+
+    // No raw snapshot is exposed through the selector.
+    assert!(selector.get("draft_snapshot").is_none());
+    assert!(selector.get("preview_snapshot").is_none());
+
+    // Update the current draft; the SAME historical selector must stay byte-for-byte identical,
+    // proving it joins this run's own immutable snapshots rather than the newer draft.
+    let response = call(
+        &app,
+        request(
+            Method::PUT,
+            &format!("/api/drafts/{id}"),
+            serde_json::to_vec(&finalizable_update_payload(0, 125000.0)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    let updated = json_response(response, StatusCode::OK).await;
+    assert_eq!(updated["revision"], 1);
+
+    let response = call(&app, request(Method::GET, &selector_path, "", false)).await;
+
+    let selector_again = json_response(response, StatusCode::OK).await;
+
+    assert_eq!(selector_again, selector);
 
     cleanup_finalized_api_contract(&pool, id).await;
 }

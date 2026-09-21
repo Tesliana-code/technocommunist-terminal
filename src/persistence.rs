@@ -279,6 +279,26 @@ pub struct FinalizedContributionFactorTerms {
     pub dependency_reach: f64,
 }
 
+/// A lightweight selector listing which contributions exist inside one finalized run, so a
+/// caller can discover valid `contribution_id` values without parsing raw `preview_snapshot`
+/// JSON. Intentionally excludes weights/factors/factor_terms/contribution_value/snapshots —
+/// those belong to [`FinalizedAllocationExplanation`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedRunContributions {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub contributions: Vec<FinalizedContributionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedContributionOption {
+    pub contributor_id: String,
+    pub contribution_id: String,
+    pub normalized_share: f64,
+    pub allocated_amount: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct DistributionDraftSnapshot {
     schema_version: &'static str,
@@ -536,6 +556,20 @@ impl DraftStore {
         };
 
         Ok(Some(extract_allocation_explanation(&run, contribution_id)?))
+    }
+
+    /// Discovers which contributions exist inside one finalized run. Reuses the same single
+    /// `load_finalized_run` lookup as [`Self::explain_finalized_allocation`] — no further
+    /// queries are issued per discovered contribution.
+    pub async fn list_finalized_run_contributions(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<FinalizedRunContributions>, DraftStoreError> {
+        let Some(run) = self.load_finalized_run(run_id).await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(extract_run_contributions(&run)?))
     }
 
     pub async fn list_finalized_runs_for_draft(
@@ -1150,5 +1184,90 @@ fn extract_allocation_explanation(
         engine_version: run.engine_version.clone(),
         manual_version: run.manual_version.clone(),
         finalized_at: run.finalized_at.clone(),
+    })
+}
+
+/// Discovers which contributions exist in a finalized run's already-loaded immutable
+/// `preview_snapshot`, then reuses [`extract_allocation_explanation`] per discovered
+/// `contribution_id` rather than reimplementing a second, weaker identity check. Legacy or
+/// unrecognized-version snapshots fail closed with `CalculationTraceUnavailable`, matching the
+/// same compatibility gate as the existing WHY explanation endpoint.
+fn extract_run_contributions(
+    run: &FinalizedRunRecord,
+) -> Result<FinalizedRunContributions, DraftStoreError> {
+    let corrupt = |reason: String| DraftStoreError::CorruptRunSnapshot { id: run.id, reason };
+
+    let draft_schema_version = run
+        .draft_snapshot
+        .get("schema_version")
+        .and_then(Value::as_str);
+    let preview_schema_version = run
+        .preview_snapshot
+        .get("schema_version")
+        .and_then(Value::as_str);
+
+    if draft_schema_version != Some(DISTRIBUTION_DRAFT_SNAPSHOT_SCHEMA_VERSION)
+        || preview_schema_version != Some(DRAFT_PREVIEW_SNAPSHOT_SCHEMA_VERSION)
+    {
+        return Err(DraftStoreError::CalculationTraceUnavailable {
+            id: run.id,
+            reason: "draft_snapshot/preview_snapshot missing or unrecognized schema_version"
+                .to_string(),
+        });
+    }
+
+    let preview_allocations = run
+        .preview_snapshot
+        .get("contribution_allocations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            corrupt("preview_snapshot.contribution_allocations missing or non-array".to_string())
+        })?;
+
+    let mut contribution_ids: Vec<String> = Vec::with_capacity(preview_allocations.len());
+
+    for allocation in preview_allocations {
+        let contribution_id = allocation
+            .get("contribution_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                corrupt(
+                    "preview_snapshot.contribution_allocations entry has missing, non-string, \
+                     or empty contribution_id"
+                        .to_string(),
+                )
+            })?;
+
+        if contribution_ids
+            .iter()
+            .any(|existing| existing == contribution_id)
+        {
+            return Err(corrupt(format!(
+                "duplicate contribution_id in preview_snapshot.contribution_allocations: {contribution_id}"
+            )));
+        }
+
+        contribution_ids.push(contribution_id.to_string());
+    }
+
+    let mut contributions = Vec::with_capacity(contribution_ids.len());
+
+    for contribution_id in &contribution_ids {
+        let explanation = extract_allocation_explanation(run, contribution_id)?;
+
+        contributions.push(FinalizedContributionOption {
+            contributor_id: explanation.contributor_id,
+            contribution_id: explanation.contribution_id,
+            normalized_share: explanation.normalized_share,
+            allocated_amount: explanation.allocated_amount,
+        });
+    }
+
+    Ok(FinalizedRunContributions {
+        run_id: run.id,
+        source_draft_id: run.source_draft_id.clone(),
+        source_revision: run.source_revision,
+        contributions,
     })
 }

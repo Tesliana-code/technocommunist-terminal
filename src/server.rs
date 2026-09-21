@@ -17,8 +17,8 @@ use crate::{
     persistence::{
         DraftStore, DraftStoreError, FinalizationMetadata, FinalizedAllocationExplanation,
         FinalizedContributionFactorTerms, FinalizedContributionFactors,
-        FinalizedContributionWeights, FinalizedRun, FinalizedRunMetadata, FinalizedRunRecord,
-        FinalizedRunTelemetry,
+        FinalizedContributionOption, FinalizedContributionWeights, FinalizedRun,
+        FinalizedRunContributions, FinalizedRunMetadata, FinalizedRunRecord, FinalizedRunTelemetry,
     },
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
@@ -38,6 +38,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/drafts/{id}/finalize", post(finalize_draft))
         .route("/api/drafts/{id}/runs", get(list_finalized_runs))
         .route("/api/runs/{id}", get(get_finalized_run))
+        .route(
+            "/api/runs/{run_id}/contributions",
+            get(list_finalized_run_contributions),
+        )
         .route(
             "/api/runs/{run_id}/contributions/{contribution_id}/explanation",
             get(get_finalized_allocation_explanation),
@@ -296,6 +300,49 @@ impl From<FinalizedAllocationExplanation> for FinalizedAllocationExplanationResp
     }
 }
 
+/// A lightweight selector listing which contributions exist inside one finalized run.
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunContributionsResponse {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub contributions: Vec<FinalizedContributionOptionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizedContributionOptionResponse {
+    pub contributor_id: String,
+    pub contribution_id: String,
+    pub normalized_share: f64,
+    pub allocated_amount: f64,
+}
+
+impl From<FinalizedContributionOption> for FinalizedContributionOptionResponse {
+    fn from(option: FinalizedContributionOption) -> Self {
+        Self {
+            contributor_id: option.contributor_id,
+            contribution_id: option.contribution_id,
+            normalized_share: option.normalized_share,
+            allocated_amount: option.allocated_amount,
+        }
+    }
+}
+
+impl From<FinalizedRunContributions> for FinalizedRunContributionsResponse {
+    fn from(contributions: FinalizedRunContributions) -> Self {
+        Self {
+            run_id: contributions.run_id,
+            source_draft_id: contributions.source_draft_id,
+            source_revision: contributions.source_revision,
+            contributions: contributions
+                .contributions
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct DraftResponse {
     pub id: String,
@@ -479,6 +526,24 @@ async fn get_finalized_allocation_explanation(
         .ok_or(DraftStoreError::RunNotFound(run_id))?;
 
     Ok(Json(explanation.into()))
+}
+
+async fn list_finalized_run_contributions(
+    State(state): State<AppState>,
+    path: Result<Path<i64>, PathRejection>,
+) -> Result<Json<FinalizedRunContributionsResponse>, ApiError> {
+    let Path(run_id) = path.map_err(|rejection| ApiError::Request {
+        status: rejection.status(),
+        error: rejection.body_text(),
+    })?;
+
+    let contributions = state
+        .store
+        .list_finalized_run_contributions(run_id)
+        .await?
+        .ok_or(DraftStoreError::RunNotFound(run_id))?;
+
+    Ok(Json(contributions.into()))
 }
 
 async fn list_finalized_runs(

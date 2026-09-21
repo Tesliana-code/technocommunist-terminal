@@ -102,6 +102,23 @@ pub struct OperatorContributionFactorTerms {
     pub dependency_reach: f64,
 }
 
+/// A lightweight selector listing which contributions exist inside one finalized run.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorRunContributions {
+    pub run_id: i64,
+    pub source_draft_id: String,
+    pub source_revision: u64,
+    pub contributions: Vec<OperatorContributionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorContributionOption {
+    pub contributor_id: String,
+    pub contribution_id: String,
+    pub normalized_share: f64,
+    pub allocated_amount: f64,
+}
+
 #[derive(Debug)]
 pub enum OperatorApiError {
     Configuration(String),
@@ -249,6 +266,29 @@ impl OperatorApiClient {
         Ok(response.json::<OperatorAllocationExplanation>()?)
     }
 
+    pub fn list_run_contributions(
+        &self,
+        run_id: i64,
+    ) -> Result<OperatorRunContributions, OperatorApiError> {
+        let url = self.run_contributions_url(run_id)?;
+
+        let response = self.client.get(url).send()?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let fallback = format!("request failed with HTTP {}", status.as_u16());
+
+            let error = response
+                .json::<ErrorEnvelope>()
+                .map(|body| body.error)
+                .unwrap_or(fallback);
+
+            return Err(OperatorApiError::Http { status, error });
+        }
+
+        Ok(response.json::<OperatorRunContributions>()?)
+    }
+
     fn run_history_url(&self, draft_id: &str) -> Result<Url, OperatorApiError> {
         let mut url = self.base_url.clone();
 
@@ -305,6 +345,25 @@ impl OperatorApiClient {
             segments.push("contributions");
             segments.push(contribution_id);
             segments.push("explanation");
+        }
+
+        Ok(url)
+    }
+
+    fn run_contributions_url(&self, run_id: i64) -> Result<Url, OperatorApiError> {
+        let mut url = self.base_url.clone();
+        let run_id = run_id.to_string();
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                OperatorApiError::Configuration("base URL cannot accept path segments".to_string())
+            })?;
+
+            segments.clear();
+            segments.push("api");
+            segments.push("runs");
+            segments.push(&run_id);
+            segments.push("contributions");
         }
 
         Ok(url)
@@ -553,6 +612,74 @@ mod tests {
             request.starts_with(
                 "GET /api/runs/54/contributions/backend-engineering/explanation HTTP/1.1"
             ),
+            "unexpected request: {request}"
+        );
+    }
+
+    #[test]
+    fn run_contributions_url_targets_the_selector_path() {
+        let client = OperatorApiClient::new("http://127.0.0.1:18080").unwrap();
+
+        let url = client.run_contributions_url(54).unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:18080/api/runs/54/contributions"
+        );
+    }
+
+    #[test]
+    fn client_reads_authoritative_run_contributions_over_http() {
+        let body = r#"{
+            "run_id": 54,
+            "source_draft_id": "operator-proof",
+            "source_revision": 0,
+            "contributions": [
+                {
+                    "contributor_id": "operations",
+                    "contribution_id": "operations-delivery",
+                    "normalized_share": 0.2839,
+                    "allocated_amount": 2980.95
+                },
+                {
+                    "contributor_id": "backend",
+                    "contribution_id": "backend-engineering",
+                    "normalized_share": 0.3843,
+                    "allocated_amount": 4034.83
+                }
+            ]
+        }"#;
+
+        let (base_url, server) = serve_once("200 OK", body);
+        let client = OperatorApiClient::new(&base_url).unwrap();
+
+        let contributions = client.list_run_contributions(54).unwrap();
+
+        assert_eq!(contributions.run_id, 54);
+        assert_eq!(contributions.source_draft_id, "operator-proof");
+        assert_eq!(contributions.source_revision, 0);
+        assert_eq!(contributions.contributions.len(), 2);
+
+        assert_eq!(contributions.contributions[0].contributor_id, "operations");
+        assert_eq!(
+            contributions.contributions[0].contribution_id,
+            "operations-delivery"
+        );
+        assert_eq!(contributions.contributions[0].normalized_share, 0.2839);
+        assert_eq!(contributions.contributions[0].allocated_amount, 2980.95);
+
+        assert_eq!(contributions.contributions[1].contributor_id, "backend");
+        assert_eq!(
+            contributions.contributions[1].contribution_id,
+            "backend-engineering"
+        );
+        assert_eq!(contributions.contributions[1].normalized_share, 0.3843);
+        assert_eq!(contributions.contributions[1].allocated_amount, 4034.83);
+
+        let request = server.join().unwrap();
+
+        assert!(
+            request.starts_with("GET /api/runs/54/contributions HTTP/1.1"),
             "unexpected request: {request}"
         );
     }
