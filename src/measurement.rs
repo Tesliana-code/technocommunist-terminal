@@ -2091,6 +2091,217 @@ pub fn effective_structural_branches(
     effective
 }
 
+/// The effective structural branch count of `source`: a named reduction over
+/// the existing [`effective_structural_branches`] primitive, nothing more.
+///
+/// ```text
+/// effective_structural_branch_count(source, edges) == effective_structural_branches(source, edges).len()
+/// ```
+///
+/// No second traversal, no new graph semantics, no normalization, no economic scoring.
+///
+/// ## What PATH-035 / FIND-012 observed about this candidate
+///
+/// PATH-035 (FIND-012) observed that `effective_structural_branches(...).len()` -- the same
+/// reduction this function names -- remained invariant under the specific tested attacks:
+///
+/// - node splitting (`path_035_a`)
+/// - pass-through relay insertion (`path_035_b`)
+/// - duplicate edges (`path_035_c`)
+/// - edge reordering (`path_035_g`)
+/// - capability relabeling (`path_035_f`)
+///
+/// and distinguished one effective branch from two genuinely independent effective branches in
+/// the tested cases (`path_035_d`). This is: **representation-invariant on the PATH-035 attacks
+/// tried.** No universal representation invariance is claimed -- only the specific attack shapes
+/// PATH-035 constructed and tested were checked, not every possible representation-laundering
+/// shape.
+///
+/// ## Epistemic boundary
+///
+/// This is a modeled-graph -> deterministic structural observable, not `Evidence -> Observable`.
+/// The count does NOT establish:
+///
+/// - failure severity
+/// - economic importance
+/// - capacity loss
+/// - degradation degree
+/// - duration
+/// - substitutability
+/// - authenticity of the graph
+/// - completeness of the graph
+/// - freshness/currentness
+/// - causal attribution
+/// - business impact
+///
+/// Topology can supply this structural count only. It is NOT wired into
+/// `CriticalityObservables`, `failure_blast_radius`, `measure_criticality`,
+/// `measure_criticality_trace`, `DependencyEvidence`, any qualification/aggregation trace,
+/// `ContributionFactors`, `DistributionDraft`, persistence, snapshots, the server, or the
+/// operator UI. No existing input starts using this value merely because this function exists.
+pub fn effective_structural_branch_count(source: &CapabilityId, edges: &[DependencyEdge]) -> usize {
+    effective_structural_branches(source, edges).len()
+}
+
+#[cfg(test)]
+mod effective_structural_branch_count_tests {
+    use super::*;
+
+    #[test]
+    fn a_matches_effective_structural_branches_len_on_several_topologies() {
+        let cases: Vec<(CapabilityId, Vec<DependencyEdge>)> = vec![
+            (CapabilityId("x".into()), vec![]),
+            (
+                CapabilityId("x".into()),
+                vec![DependencyEdge::new("x", "payment")],
+            ),
+            (
+                CapabilityId("x".into()),
+                vec![
+                    DependencyEdge::new("x", "payment"),
+                    DependencyEdge::new("x", "shipping"),
+                ],
+            ),
+            (
+                CapabilityId("x".into()),
+                vec![
+                    DependencyEdge::new("x", "a"),
+                    DependencyEdge::new("a", "b"),
+                    DependencyEdge::new("x", "c"),
+                ],
+            ),
+        ];
+
+        for (source, edges) in cases {
+            assert_eq!(
+                effective_structural_branch_count(&source, &edges),
+                effective_structural_branches(&source, &edges).len()
+            );
+        }
+    }
+
+    #[test]
+    fn b_no_downstream_branches_produces_zero() {
+        let source = CapabilityId("x".into());
+        let edges: Vec<DependencyEdge> = vec![];
+
+        assert_eq!(effective_structural_branch_count(&source, &edges), 0);
+    }
+
+    #[test]
+    fn c_one_effective_branch_produces_one() {
+        let source = CapabilityId("x".into());
+        let edges = vec![DependencyEdge::new("x", "payment")];
+
+        assert_eq!(effective_structural_branch_count(&source, &edges), 1);
+    }
+
+    #[test]
+    fn d_two_independent_effective_branches_produce_two() {
+        let source = CapabilityId("x".into());
+        let edges = vec![
+            DependencyEdge::new("x", "payment"),
+            DependencyEdge::new("x", "shipping"),
+        ];
+
+        assert_eq!(effective_structural_branch_count(&source, &edges), 2);
+    }
+
+    #[test]
+    fn e_duplicate_edge_does_not_change_the_count() {
+        let source = CapabilityId("x".into());
+        let single = vec![DependencyEdge::new("x", "payment")];
+        let duplicated = vec![
+            DependencyEdge::new("x", "payment"),
+            DependencyEdge::new("x", "payment"),
+            DependencyEdge::new("x", "payment"),
+        ];
+
+        assert_eq!(
+            effective_structural_branch_count(&source, &single),
+            effective_structural_branch_count(&source, &duplicated)
+        );
+    }
+
+    #[test]
+    fn f_edge_reordering_does_not_change_the_count() {
+        let source = CapabilityId("x".into());
+        let forward = vec![
+            DependencyEdge::new("x", "payment_frontend"),
+            DependencyEdge::new("payment_frontend", "payment_backend"),
+            DependencyEdge::new("x", "shipping"),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        assert_eq!(
+            effective_structural_branch_count(&source, &forward),
+            effective_structural_branch_count(&source, &reversed)
+        );
+    }
+
+    #[test]
+    fn g_relabel_equivalent_topology_preserves_the_count() {
+        let original = vec![
+            DependencyEdge::new("x", "payment_frontend"),
+            DependencyEdge::new("payment_frontend", "payment_backend"),
+            DependencyEdge::new("x", "shipping"),
+        ];
+        let renamed = vec![
+            DependencyEdge::new("node-1", "node-2"),
+            DependencyEdge::new("node-2", "node-3"),
+            DependencyEdge::new("node-1", "node-4"),
+        ];
+
+        let original_count =
+            effective_structural_branch_count(&CapabilityId("x".into()), &original);
+        let renamed_count =
+            effective_structural_branch_count(&CapabilityId("node-1".into()), &renamed);
+
+        assert_eq!(original_count, renamed_count);
+        assert_eq!(renamed_count, 2);
+    }
+
+    /// Mirrors PATH-035-A (`path_035_a_node_splitting_inflates_naive_count_but_not_effective_branch_count`
+    /// in `tests/pathological_cases.rs`), through the newly named function instead of the raw
+    /// `effective_structural_branches(...).len()` call.
+    #[test]
+    fn h_node_splitting_does_not_change_the_count() {
+        let source = CapabilityId("x".into());
+        let single_node = vec![DependencyEdge::new("x", "payment")];
+        let split_chain = vec![
+            DependencyEdge::new("x", "payment_frontend"),
+            DependencyEdge::new("payment_frontend", "payment_backend"),
+        ];
+
+        assert_eq!(
+            effective_structural_branch_count(&source, &single_node),
+            effective_structural_branch_count(&source, &split_chain)
+        );
+        assert_eq!(effective_structural_branch_count(&source, &single_node), 1);
+    }
+
+    /// Mirrors PATH-035-B (`path_035_b_relay_insertion_inflates_naive_count_but_not_effective_branch_count`
+    /// in `tests/pathological_cases.rs`), through the newly named function instead of the raw
+    /// `effective_structural_branches(...).len()` call.
+    #[test]
+    fn i_relay_insertion_does_not_change_the_count() {
+        let source = CapabilityId("x".into());
+        let direct = vec![DependencyEdge::new("x", "a"), DependencyEdge::new("a", "b")];
+        let via_relay = vec![
+            DependencyEdge::new("x", "a"),
+            DependencyEdge::new("a", "relay"),
+            DependencyEdge::new("relay", "b"),
+        ];
+
+        assert_eq!(
+            effective_structural_branch_count(&source, &direct),
+            effective_structural_branch_count(&source, &via_relay)
+        );
+        assert_eq!(effective_structural_branch_count(&source, &direct), 1);
+    }
+}
+
 /// Explicit counterfactual removal (PATH-036): `edges` with every edge
 /// incident to `removed` (as either source or target) dropped.
 ///
