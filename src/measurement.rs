@@ -665,11 +665,92 @@ pub fn qualify_dependency(
     Ok(qualify_dependency_trace(evidence, weights)?.qualified_dependency)
 }
 
-pub fn aggregate_dependency_weight(dependencies: &[QualifiedDependency]) -> f64 {
-    if dependencies.is_empty() {
-        return 0.0;
+/// Identifies the exact experimental aggregation rule implemented by
+/// [`aggregate_dependency_weight_trace`]: complementary probability-style accumulation
+/// (`1 - Π(1 - dependency.score)`). This slice instruments that existing rule; it does not
+/// select it over `Thresholded`/`RankedDecay`, and it does not change the formula.
+pub const DEPENDENCY_AGGREGATION_RULE_VERSION: &str = "dependency-aggregation-complementary/1";
+
+/// One stored accumulation step: `remaining_after = remaining_before * (1.0 - dependency_score)`,
+/// computed once by [`aggregate_dependency_weight_trace`] for the dependency at
+/// `dependency_index` in the caller's supplied slice order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DependencyAggregationStep {
+    pub dependency_index: usize,
+    pub dependency_score: f64,
+    pub remaining_before: f64,
+    pub remaining_after: f64,
+}
+
+/// An inspectable, versioned record of how the supplied [`QualifiedDependency`] scores were
+/// combined under [`DEPENDENCY_AGGREGATION_RULE_VERSION`]. Preserves the exact input
+/// dependencies and order, every accumulation step, the final remaining quantity, the final
+/// aggregate weight, and the exact rule version.
+///
+/// # Epistemic boundary
+///
+/// This trace establishes only how supplied [`QualifiedDependency`] scores were combined under
+/// the experimental complementary rule. It does NOT establish:
+///
+/// - that dependencies are statistically independent
+/// - that the scores are probabilities
+/// - that the complementary-probability interpretation is economically valid
+/// - that source evidence is authentic
+/// - that dependencies represent distinct causal paths
+/// - that duplicate/related signals are independent
+/// - that weak-signal accumulation is solved
+/// - that this rule should control real economic allocation
+///
+/// The formula's probability-like shape is a measurement hypothesis, not evidence of
+/// probabilistic independence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyAggregationTrace {
+    pub rule_version: &'static str,
+    pub dependencies: Vec<QualifiedDependency>,
+    pub steps: Vec<DependencyAggregationStep>,
+    pub final_remaining: f64,
+    pub aggregate_weight: f64,
+}
+
+/// The one authoritative implementation of the complementary aggregation formula
+/// (`1 - Π(1 - dependency.score)`), carried out step by step so each intermediate `remaining`
+/// value is inspectable. [`aggregate_dependency_weight`] delegates here and returns only
+/// `trace.aggregate_weight`, so there is no independent fold expression left to drift. No
+/// validation, clamping, sorting, filtering, thresholding, deduplication, or independence
+/// inference is added -- dependencies are combined in exactly the supplied slice order.
+pub fn aggregate_dependency_weight_trace(
+    dependencies: &[QualifiedDependency],
+) -> DependencyAggregationTrace {
+    let mut remaining = 1.0;
+    let mut steps = Vec::with_capacity(dependencies.len());
+
+    for (dependency_index, dependency) in dependencies.iter().enumerate() {
+        let remaining_before = remaining;
+        let remaining_after = remaining_before * (1.0 - dependency.score);
+
+        steps.push(DependencyAggregationStep {
+            dependency_index,
+            dependency_score: dependency.score,
+            remaining_before,
+            remaining_after,
+        });
+
+        remaining = remaining_after;
     }
 
+    let final_remaining = remaining;
+    let aggregate_weight = 1.0 - final_remaining;
+
+    DependencyAggregationTrace {
+        rule_version: DEPENDENCY_AGGREGATION_RULE_VERSION,
+        dependencies: dependencies.to_vec(),
+        steps,
+        final_remaining,
+        aggregate_weight,
+    }
+}
+
+pub fn aggregate_dependency_weight(dependencies: &[QualifiedDependency]) -> f64 {
     // Experimental V0.1 aggregation:
     // complementary probability-style accumulation.
     //
@@ -678,9 +759,7 @@ pub fn aggregate_dependency_weight(dependencies: &[QualifiedDependency]) -> f64 
     //
     // This is a measurement hypothesis and must be attacked by
     // pathological tests before becoming protocol policy.
-    1.0 - dependencies.iter().fold(1.0, |remaining, dependency| {
-        remaining * (1.0 - dependency.score)
-    })
+    aggregate_dependency_weight_trace(dependencies).aggregate_weight
 }
 
 #[cfg(test)]
@@ -774,6 +853,143 @@ mod dependency_measurement_tests {
 
         assert!(aggregate <= 1.0);
         assert!(aggregate >= 0.0);
+    }
+
+    fn aggregation_dependency(score: f64) -> QualifiedDependency {
+        QualifiedDependency {
+            blocking_relevance: 0.0,
+            failure_propagation: 0.0,
+            operational_reliance: 0.0,
+            business_path_relevance: 0.0,
+            score,
+        }
+    }
+
+    #[test]
+    fn empty_input_trace_is_identity() {
+        let trace = aggregate_dependency_weight_trace(&[]);
+
+        assert!(trace.dependencies.is_empty());
+        assert!(trace.steps.is_empty());
+        assert_eq!(trace.final_remaining, 1.0);
+        assert_eq!(trace.aggregate_weight, 0.0);
+        assert_eq!(trace.rule_version, "dependency-aggregation-complementary/1");
+        assert_eq!(trace.rule_version, DEPENDENCY_AGGREGATION_RULE_VERSION);
+    }
+
+    #[test]
+    fn trace_preserves_exact_dependencies_and_order() {
+        let dependencies = vec![
+            aggregation_dependency(0.2),
+            aggregation_dependency(0.9),
+            aggregation_dependency(0.4),
+        ];
+
+        let trace = aggregate_dependency_weight_trace(&dependencies);
+
+        assert_eq!(trace.dependencies, dependencies);
+        assert_eq!(
+            trace
+                .steps
+                .iter()
+                .map(|step| step.dependency_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            trace
+                .steps
+                .iter()
+                .map(|step| step.dependency_score)
+                .collect::<Vec<_>>(),
+            vec![0.2, 0.9, 0.4]
+        );
+    }
+
+    #[test]
+    fn each_step_satisfies_the_complementary_formula() {
+        let dependencies = vec![
+            aggregation_dependency(0.2),
+            aggregation_dependency(0.9),
+            aggregation_dependency(0.4),
+        ];
+
+        let trace = aggregate_dependency_weight_trace(&dependencies);
+
+        for step in &trace.steps {
+            let expected = step.remaining_before * (1.0 - step.dependency_score);
+            assert!((step.remaining_after - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn each_steps_remaining_before_chains_from_the_previous_remaining_after() {
+        let dependencies = vec![
+            aggregation_dependency(0.2),
+            aggregation_dependency(0.9),
+            aggregation_dependency(0.4),
+        ];
+
+        let trace = aggregate_dependency_weight_trace(&dependencies);
+
+        let mut expected_remaining_before = 1.0;
+
+        for step in &trace.steps {
+            assert!((step.remaining_before - expected_remaining_before).abs() < 1e-12);
+            expected_remaining_before = step.remaining_after;
+        }
+
+        assert!((trace.final_remaining - expected_remaining_before).abs() < 1e-12);
+    }
+
+    #[test]
+    fn aggregate_weight_equals_one_minus_final_remaining() {
+        let dependencies = vec![aggregation_dependency(0.3), aggregation_dependency(0.6)];
+
+        let trace = aggregate_dependency_weight_trace(&dependencies);
+
+        assert!((trace.aggregate_weight - (1.0 - trace.final_remaining)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn aggregate_dependency_weight_matches_trace_aggregate_weight() {
+        let dependencies = vec![
+            aggregation_dependency(0.1),
+            aggregation_dependency(0.5),
+            aggregation_dependency(0.7),
+        ];
+
+        let direct = aggregate_dependency_weight(&dependencies);
+        let traced = aggregate_dependency_weight_trace(&dependencies).aggregate_weight;
+
+        assert_eq!(direct, traced);
+    }
+
+    #[test]
+    fn same_inputs_produce_exactly_equal_aggregation_traces() {
+        let dependencies = vec![aggregation_dependency(0.35), aggregation_dependency(0.55)];
+
+        let first = aggregate_dependency_weight_trace(&dependencies);
+        let second = aggregate_dependency_weight_trace(&dependencies);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn complementary_tournament_model_matches_traced_aggregate() {
+        let dependencies = vec![
+            aggregation_dependency(0.2),
+            aggregation_dependency(0.4),
+            aggregation_dependency(0.6),
+        ];
+
+        let traced = aggregate_dependency_weight_trace(&dependencies).aggregate_weight;
+        let via_model = aggregate_dependency_weight_with_model(
+            &dependencies,
+            DependencyAggregationModel::Complementary,
+        );
+
+        assert_eq!(via_model, traced);
     }
 
     #[test]
