@@ -14,8 +14,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, Tabs, Wrap,
+        Bar, BarChart, Block, Borders, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, Tabs, Wrap,
     },
 };
 
@@ -26,6 +26,9 @@ const MUTED: Color = Color::Rgb(122, 128, 132);
 const TEXT: Color = Color::Rgb(214, 216, 210);
 
 const OPERATOR_API_BASE_URL: &str = "http://127.0.0.1:18080";
+
+/// Width of the "share% + EUR amount" column in the allocation chart: `{:>6.2}%   {:>13}`.
+const ALLOCATION_NUMBERS_WIDTH: u16 = 23;
 
 #[derive(Clone)]
 struct ContributorDraft {
@@ -719,7 +722,7 @@ impl OperatorState {
             .constraints([
                 Constraint::Length(8),
                 Constraint::Length(11),
-                Constraint::Min(8),
+                Constraint::Min(10),
             ])
             .split(columns[1]);
 
@@ -1004,99 +1007,183 @@ impl OperatorState {
     }
 
     fn draw_preview(&self, frame: &mut Frame, area: Rect) {
-        let lines = match self.preview() {
-            Ok(preview) => {
-                let mut lines = vec![
-                    Line::from(vec![
-                        Span::styled("Available       ", Style::default().fg(MUTED)),
-                        Span::styled(
-                            format_money(preview.surplus),
-                            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled("   Contribution pool   ", Style::default().fg(MUTED)),
-                        Span::styled(
-                            format_money(preview.contribution_pool),
-                            Style::default().fg(TEXT),
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "CONTRIBUTOR          SHARE        AMOUNT        VERIFIED VALUE",
-                        Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
-                    )),
-                ];
+        let block = Block::default()
+            .title(" LIVE DISTRIBUTION PREVIEW ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MINERAL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-                let selected = self.selected_contributor().id;
+        match self.preview() {
+            Ok(preview) => self.draw_preview_chart(frame, inner, &preview),
+            Err(error) => self.draw_preview_error(frame, inner, &error),
+        }
+    }
 
-                for allocation in &preview.allocations {
-                    let marker = if allocation.contributor_id == selected {
-                        "▶"
-                    } else {
-                        " "
-                    };
+    fn draw_preview_error(&self, frame: &mut Frame, area: Rect, error: &str) {
+        let lines = vec![
+            Line::from(Span::styled(
+                "PREVIEW UNAVAILABLE",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(error.to_string(), Style::default().fg(TEXT))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Reconcile pool/weight totals and valid inputs to restore preview.",
+                Style::default().fg(MUTED),
+            )),
+        ];
 
-                    let style = if allocation.contributor_id == selected {
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(TEXT)
-                    };
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
 
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{marker} {:<17} {:>6.2}%   {:>13}   {:>8.4}",
-                            allocation.contributor_id,
-                            allocation.normalized_share * 100.0,
-                            format_money(allocation.allocated_amount),
-                            allocation.contribution_value,
-                        ),
-                        style,
-                    )));
-                }
+    /// A valid `Preview` reconciled `allocated_amount` from `contribution_pool` at construction
+    /// time (see `allocate_contribution_pool`), so this re-check only guards against float drift
+    /// before the pool is trusted enough to render as a chart.
+    fn draw_preview_chart(&self, frame: &mut Frame, area: Rect, preview: &Preview) {
+        let selected = self.selected_contributor().id;
 
-                let total: f64 = preview
-                    .allocations
-                    .iter()
-                    .map(|allocation| allocation.allocated_amount)
-                    .sum();
+        let total: f64 = preview
+            .allocations
+            .iter()
+            .map(|allocation| allocation.allocated_amount)
+            .sum();
+        let reconciled = (total - preview.contribution_pool).abs() < 0.005;
 
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("Reconcile        ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!(
-                            "{} / {}",
-                            format_money(total),
-                            format_money(preview.contribution_pool)
-                        ),
-                        Style::default().fg(MINERAL).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(preview.allocations.len() as u16),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .split(area);
 
-                lines
-            }
-            Err(error) => vec![
-                Line::from(Span::styled(
-                    "PREVIEW UNAVAILABLE",
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Available       ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format_money(preview.surplus),
                     Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(error, Style::default().fg(TEXT))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Reconcile pool/weight totals and valid inputs to restore preview.",
-                    Style::default().fg(MUTED),
-                )),
-            ],
-        };
-
-        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" LIVE DISTRIBUTION PREVIEW ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MINERAL)),
+                ),
+                Span::styled("   Contribution pool   ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format_money(preview.contribution_pool),
+                    Style::default().fg(TEXT),
+                ),
+            ])),
+            sections[0],
         );
 
-        frame.render_widget(widget, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "CONTRIBUTION ALLOCATION",
+                Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
+            ))),
+            sections[2],
+        );
+
+        // Bar geometry (name + fill) on the left, a stable share/EUR column on the right.
+        // The numbers column never carries text_value inside the bar itself.
+        let rows = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(ALLOCATION_NUMBERS_WIDTH),
+            ])
+            .split(sections[3]);
+
+        let max_cents = preview
+            .allocations
+            .iter()
+            .map(|allocation| money_cents(allocation.allocated_amount))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let bars: Vec<Bar> = preview
+            .allocations
+            .iter()
+            .map(|allocation| {
+                let is_selected = allocation.contributor_id == selected;
+                let style = if is_selected {
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MINERAL)
+                };
+
+                Bar::default()
+                    .label(Line::styled(allocation.contributor_id.clone(), style))
+                    .value(money_cents(allocation.allocated_amount))
+                    .text_value("")
+                    .style(style)
+            })
+            .collect();
+
+        let chart = BarChart::horizontal(bars)
+            .bar_width(1)
+            .bar_gap(0)
+            .max(max_cents);
+
+        frame.render_widget(chart, rows[0]);
+
+        let number_lines: Vec<Line> = preview
+            .allocations
+            .iter()
+            .map(|allocation| {
+                Line::from(Span::styled(
+                    format!(
+                        "{:>6.2}%   {:>13}",
+                        allocation.normalized_share * 100.0,
+                        format_money(allocation.allocated_amount),
+                    ),
+                    Style::default().fg(TEXT),
+                ))
+            })
+            .collect();
+
+        frame.render_widget(Paragraph::new(number_lines), rows[1]);
+
+        let status_style = if reconciled {
+            Style::default().fg(MINERAL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        };
+
+        let footer_width = sections[5].width;
+        let footer = vec![
+            justified_line(
+                footer_width,
+                "TOTAL",
+                Style::default().fg(MUTED),
+                format_money(total),
+                Style::default().fg(TEXT),
+            ),
+            justified_line(
+                footer_width,
+                "POOL",
+                Style::default().fg(MUTED),
+                format_money(preview.contribution_pool),
+                Style::default().fg(TEXT),
+            ),
+            justified_line(
+                footer_width,
+                "STATUS",
+                Style::default().fg(MUTED),
+                if reconciled {
+                    "RECONCILED".to_string()
+                } else {
+                    "NOT RECONCILED".to_string()
+                },
+                status_style,
+            ),
+        ];
+
+        frame.render_widget(Paragraph::new(footer), sections[5]);
     }
 
     fn draw_run_history(&self, frame: &mut Frame, area: Rect) {
@@ -1502,6 +1589,36 @@ fn format_money(value: f64) -> String {
     format!("{sign}EUR {grouped}.{cents:02}")
 }
 
+/// `BarChart` bar magnitudes are `u64`. This converts an allocated EUR amount into whole cents
+/// for that purpose only; the textual EUR amount shown alongside a bar is always rendered
+/// separately from the original `f64` via `format_money`, never derived back from this value.
+fn money_cents(value: f64) -> u64 {
+    (value.max(0.0) * 100.0).round() as u64
+}
+
+/// Renders `left` flush against the area's left edge and `right` flush against its right edge,
+/// so a value's last character always lands at the same X coordinate as the area's right border
+/// regardless of terminal width.
+fn justified_line(
+    width: u16,
+    left: &str,
+    left_style: Style,
+    right: String,
+    right_style: Style,
+) -> Line<'static> {
+    let left_width = left.chars().count();
+    let right_width = right.chars().count();
+    let pad = (width as usize)
+        .saturating_sub(left_width + right_width)
+        .max(1);
+
+    Line::from(vec![
+        Span::styled(left.to_string(), left_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right, right_style),
+    ])
+}
+
 fn main() -> io::Result<()> {
     ratatui::run(|terminal| {
         let mut app = OperatorState::from_environment();
@@ -1512,6 +1629,13 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn money_cents_rounds_to_whole_cents_and_clamps_negative() {
+        assert_eq!(money_cents(4_213.554), 421_355);
+        assert_eq!(money_cents(0.0), 0);
+        assert_eq!(money_cents(-5.0), 0);
+    }
 
     #[test]
     fn default_preview_reconciles_contribution_pool() {
