@@ -148,10 +148,63 @@ fn substitutability_score(value: Substitutability) -> f64 {
     }
 }
 
-pub fn measure_criticality(
+/// Identifies the exact experimental normalization/weighting rule implemented by
+/// [`measure_criticality_trace`]. This slice does not change the saturation points (5 for
+/// `blocking_paths`, 5 for `failure_blast_radius`) or the `Substitutability` normalization
+/// (Easy 0.00 / Moderate 0.33 / Difficult 0.67 / None 1.00) -- it only makes the existing rule
+/// inspectable. Bump this identifier if that rule itself ever changes.
+pub const CRITICALITY_MEASUREMENT_RULE_VERSION: &str = "criticality-measurement/1";
+
+/// Each field is the stored result of `normalized observable * measurement weight`, computed
+/// once by [`measure_criticality_trace`] and never independently re-derived elsewhere. No new
+/// economic factor or hypothesis is introduced by this type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CriticalityMeasurementTerms {
+    pub qualified_dependency_weight: f64,
+    pub blocking_paths: f64,
+    pub failure_blast_radius: f64,
+    pub substitutability: f64,
+}
+
+/// An inspectable, versioned record of how [`CriticalityObservables`] were deterministically
+/// transformed into a normalized [`CriticalityMeasurement`] under
+/// [`CRITICALITY_MEASUREMENT_RULE_VERSION`]. Preserves the exact input observables, exact
+/// measurement weights, exact normalized measurement, and exact weighted terms that produced
+/// `measurement.score`. No external state, no clock, no random values.
+///
+/// # Epistemic boundary
+///
+/// This trace proves only how the supplied observables were deterministically transformed into
+/// the normalized criticality score under rule version `/1`. It does NOT establish:
+///
+/// - where `blocking_paths` came from
+/// - where `failure_blast_radius` came from
+/// - how `Substitutability` was evidenced
+/// - authenticity of any upstream evidence
+/// - completeness or freshness of evidence
+/// - that the score should yet control real economic allocation
+///
+/// `CriticalityObservables` are themselves NOT authenticated evidence -- this slice addresses
+/// only observables -> deterministic normalization -> weighted measurement terms -> normalized
+/// score, not the upstream evidence provenance of those observables. In particular,
+/// `TimeToEffectiveSubstitution` remains research-only and MUST NOT be wired into this trace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CriticalityMeasurementTrace {
+    pub rule_version: &'static str,
+    pub observables: CriticalityObservables,
+    pub weights: CriticalityMeasurementWeights,
+    pub measurement: CriticalityMeasurement,
+    pub weighted_terms: CriticalityMeasurementTerms,
+}
+
+/// The one authoritative calculation path for criticality measurement: computes normalization,
+/// computes each weighted term once, sums those stored terms once for `measurement.score`, and
+/// returns the full inspectable trace. [`measure_criticality`] delegates here and returns only
+/// `trace.measurement`, so there is no second, independently drifting implementation.
+pub fn measure_criticality_trace(
     observables: CriticalityObservables,
     weights: CriticalityMeasurementWeights,
-) -> Result<CriticalityMeasurement, &'static str> {
+) -> Result<CriticalityMeasurementTrace, &'static str> {
     weights.validate()?;
 
     // PP-0.1 experimental saturation points.
@@ -168,18 +221,40 @@ pub fn measure_criticality(
 
     let substitutability = substitutability_score(observables.substitutability);
 
-    let score = dependencies * weights.qualified_dependency_weight
-        + blocking * weights.blocking_paths
-        + blast_radius * weights.failure_blast_radius
-        + substitutability * weights.substitutability;
+    let weighted_terms = CriticalityMeasurementTerms {
+        qualified_dependency_weight: dependencies * weights.qualified_dependency_weight,
+        blocking_paths: blocking * weights.blocking_paths,
+        failure_blast_radius: blast_radius * weights.failure_blast_radius,
+        substitutability: substitutability * weights.substitutability,
+    };
 
-    Ok(CriticalityMeasurement {
+    let score = weighted_terms.qualified_dependency_weight
+        + weighted_terms.blocking_paths
+        + weighted_terms.failure_blast_radius
+        + weighted_terms.substitutability;
+
+    let measurement = CriticalityMeasurement {
         normalized_downstream_dependencies: dependencies,
         normalized_blocking_paths: blocking,
         normalized_failure_blast_radius: blast_radius,
         normalized_substitutability: substitutability,
         score,
+    };
+
+    Ok(CriticalityMeasurementTrace {
+        rule_version: CRITICALITY_MEASUREMENT_RULE_VERSION,
+        observables,
+        weights,
+        measurement,
+        weighted_terms,
     })
+}
+
+pub fn measure_criticality(
+    observables: CriticalityObservables,
+    weights: CriticalityMeasurementWeights,
+) -> Result<CriticalityMeasurement, &'static str> {
+    Ok(measure_criticality_trace(observables, weights)?.measurement)
 }
 
 #[cfg(test)]
@@ -273,6 +348,161 @@ mod tests {
         .unwrap();
 
         assert!(high.score > low.score);
+    }
+
+    #[test]
+    fn trace_preserves_exact_observables_and_weights() {
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.42,
+            blocking_paths: 3,
+            failure_blast_radius: 2,
+            substitutability: Substitutability::Moderate,
+        };
+
+        let trace = measure_criticality_trace(observables, weights()).unwrap();
+
+        assert_eq!(trace.observables, observables);
+        assert_eq!(trace.weights, weights());
+    }
+
+    #[test]
+    fn trace_rule_version_is_criticality_measurement_v1() {
+        let trace = measure_criticality_trace(
+            CriticalityObservables {
+                qualified_dependency_weight: 0.5,
+                blocking_paths: 2,
+                failure_blast_radius: 2,
+                substitutability: Substitutability::Moderate,
+            },
+            weights(),
+        )
+        .unwrap();
+
+        assert_eq!(trace.rule_version, "criticality-measurement/1");
+        assert_eq!(trace.rule_version, CRITICALITY_MEASUREMENT_RULE_VERSION);
+    }
+
+    #[test]
+    fn weighted_terms_equal_normalized_observable_times_weight() {
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.6,
+            blocking_paths: 3,
+            failure_blast_radius: 4,
+            substitutability: Substitutability::Difficult,
+        };
+
+        let trace = measure_criticality_trace(observables, weights()).unwrap();
+
+        assert!(
+            (trace.weighted_terms.qualified_dependency_weight
+                - trace.measurement.normalized_downstream_dependencies
+                    * weights().qualified_dependency_weight)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.blocking_paths
+                - trace.measurement.normalized_blocking_paths * weights().blocking_paths)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.failure_blast_radius
+                - trace.measurement.normalized_failure_blast_radius
+                    * weights().failure_blast_radius)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.weighted_terms.substitutability
+                - trace.measurement.normalized_substitutability * weights().substitutability)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn score_equals_sum_of_stored_weighted_terms() {
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.6,
+            blocking_paths: 3,
+            failure_blast_radius: 4,
+            substitutability: Substitutability::Difficult,
+        };
+
+        let trace = measure_criticality_trace(observables, weights()).unwrap();
+
+        let expected_score = trace.weighted_terms.qualified_dependency_weight
+            + trace.weighted_terms.blocking_paths
+            + trace.weighted_terms.failure_blast_radius
+            + trace.weighted_terms.substitutability;
+
+        assert!((trace.measurement.score - expected_score).abs() < 1e-12);
+    }
+
+    #[test]
+    fn measure_criticality_matches_trace_measurement() {
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.37,
+            blocking_paths: 6,
+            failure_blast_radius: 1,
+            substitutability: Substitutability::None,
+        };
+
+        let direct = measure_criticality(observables, weights()).unwrap();
+        let traced = measure_criticality_trace(observables, weights()).unwrap();
+
+        assert_eq!(direct, traced.measurement);
+    }
+
+    #[test]
+    fn same_inputs_produce_exactly_equal_traces() {
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.37,
+            blocking_paths: 6,
+            failure_blast_radius: 1,
+            substitutability: Substitutability::None,
+        };
+
+        let first = measure_criticality_trace(observables, weights()).unwrap();
+        let second = measure_criticality_trace(observables, weights()).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn invalid_inputs_return_identical_errors_through_both_functions() {
+        let invalid_weights = CriticalityMeasurementWeights {
+            qualified_dependency_weight: 0.30,
+            blocking_paths: 0.30,
+            failure_blast_radius: 0.25,
+            substitutability: 0.30,
+        };
+
+        let observables = CriticalityObservables {
+            qualified_dependency_weight: 0.5,
+            blocking_paths: 2,
+            failure_blast_radius: 2,
+            substitutability: Substitutability::Moderate,
+        };
+
+        let direct_error = measure_criticality(observables, invalid_weights).unwrap_err();
+        let traced_error = measure_criticality_trace(observables, invalid_weights).unwrap_err();
+
+        assert_eq!(direct_error, traced_error);
+
+        let out_of_range_observables = CriticalityObservables {
+            qualified_dependency_weight: 1.5,
+            blocking_paths: 2,
+            failure_blast_radius: 2,
+            substitutability: Substitutability::Moderate,
+        };
+
+        let direct_error = measure_criticality(out_of_range_observables, weights()).unwrap_err();
+        let traced_error =
+            measure_criticality_trace(out_of_range_observables, weights()).unwrap_err();
+
+        assert_eq!(direct_error, traced_error);
     }
 }
 
@@ -1009,7 +1239,12 @@ fn compute_region_entries(
         .map(|(branch, member)| StructuralConvergenceEntry { branch, member })
         .collect();
 
-    entries.sort_by(|a, b| a.branch.0.cmp(&b.branch.0).then(a.member.0.cmp(&b.member.0)));
+    entries.sort_by(|a, b| {
+        a.branch
+            .0
+            .cmp(&b.branch.0)
+            .then(a.member.0.cmp(&b.member.0))
+    });
     entries
 }
 
@@ -1120,7 +1355,10 @@ fn cycle_aware_first_convergences_over_shared(
 
     let mut members_by_class: HashMap<usize, Vec<usize>> = HashMap::new();
     for (idx, class) in class_of.iter().enumerate() {
-        members_by_class.entry(class.unwrap()).or_default().push(idx);
+        members_by_class
+            .entry(class.unwrap())
+            .or_default()
+            .push(idx);
     }
 
     let class_ids: Vec<usize> = members_by_class.keys().copied().collect();
@@ -1159,9 +1397,10 @@ pub fn cycle_aware_first_structural_convergences(
 ) -> Vec<StructuralConvergenceRegion> {
     let adjacency = build_structural_adjacency(edges);
     let branch_roots = immediate_branch_roots(source, &adjacency);
-    let shared: std::collections::HashSet<CapabilityId> = shared_structural_bottlenecks(source, edges)
-        .into_iter()
-        .collect();
+    let shared: std::collections::HashSet<CapabilityId> =
+        shared_structural_bottlenecks(source, edges)
+            .into_iter()
+            .collect();
     cycle_aware_first_convergences_over_shared(source, &adjacency, shared, &branch_roots)
 }
 
@@ -1433,7 +1672,11 @@ pub fn remove_capability(edges: &[DependencyEdge], removed: &CapabilityId) -> Ve
 /// Plain topological reachability (PATH-036): is `target` reachable from
 /// `source` by following `edges` forward? Cycle-safe via a visited set;
 /// carries no operational meaning beyond "a directed path exists."
-pub fn is_reachable(source: &CapabilityId, target: &CapabilityId, edges: &[DependencyEdge]) -> bool {
+pub fn is_reachable(
+    source: &CapabilityId,
+    target: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> bool {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     if source == target {
@@ -1577,7 +1820,10 @@ pub fn structural_counterfactual(
 /// cannot express a capability with no relationships at all -- that
 /// limitation is inherited by every function built on top of this one,
 /// including [`structural_propagation_surface`].
-pub fn reachable_capabilities(source: &CapabilityId, edges: &[DependencyEdge]) -> Vec<CapabilityId> {
+pub fn reachable_capabilities(
+    source: &CapabilityId,
+    edges: &[DependencyEdge],
+) -> Vec<CapabilityId> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut adjacency: HashMap<CapabilityId, Vec<CapabilityId>> = HashMap::new();
@@ -1906,7 +2152,12 @@ fn collapse_relays_where(
             target: edge_target,
         })
         .collect();
-    canonical_edges.sort_by(|a, b| a.source.0.cmp(&b.source.0).then(a.target.0.cmp(&b.target.0)));
+    canonical_edges.sort_by(|a, b| {
+        a.source
+            .0
+            .cmp(&b.source.0)
+            .then(a.target.0.cmp(&b.target.0))
+    });
 
     (canonical_edges, provenance)
 }
@@ -2034,8 +2285,10 @@ pub fn evaluate_representation_claims(
 pub fn representation_claim_conflicts(claims: &[RepresentationClaim]) -> Vec<CapabilityId> {
     use std::collections::HashSet;
 
-    let distinct_capabilities: HashSet<CapabilityId> =
-        claims.iter().map(|claim| claim.capability.clone()).collect();
+    let distinct_capabilities: HashSet<CapabilityId> = claims
+        .iter()
+        .map(|claim| claim.capability.clone())
+        .collect();
 
     let mut conflicted: Vec<CapabilityId> = distinct_capabilities
         .into_iter()
@@ -2082,7 +2335,11 @@ pub fn canonicalize_declared_representation_nodes(
     protected: &[CapabilityId],
     claims: &[RepresentationClaim],
     edges: &[DependencyEdge],
-) -> (Vec<DependencyEdge>, Vec<RelayCollapseProvenance>, Vec<CapabilityId>) {
+) -> (
+    Vec<DependencyEdge>,
+    Vec<RelayCollapseProvenance>,
+    Vec<CapabilityId>,
+) {
     use std::collections::HashSet;
 
     let protected_set: HashSet<CapabilityId> = protected.iter().cloned().collect();
