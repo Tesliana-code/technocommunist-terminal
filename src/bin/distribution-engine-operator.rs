@@ -5,7 +5,10 @@ use distribution_machine::{
     contribution::{ContributionEvent, ContributionFactors, ContributionWeights},
     distribution::{ContributionAllocation, allocate_contribution_pool},
     ledger::MoneyLedger,
-    operator_api::{OperatorApiClient, OperatorRunDetail, OperatorRunHistory},
+    operator_api::{
+        OperatorAllocationExplanation, OperatorApiClient, OperatorRunContributions,
+        OperatorRunDetail, OperatorRunHistory,
+    },
     protocol::DistributionPools,
 };
 use ratatui::{
@@ -142,6 +145,8 @@ enum OperatorView {
     Sandbox,
     RunHistory,
     RunDetail,
+    RunContributions,
+    AllocationExplanation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +169,9 @@ struct OperatorState {
     run_history: Option<OperatorRunHistory>,
     history_selected: usize,
     run_detail: Option<OperatorRunDetail>,
+    run_contributions: Option<OperatorRunContributions>,
+    contribution_selected: usize,
+    allocation_explanation: Option<OperatorAllocationExplanation>,
     snapshot_pane: SnapshotPane,
     draft_snapshot_scroll: u16,
     preview_snapshot_scroll: u16,
@@ -234,6 +242,9 @@ impl OperatorState {
             run_history: None,
             history_selected: 0,
             run_detail: None,
+            run_contributions: None,
+            contribution_selected: 0,
+            allocation_explanation: None,
             snapshot_pane: SnapshotPane::Draft,
             draft_snapshot_scroll: 0,
             preview_snapshot_scroll: 0,
@@ -278,6 +289,9 @@ impl OperatorState {
                 self.run_history = Some(history);
                 self.history_selected = 0;
                 self.run_detail = None;
+                self.run_contributions = None;
+                self.contribution_selected = 0;
+                self.allocation_explanation = None;
                 self.view = OperatorView::RunHistory;
                 self.message = format!("RUN HISTORY · {draft_id} · {count} finalized run(s)");
             }
@@ -363,6 +377,158 @@ impl OperatorState {
         }
     }
 
+    fn next_contribution(&mut self) {
+        let count = self
+            .run_contributions
+            .as_ref()
+            .map(|contributions| contributions.contributions.len())
+            .unwrap_or(0);
+
+        if count > 0 {
+            self.contribution_selected = (self.contribution_selected + 1).min(count - 1);
+        }
+    }
+
+    fn previous_contribution(&mut self) {
+        self.contribution_selected = self.contribution_selected.saturating_sub(1);
+    }
+
+    fn open_selected_run_contributions(&mut self) {
+        let Some((run_id, draft_id, revision)) = self.selected_history_run_identity() else {
+            self.message = "CONTRIBUTIONS unavailable · no finalized run selected".into();
+            return;
+        };
+
+        let client = match OperatorApiClient::new(OPERATOR_API_BASE_URL) {
+            Ok(client) => client,
+            Err(error) => {
+                self.message = format!("CONTRIBUTIONS CONFIG ERROR · {error}");
+                return;
+            }
+        };
+
+        match client.list_run_contributions(run_id) {
+            Ok(contributions) => {
+                self.accept_run_contributions(run_id, &draft_id, revision, contributions);
+            }
+            Err(error) => {
+                self.message = format!("CONTRIBUTIONS ERROR · {error}");
+            }
+        }
+    }
+
+    /// Accepts a `list_run_contributions` response only if it identifies the exact
+    /// history-selected run; on mismatch, stays in `RunHistory` and retains no stale selector
+    /// state from either this attempt or a previous one.
+    fn accept_run_contributions(
+        &mut self,
+        expected_run_id: i64,
+        expected_draft_id: &str,
+        expected_revision: u64,
+        contributions: OperatorRunContributions,
+    ) -> bool {
+        if contributions.run_id != expected_run_id
+            || contributions.source_draft_id != expected_draft_id
+            || contributions.source_revision != expected_revision
+        {
+            self.message = format!(
+                "CONTRIBUTION SELECTOR IDENTITY ERROR · expected run {expected_run_id} · draft {expected_draft_id} · rev {expected_revision}"
+            );
+            self.run_contributions = None;
+            self.contribution_selected = 0;
+            self.allocation_explanation = None;
+            return false;
+        }
+
+        let count = contributions.contributions.len();
+
+        self.message = format!(
+            "CONTRIBUTIONS · run {} · rev {} · {count} contribution(s)",
+            contributions.run_id, contributions.source_revision
+        );
+        self.run_contributions = Some(contributions);
+        self.contribution_selected = 0;
+        self.allocation_explanation = None;
+        self.view = OperatorView::RunContributions;
+        true
+    }
+
+    fn open_selected_contribution_explanation(&mut self) {
+        let Some(contributions) = self.run_contributions.as_ref() else {
+            self.message = "WHY unavailable · no contribution selector loaded".into();
+            return;
+        };
+
+        let Some(option) = contributions.contributions.get(self.contribution_selected) else {
+            self.message = "WHY unavailable · no contribution selected".into();
+            return;
+        };
+
+        let run_id = contributions.run_id;
+        let draft_id = contributions.source_draft_id.clone();
+        let revision = contributions.source_revision;
+        let contribution_id = option.contribution_id.clone();
+        let contributor_id = option.contributor_id.clone();
+
+        let client = match OperatorApiClient::new(OPERATOR_API_BASE_URL) {
+            Ok(client) => client,
+            Err(error) => {
+                self.message = format!("WHY CONFIG ERROR · {error}");
+                return;
+            }
+        };
+
+        match client.get_allocation_explanation(run_id, &contribution_id) {
+            Ok(explanation) => {
+                self.accept_allocation_explanation(
+                    run_id,
+                    &draft_id,
+                    revision,
+                    &contribution_id,
+                    &contributor_id,
+                    explanation,
+                );
+            }
+            Err(error) => {
+                self.message = format!("WHY ERROR · {error}");
+            }
+        }
+    }
+
+    /// Accepts a `get_allocation_explanation` response only if it identifies the exact
+    /// selected run/draft/revision/contribution/contributor; on mismatch, stays in
+    /// `RunContributions` and `allocation_explanation` remains `None`.
+    fn accept_allocation_explanation(
+        &mut self,
+        expected_run_id: i64,
+        expected_draft_id: &str,
+        expected_revision: u64,
+        expected_contribution_id: &str,
+        expected_contributor_id: &str,
+        explanation: OperatorAllocationExplanation,
+    ) -> bool {
+        if explanation.run_id != expected_run_id
+            || explanation.source_draft_id != expected_draft_id
+            || explanation.source_revision != expected_revision
+            || explanation.contribution_id != expected_contribution_id
+            || explanation.contributor_id != expected_contributor_id
+        {
+            self.message = format!(
+                "ALLOCATION EXPLANATION IDENTITY ERROR · expected run {expected_run_id} · contribution {expected_contribution_id}"
+            );
+            self.allocation_explanation = None;
+            return false;
+        }
+
+        self.message = format!(
+            "WHY THIS AMOUNT? · {} · {}",
+            explanation.contributor_id, explanation.contribution_id
+        );
+        self.allocation_explanation = Some(explanation);
+        self.view = OperatorView::AllocationExplanation;
+        true
+    }
+
     fn snapshot_scroll_limit(&self, pane: SnapshotPane) -> u16 {
         let Some(run) = self.run_detail.as_ref() else {
             return 0;
@@ -441,7 +607,37 @@ impl OperatorState {
             KeyCode::Enter => self.open_selected_run(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => self.previous_history_run(),
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'j') => self.next_history_run(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => {
+                self.open_selected_run_contributions()
+            }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => self.load_run_history(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn handle_run_contributions_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = OperatorView::RunHistory;
+                self.message = "RUN HISTORY · contribution selector closed".into();
+            }
+            KeyCode::Up => self.previous_contribution(),
+            KeyCode::Down => self.next_contribution(),
+            KeyCode::Enter => self.open_selected_contribution_explanation(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => self.previous_contribution(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'j') => self.next_contribution(),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn handle_allocation_explanation_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = OperatorView::RunContributions;
+                self.message = "CONTRIBUTIONS · allocation explanation closed".into();
+            }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
             _ => {}
         }
@@ -635,6 +831,14 @@ impl OperatorState {
                 self.handle_run_detail_key(key);
                 return;
             }
+            OperatorView::RunContributions => {
+                self.handle_run_contributions_key(key);
+                return;
+            }
+            OperatorView::AllocationExplanation => {
+                self.handle_allocation_explanation_key(key);
+                return;
+            }
             OperatorView::Sandbox => {}
         }
 
@@ -711,6 +915,16 @@ impl OperatorState {
                 self.draw_footer(frame, root[2]);
                 return;
             }
+            OperatorView::RunContributions => {
+                self.draw_run_contributions(frame, root[1]);
+                self.draw_footer(frame, root[2]);
+                return;
+            }
+            OperatorView::AllocationExplanation => {
+                self.draw_allocation_explanation(frame, root[1]);
+                self.draw_footer(frame, root[2]);
+                return;
+            }
             OperatorView::Sandbox => {}
         }
 
@@ -780,6 +994,8 @@ impl OperatorState {
             OperatorView::Sandbox => 0,
             OperatorView::RunHistory => 1,
             OperatorView::RunDetail => 2,
+            OperatorView::RunContributions => 3,
+            OperatorView::AllocationExplanation => 4,
         };
 
         let title = Line::from(vec![
@@ -791,17 +1007,23 @@ impl OperatorState {
             Span::styled("  NO AI / NO LLM ", Style::default().fg(MUTED)),
         ]);
 
-        let tabs = Tabs::new(vec!["SANDBOX", "HISTORY", "IMMUTABLE"])
-            .select(selected)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
-            .divider(" │ ")
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MINERAL)),
-            );
+        let tabs = Tabs::new(vec![
+            "SANDBOX",
+            "HISTORY",
+            "IMMUTABLE",
+            "CONTRIBUTIONS",
+            "WHY",
+        ])
+        .select(selected)
+        .style(Style::default().fg(MUTED))
+        .highlight_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+        .divider(" │ ")
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MINERAL)),
+        );
 
         frame.render_widget(tabs, area);
     }
@@ -1584,6 +1806,316 @@ impl OperatorState {
         );
     }
 
+    /// Renders the typed contribution selector for one finalized run. Reads only
+    /// `OperatorRunContributions`/`OperatorContributionOption` — never raw snapshot JSON — and
+    /// performs no economic recomputation.
+    fn draw_run_contributions(&self, frame: &mut Frame, area: Rect) {
+        let Some(contributions) = self.run_contributions.as_ref() else {
+            let widget = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "NO CONTRIBUTIONS LOADED",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Return to run history and press W on a finalized run.",
+                    Style::default().fg(TEXT),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .title(" FINALIZED RUN CONTRIBUTIONS ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+            frame.render_widget(widget, area);
+            return;
+        };
+
+        let title = Line::from(vec![
+            Span::styled(
+                " FINALIZED RUN CONTRIBUTIONS · RUN ",
+                Style::default().fg(MINERAL),
+            ),
+            Span::styled(
+                contributions.run_id.to_string(),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · DRAFT ", Style::default().fg(MUTED)),
+            Span::styled(
+                contributions.source_draft_id.clone(),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(" · REV ", Style::default().fg(MUTED)),
+            Span::styled(
+                contributions.source_revision.to_string(),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(" ", Style::default()),
+        ]);
+
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MINERAL));
+
+        if contributions.contributions.is_empty() {
+            let widget = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "NO CONTRIBUTIONS IN FINALIZED RUN",
+                    Style::default().fg(TEXT),
+                )),
+            ])
+            .block(block);
+
+            frame.render_widget(widget, area);
+            return;
+        }
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        const ROW_PALETTE: [Color; 3] = [MINERAL, PURPLE, TEXT];
+
+        let header = Row::new(vec!["CONTRIBUTOR", "CONTRIBUTION ID", "SHARE", "ALLOCATED"])
+            .style(Style::default().fg(PURPLE).add_modifier(Modifier::BOLD))
+            .bottom_margin(1);
+
+        let rows = contributions
+            .contributions
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let is_selected = index == self.contribution_selected;
+                let marker = if is_selected { "▶" } else { " " };
+                let style = if is_selected {
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(ROW_PALETTE[index % ROW_PALETTE.len()])
+                };
+
+                Row::new(vec![
+                    format!("{marker} {}", option.contributor_id),
+                    option.contribution_id.clone(),
+                    format!("{:>6.2}%", option.normalized_share * 100.0),
+                    format_money(option.allocated_amount),
+                ])
+                .style(style)
+            });
+
+        let widget = Table::new(
+            rows,
+            [
+                Constraint::Length(18),
+                Constraint::Length(28),
+                Constraint::Length(10),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header)
+        .column_spacing(1);
+
+        frame.render_widget(widget, inner);
+    }
+
+    /// Renders the immutable calculation trace for one contribution. Every displayed value is
+    /// read directly off the already-fetched `OperatorAllocationExplanation` — this function
+    /// performs no arithmetic beyond presentational formatting (percentage/money display), never
+    /// calls `ContributionEvent::calculate()`, `allocate_contribution_pool()`, or
+    /// `DistributionDraft::preview()`, and never touches raw snapshot JSON.
+    fn draw_allocation_explanation(&self, frame: &mut Frame, area: Rect) {
+        let Some(explanation) = self.allocation_explanation.as_ref() else {
+            let widget = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "NO ALLOCATION EXPLANATION LOADED",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Return to contributions and press Enter on a contribution.",
+                    Style::default().fg(TEXT),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .title(" WHY THIS AMOUNT? · IMMUTABLE CALCULATION TRACE ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MINERAL)),
+            );
+
+            frame.render_widget(widget, area);
+            return;
+        };
+
+        let block = Block::default()
+            .title(" WHY THIS AMOUNT? · IMMUTABLE CALCULATION TRACE ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MINERAL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(10)])
+            .split(inner);
+
+        let identity = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("RUN ", Style::default().fg(MUTED)),
+                Span::styled(explanation.run_id.to_string(), Style::default().fg(TEXT)),
+                Span::styled("   DRAFT ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.source_draft_id.clone(),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled("   REV ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.source_revision.to_string(),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("CONTRIBUTOR ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.contributor_id.clone(),
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   CONTRIBUTION ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.contribution_id.clone(),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("FINALIZED ", Style::default().fg(MUTED)),
+                Span::styled(explanation.finalized_at.clone(), Style::default().fg(TEXT)),
+                Span::styled("   PROTOCOL ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.protocol_version.clone(),
+                    Style::default().fg(PURPLE),
+                ),
+                Span::styled("   ENGINE ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.engine_version.clone(),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled("   MANUAL ", Style::default().fg(MUTED)),
+                Span::styled(
+                    explanation.manual_version.clone(),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+        ]);
+
+        frame.render_widget(identity, sections[0]);
+
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(32)])
+            .split(sections[1]);
+
+        let mut ladder = vec![ladder_line(
+            "BASE WORK VALUE",
+            format!("{:.3}", explanation.base_work_value),
+            Style::default().fg(TEXT),
+        )];
+        ladder.push(Line::from(""));
+
+        ladder.extend(ladder_factor_lines(
+            "RESPONSIBILITY",
+            explanation.weights.responsibility,
+            explanation.factors.responsibility,
+            explanation.factor_terms.responsibility,
+            MINERAL,
+        ));
+        ladder.extend(ladder_factor_lines(
+            "CRITICALITY",
+            explanation.weights.criticality,
+            explanation.factors.criticality,
+            explanation.factor_terms.criticality,
+            PURPLE,
+        ));
+        ladder.extend(ladder_factor_lines(
+            "DEAL IMPACT",
+            explanation.weights.deal_impact,
+            explanation.factors.deal_impact,
+            explanation.factor_terms.deal_impact,
+            MINERAL,
+        ));
+        ladder.extend(ladder_factor_lines(
+            "DEPENDENCY REACH",
+            explanation.weights.dependency_reach,
+            explanation.factors.dependency_reach,
+            explanation.factor_terms.dependency_reach,
+            PURPLE,
+        ));
+
+        ladder.push(Line::from(""));
+        ladder.push(ladder_line(
+            "WEIGHTED FACTORS",
+            format!("{:.3}", explanation.weighted_factors),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "EVIDENCE CONFIDENCE",
+            format!("{:.3}", explanation.factors.evidence_confidence),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "CONTRIBUTION VALUE",
+            format!("{:.3}", explanation.contribution_value),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "TOTAL CONTRIBUTION VALUE",
+            format!("{:.3}", explanation.total_contribution_value),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "NORMALIZED SHARE",
+            format!("{:.2}%", explanation.normalized_share * 100.0),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "CONTRIBUTION POOL",
+            format_money(explanation.contribution_pool),
+            Style::default().fg(TEXT),
+        ));
+        ladder.push(ladder_line(
+            "ALLOCATED AMOUNT",
+            format_money(explanation.allocated_amount),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ));
+
+        frame.render_widget(Paragraph::new(ladder), columns[0]);
+
+        let summary = vec![
+            Line::from(Span::styled("ALLOCATED", Style::default().fg(MUTED))),
+            Line::from(Span::styled(
+                format_money(explanation.allocated_amount),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "IMMUTABLE CALCULATION TRACE",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                explanation.draft_snapshot_schema_version.clone(),
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                explanation.preview_snapshot_schema_version.clone(),
+                Style::default().fg(MUTED),
+            )),
+        ];
+
+        frame.render_widget(Paragraph::new(summary), columns[1]);
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let lines = if self.view == OperatorView::RunDetail {
             vec![
@@ -1613,10 +2145,42 @@ impl OperatorState {
                     Span::raw(" Select   "),
                     Span::styled("[Enter]", Style::default().fg(AMBER)),
                     Span::raw(" Inspect   "),
+                    Span::styled("[W]", Style::default().fg(MINERAL)),
+                    Span::raw(" Why   "),
                     Span::styled("[H]", Style::default().fg(MINERAL)),
                     Span::raw(" Refresh   "),
                     Span::styled("[Esc]", Style::default().fg(PURPLE)),
                     Span::raw(" Sandbox   "),
+                    Span::styled("[Q]", Style::default().fg(MUTED)),
+                    Span::raw(" Quit"),
+                ]),
+                Line::from(Span::styled(
+                    self.message.as_str(),
+                    Style::default().fg(PURPLE),
+                )),
+            ]
+        } else if self.view == OperatorView::RunContributions {
+            vec![
+                Line::from(vec![
+                    Span::styled("[J/K]", Style::default().fg(AMBER)),
+                    Span::raw(" Select   "),
+                    Span::styled("[Enter]", Style::default().fg(AMBER)),
+                    Span::raw(" Explain   "),
+                    Span::styled("[Esc]", Style::default().fg(PURPLE)),
+                    Span::raw(" History   "),
+                    Span::styled("[Q]", Style::default().fg(MUTED)),
+                    Span::raw(" Quit"),
+                ]),
+                Line::from(Span::styled(
+                    self.message.as_str(),
+                    Style::default().fg(PURPLE),
+                )),
+            ]
+        } else if self.view == OperatorView::AllocationExplanation {
+            vec![
+                Line::from(vec![
+                    Span::styled("[Esc]", Style::default().fg(PURPLE)),
+                    Span::raw(" Contributions   "),
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
@@ -1759,6 +2323,37 @@ fn justified_line(
         Span::raw(" ".repeat(pad)),
         Span::styled(right, right_style),
     ])
+}
+
+/// A single "LABEL   value" row in the WHY calculation ladder. `value` is always a stored
+/// `OperatorAllocationExplanation` field already formatted for display — never a freshly
+/// derived economic quantity.
+fn ladder_line(label: &str, value: String, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<26}"), Style::default().fg(MUTED)),
+        Span::styled(value, style),
+    ])
+}
+
+/// Two ladder rows for one contribution factor, placing the already-stored `weight`, `factor`,
+/// and `term` side by side purely for display — no arithmetic is performed here.
+fn ladder_factor_lines(
+    label: &str,
+    weight: f64,
+    factor: f64,
+    term: f64,
+    accent: Color,
+) -> [Line<'static>; 2] {
+    [
+        Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  WEIGHT {weight:.3}   FACTOR {factor:.3}   STORED TERM {term:.3}"),
+            Style::default().fg(TEXT),
+        )),
+    ]
 }
 
 fn main() -> io::Result<()> {
@@ -1908,6 +2503,281 @@ mod tests {
 
         state.handle_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(state.history_selected, 0);
+    }
+
+    #[test]
+    fn contribution_selection_is_bounded() {
+        use distribution_machine::operator_api::{
+            OperatorContributionOption, OperatorRunContributions,
+        };
+
+        let option = |contributor_id: &str, contribution_id: &str| OperatorContributionOption {
+            contributor_id: contributor_id.into(),
+            contribution_id: contribution_id.into(),
+            normalized_share: 0.5,
+            allocated_amount: 5_250.0,
+        };
+
+        let mut state = OperatorState::new();
+
+        state.run_contributions = Some(OperatorRunContributions {
+            run_id: 54,
+            source_draft_id: "bounded-proof".into(),
+            source_revision: 0,
+            contributions: vec![
+                option("operations", "operations-delivery"),
+                option("backend", "backend-engineering"),
+            ],
+        });
+
+        state.view = OperatorView::RunContributions;
+
+        state.next_contribution();
+        assert_eq!(state.contribution_selected, 1);
+
+        state.next_contribution();
+        assert_eq!(state.contribution_selected, 1);
+
+        state.previous_contribution();
+        assert_eq!(state.contribution_selected, 0);
+
+        state.previous_contribution();
+        assert_eq!(state.contribution_selected, 0);
+    }
+
+    #[test]
+    fn vim_style_keys_alias_contribution_selection() {
+        use distribution_machine::operator_api::{
+            OperatorContributionOption, OperatorRunContributions,
+        };
+
+        let option = |contributor_id: &str, contribution_id: &str| OperatorContributionOption {
+            contributor_id: contributor_id.into(),
+            contribution_id: contribution_id.into(),
+            normalized_share: 0.5,
+            allocated_amount: 5_250.0,
+        };
+
+        let mut state = OperatorState::new();
+
+        state.run_contributions = Some(OperatorRunContributions {
+            run_id: 54,
+            source_draft_id: "vim-keys-proof".into(),
+            source_revision: 0,
+            contributions: vec![
+                option("operations", "operations-delivery"),
+                option("backend", "backend-engineering"),
+            ],
+        });
+
+        state.view = OperatorView::RunContributions;
+
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 1);
+
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 1);
+
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 0);
+
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 0);
+
+        // Arrow keys keep working unmodified.
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 1);
+
+        state.handle_run_contributions_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.contribution_selected, 0);
+    }
+
+    #[test]
+    fn exact_selector_identity_opens_run_contributions() {
+        use distribution_machine::operator_api::{
+            OperatorContributionOption, OperatorRunContributions,
+        };
+
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunHistory;
+
+        let contributions = OperatorRunContributions {
+            run_id: 54,
+            source_draft_id: "selector-proof".into(),
+            source_revision: 0,
+            contributions: vec![OperatorContributionOption {
+                contributor_id: "backend".into(),
+                contribution_id: "backend-engineering".into(),
+                normalized_share: 1.0,
+                allocated_amount: 10_500.0,
+            }],
+        };
+
+        let accepted = state.accept_run_contributions(54, "selector-proof", 0, contributions);
+
+        assert!(accepted);
+        assert_eq!(state.view, OperatorView::RunContributions);
+        assert_eq!(state.contribution_selected, 0);
+        assert!(state.allocation_explanation.is_none());
+        assert_eq!(state.run_contributions.as_ref().unwrap().run_id, 54);
+    }
+
+    #[test]
+    fn mismatched_selector_identity_is_rejected() {
+        use distribution_machine::operator_api::{
+            OperatorContributionOption, OperatorRunContributions,
+        };
+
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunHistory;
+
+        let contributions = OperatorRunContributions {
+            run_id: 54,
+            source_draft_id: "selector-proof".into(),
+            source_revision: 99,
+            contributions: vec![OperatorContributionOption {
+                contributor_id: "backend".into(),
+                contribution_id: "backend-engineering".into(),
+                normalized_share: 1.0,
+                allocated_amount: 10_500.0,
+            }],
+        };
+
+        let accepted = state.accept_run_contributions(54, "selector-proof", 0, contributions);
+
+        assert!(!accepted);
+        assert_eq!(state.view, OperatorView::RunHistory);
+        assert!(state.run_contributions.is_none());
+        assert!(
+            state
+                .message
+                .contains("CONTRIBUTION SELECTOR IDENTITY ERROR")
+        );
+    }
+
+    fn sample_allocation_explanation(
+        contribution_id: &str,
+    ) -> distribution_machine::operator_api::OperatorAllocationExplanation {
+        use distribution_machine::operator_api::{
+            OperatorAllocationExplanation, OperatorContributionFactorTerms,
+            OperatorContributionFactors, OperatorContributionWeights,
+        };
+
+        OperatorAllocationExplanation {
+            run_id: 54,
+            source_draft_id: "why-proof".into(),
+            source_revision: 0,
+            draft_snapshot_schema_version: "distribution-draft-snapshot/1".into(),
+            preview_snapshot_schema_version: "draft-preview-snapshot/1".into(),
+            contributor_id: "backend".into(),
+            contribution_id: contribution_id.into(),
+            base_work_value: 1.0,
+            weights: OperatorContributionWeights {
+                responsibility: 0.20,
+                criticality: 0.30,
+                deal_impact: 0.25,
+                dependency_reach: 0.25,
+            },
+            factors: OperatorContributionFactors {
+                responsibility: 1.0,
+                criticality: 1.0,
+                deal_impact: 1.0,
+                dependency_reach: 1.0,
+                evidence_confidence: 1.0,
+            },
+            factor_terms: OperatorContributionFactorTerms {
+                responsibility: 0.20,
+                criticality: 0.30,
+                deal_impact: 0.25,
+                dependency_reach: 0.25,
+            },
+            weighted_factors: 1.0,
+            contribution_value: 1.0,
+            total_contribution_value: 1.0,
+            normalized_share: 1.0,
+            contribution_pool: 10_500.0,
+            allocated_amount: 10_500.0,
+            protocol_version: "PP-0.1-draft".into(),
+            engine_version: "distribution-machine/0.1.0".into(),
+            manual_version: "manual/0.1-draft".into(),
+            finalized_at: "2026-09-19 16:00:00+00".into(),
+        }
+    }
+
+    #[test]
+    fn exact_explanation_identity_opens_allocation_explanation() {
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunContributions;
+
+        let explanation = sample_allocation_explanation("backend-engineering");
+
+        let accepted = state.accept_allocation_explanation(
+            54,
+            "why-proof",
+            0,
+            "backend-engineering",
+            "backend",
+            explanation,
+        );
+
+        assert!(accepted);
+        assert_eq!(state.view, OperatorView::AllocationExplanation);
+        assert_eq!(
+            state
+                .allocation_explanation
+                .as_ref()
+                .unwrap()
+                .allocated_amount,
+            10_500.0
+        );
+    }
+
+    #[test]
+    fn mismatched_explanation_identity_is_rejected() {
+        let mut state = OperatorState::new();
+        state.view = OperatorView::RunContributions;
+
+        let explanation = sample_allocation_explanation("backend-engineering");
+
+        let accepted = state.accept_allocation_explanation(
+            54,
+            "why-proof",
+            0,
+            "operations-delivery",
+            "backend",
+            explanation,
+        );
+
+        assert!(!accepted);
+        assert_eq!(state.view, OperatorView::RunContributions);
+        assert!(state.allocation_explanation.is_none());
+        assert!(
+            state
+                .message
+                .contains("ALLOCATION EXPLANATION IDENTITY ERROR")
+        );
+    }
+
+    #[test]
+    fn empty_contribution_selector_does_not_open_explanation() {
+        use distribution_machine::operator_api::OperatorRunContributions;
+
+        let mut state = OperatorState::new();
+
+        state.run_contributions = Some(OperatorRunContributions {
+            run_id: 54,
+            source_draft_id: "empty-proof".into(),
+            source_revision: 0,
+            contributions: Vec::new(),
+        });
+
+        state.view = OperatorView::RunContributions;
+
+        state.open_selected_contribution_explanation();
+
+        assert_eq!(state.view, OperatorView::RunContributions);
+        assert!(state.allocation_explanation.is_none());
+        assert!(state.message.contains("WHY unavailable"));
     }
 
     #[test]
