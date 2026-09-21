@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn history_selection_is_bounded_by_authoritative_rows() {
-        use distribution_machine::operator_api::OperatorRunMetadata;
+        use distribution_machine::operator_api::{OperatorRunMetadata, OperatorRunTelemetry};
 
         let run = |id, revision| OperatorRunMetadata {
             id,
@@ -1692,6 +1692,11 @@ mod tests {
             engine_version: "distribution-machine/0.1.0".into(),
             manual_version: "manual/0.1-draft".into(),
             finalized_at: "2026-09-19 16:00:00+00".into(),
+            telemetry: OperatorRunTelemetry {
+                available_for_distribution: 30_000.0,
+                contribution_pool: 10_500.0,
+                allocation_count: 1,
+            },
         };
 
         let mut state = OperatorState::new();

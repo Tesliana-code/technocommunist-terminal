@@ -12,6 +12,16 @@ pub struct OperatorRunMetadata {
     pub engine_version: String,
     pub manual_version: String,
     pub finalized_at: String,
+    pub telemetry: OperatorRunTelemetry,
+}
+
+/// A typed summary derived strictly from a run's persisted, immutable `preview_snapshot`.
+/// Never recomputed from the current draft or the current Distribution Engine.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorRunTelemetry {
+    pub available_for_distribution: f64,
+    pub contribution_pool: f64,
+    pub allocation_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -265,7 +275,12 @@ mod tests {
                     "protocol_version": "PP-0.1-draft",
                     "engine_version": "distribution-machine/0.1.0",
                     "manual_version": "manual/0.1-draft",
-                    "finalized_at": "2026-09-19 16:00:00+00"
+                    "finalized_at": "2026-09-19 16:00:00+00",
+                    "telemetry": {
+                        "available_for_distribution": 30000.0,
+                        "contribution_pool": 10500.0,
+                        "allocation_count": 1
+                    }
                 }
             ]
         }"#;
@@ -281,6 +296,12 @@ mod tests {
         assert_eq!(history.runs.len(), 1);
         assert_eq!(history.runs[0].id, 42);
         assert_eq!(history.runs[0].source_revision, 3);
+        assert_eq!(
+            history.runs[0].telemetry.available_for_distribution,
+            30000.0
+        );
+        assert_eq!(history.runs[0].telemetry.contribution_pool, 10500.0);
+        assert_eq!(history.runs[0].telemetry.allocation_count, 1);
 
         let request = server.join().unwrap();
 

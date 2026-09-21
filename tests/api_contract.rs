@@ -794,9 +794,15 @@ async fn finalized_run_history_is_metadata_only_and_newest_revision_first() {
 
     assert_eq!(runs[0]["id"], revision_one_run_id);
     assert_eq!(runs[0]["source_revision"], 1);
+    assert_eq!(runs[0]["telemetry"]["available_for_distribution"], 35000.0);
+    assert_eq!(runs[0]["telemetry"]["contribution_pool"], 12250.0);
+    assert_eq!(runs[0]["telemetry"]["allocation_count"], 1);
 
     assert_eq!(runs[1]["id"], revision_zero_run_id);
     assert_eq!(runs[1]["source_revision"], 0);
+    assert_eq!(runs[1]["telemetry"]["available_for_distribution"], 30000.0);
+    assert_eq!(runs[1]["telemetry"]["contribution_pool"], 10500.0);
+    assert_eq!(runs[1]["telemetry"]["allocation_count"], 1);
 
     for run in runs {
         assert_eq!(run["protocol_version"], "PP-0.1-draft");
@@ -820,4 +826,107 @@ async fn finalized_run_history_is_metadata_only_and_newest_revision_first() {
     for id in [empty_id, history_id] {
         cleanup_finalized_api_contract(&pool, id).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Commie PostgreSQL via DATABASE_URL"]
+async fn corrupt_finalized_run_telemetry_is_sanitized() {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for the PostgreSQL API contract test");
+
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    let app = app_with_pool(pool.clone());
+
+    let id = "api-contract-corrupt-run-telemetry";
+
+    cleanup_finalized_api_contract(&pool, id).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            "/api/drafts",
+            serde_json::to_vec(&finalizable_draft_payload(id)).unwrap(),
+            true,
+        ),
+    )
+    .await;
+
+    json_response(response, StatusCode::CREATED).await;
+
+    let response = call(
+        &app,
+        request(
+            Method::POST,
+            &format!("/api/drafts/{id}/finalize"),
+            r#"{"expected_revision":0}"#,
+            true,
+        ),
+    )
+    .await;
+
+    let finalized = json_response(response, StatusCode::CREATED).await;
+    let run_id = finalized["id"]
+        .as_i64()
+        .expect("finalized response must expose numeric run id");
+
+    // preview_snapshot is still a valid JSON object (satisfies the DB-level
+    // distribution_runs_preview_snapshot_is_object check) but pool_amounts.contribution
+    // is missing, which telemetry extraction must reject rather than default to zero.
+    let corrupt_preview_snapshot = json!({
+        "available_for_distribution": 30000.0,
+        "pool_amounts": {},
+        "contribution_allocations": []
+    });
+
+    let mut tx = pool.begin().await.unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         DISABLE TRIGGER distribution_runs_reject_update",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE distribution_runs
+         SET preview_snapshot = $1
+         WHERE id = $2",
+    )
+    .bind(sqlx::types::Json(corrupt_preview_snapshot))
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "ALTER TABLE distribution_runs
+         ENABLE TRIGGER distribution_runs_reject_update",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let response = call(
+        &app,
+        request(Method::GET, &format!("/api/drafts/{id}/runs"), "", false),
+    )
+    .await;
+
+    let body = error_response(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+
+    assert_eq!(body["error"], "internal server error");
+
+    let serialized = serde_json::to_string(&body).unwrap();
+
+    assert!(!serialized.contains("pool_amounts.contribution"));
+    assert!(!serialized.contains("preview_snapshot"));
+    assert!(!serialized.contains("database contains invalid preview_snapshot"));
+    assert!(!serialized.contains(id));
+    assert!(!serialized.contains(&run_id.to_string()));
+
+    cleanup_finalized_api_contract(&pool, id).await;
 }

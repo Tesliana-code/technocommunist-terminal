@@ -22,6 +22,7 @@ pub enum DraftStoreError {
     RevisionExhausted { id: String, revision: u64 },
     CorruptRevision(i64),
     CorruptDraft { id: String, reason: String },
+    CorruptRunSnapshot { id: i64, reason: String },
     NotFound(String),
     RunNotFound(i64),
     Conflict { id: String, expected_revision: u64 },
@@ -57,6 +58,12 @@ impl fmt::Display for DraftStoreError {
             }
             Self::CorruptDraft { id, reason } => {
                 write!(f, "database contains invalid draft {id}: {reason}")
+            }
+            Self::CorruptRunSnapshot { id, reason } => {
+                write!(
+                    f,
+                    "database contains invalid preview_snapshot for run {id}: {reason}"
+                )
             }
             Self::NotFound(id) => write!(f, "draft not found: {id}"),
             Self::RunNotFound(id) => write!(f, "distribution run not found: {id}"),
@@ -152,6 +159,16 @@ pub struct FinalizedRunMetadata {
     pub engine_version: String,
     pub manual_version: String,
     pub finalized_at: String,
+    pub telemetry: FinalizedRunTelemetry,
+}
+
+/// A typed summary derived strictly from a run's persisted, immutable `preview_snapshot`.
+/// Never recomputed from the current draft or the current Distribution Engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedRunTelemetry {
+    pub available_for_distribution: f64,
+    pub contribution_pool: f64,
+    pub allocation_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -380,7 +397,8 @@ impl DraftStore {
                 r.protocol_version,
                 r.engine_version,
                 r.manual_version,
-                r.finalized_at::text AS finalized_at
+                r.finalized_at::text AS finalized_at,
+                r.preview_snapshot
             FROM distribution_drafts d
             LEFT JOIN distribution_runs r
                 ON r.source_draft_id = d.id
@@ -412,6 +430,9 @@ impl DraftStore {
             let engine_version: String = row.try_get("engine_version")?;
             let manual_version: String = row.try_get("manual_version")?;
             let finalized_at: String = row.try_get("finalized_at")?;
+            let Json(preview_snapshot): Json<Value> = row.try_get("preview_snapshot")?;
+
+            let telemetry = extract_run_telemetry(run_id, &preview_snapshot)?;
 
             runs.push(FinalizedRunMetadata {
                 id: run_id,
@@ -420,6 +441,7 @@ impl DraftStore {
                 engine_version,
                 manual_version,
                 finalized_at,
+                telemetry,
             });
         }
 
@@ -651,4 +673,56 @@ fn revision_to_db(revision: u64) -> Result<i64, DraftStoreError> {
 
 fn revision_from_db(revision: i64) -> Result<u64, DraftStoreError> {
     u64::try_from(revision).map_err(|_| DraftStoreError::CorruptRevision(revision))
+}
+
+/// Extracts telemetry strictly from a run's persisted, immutable `preview_snapshot` — never
+/// from the current draft or the current Distribution Engine. Fails closed on any malformed or
+/// missing field so a corrupt historical snapshot cannot silently render as zeros.
+fn extract_run_telemetry(
+    run_id: i64,
+    preview_snapshot: &Value,
+) -> Result<FinalizedRunTelemetry, DraftStoreError> {
+    let corrupt = |reason: &str| DraftStoreError::CorruptRunSnapshot {
+        id: run_id,
+        reason: reason.to_string(),
+    };
+
+    let available_for_distribution = preview_snapshot
+        .get("available_for_distribution")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| corrupt("missing or non-numeric available_for_distribution"))?;
+
+    if !available_for_distribution.is_finite() {
+        return Err(corrupt("available_for_distribution is not finite"));
+    }
+
+    if available_for_distribution < 0.0 {
+        return Err(corrupt("available_for_distribution is negative"));
+    }
+
+    let contribution_pool = preview_snapshot
+        .get("pool_amounts")
+        .and_then(|pool_amounts| pool_amounts.get("contribution"))
+        .and_then(Value::as_f64)
+        .ok_or_else(|| corrupt("missing or non-numeric pool_amounts.contribution"))?;
+
+    if !contribution_pool.is_finite() {
+        return Err(corrupt("contribution_pool is not finite"));
+    }
+
+    if contribution_pool < 0.0 {
+        return Err(corrupt("contribution_pool is negative"));
+    }
+
+    let allocation_count = preview_snapshot
+        .get("contribution_allocations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| corrupt("missing or non-array contribution_allocations"))?
+        .len() as u64;
+
+    Ok(FinalizedRunTelemetry {
+        available_for_distribution,
+        contribution_pool,
+        allocation_count,
+    })
 }

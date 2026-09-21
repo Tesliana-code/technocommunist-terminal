@@ -16,7 +16,7 @@ use crate::{
     ledger::MoneyLedger,
     persistence::{
         DraftStore, DraftStoreError, FinalizationMetadata, FinalizedRun, FinalizedRunMetadata,
-        FinalizedRunRecord,
+        FinalizedRunRecord, FinalizedRunTelemetry,
     },
     protocol::{DistributionPools, PoolAmounts},
     run::{ContributorMeasurement, DistributionDraft, DraftPreview},
@@ -133,6 +133,7 @@ pub struct FinalizedRunMetadataResponse {
     pub engine_version: String,
     pub manual_version: String,
     pub finalized_at: String,
+    pub telemetry: FinalizedRunTelemetryResponse,
 }
 
 impl From<FinalizedRunMetadata> for FinalizedRunMetadataResponse {
@@ -144,6 +145,26 @@ impl From<FinalizedRunMetadata> for FinalizedRunMetadataResponse {
             engine_version: run.engine_version,
             manual_version: run.manual_version,
             finalized_at: run.finalized_at,
+            telemetry: run.telemetry.into(),
+        }
+    }
+}
+
+/// A typed summary derived strictly from a run's persisted, immutable `preview_snapshot`.
+/// Never recomputed from the current draft or the current Distribution Engine.
+#[derive(Debug, Serialize)]
+pub struct FinalizedRunTelemetryResponse {
+    pub available_for_distribution: f64,
+    pub contribution_pool: f64,
+    pub allocation_count: u64,
+}
+
+impl From<FinalizedRunTelemetry> for FinalizedRunTelemetryResponse {
+    fn from(telemetry: FinalizedRunTelemetry) -> Self {
+        Self {
+            available_for_distribution: telemetry.available_for_distribution,
+            contribution_pool: telemetry.contribution_pool,
+            allocation_count: telemetry.allocation_count,
         }
     }
 }
@@ -441,6 +462,7 @@ impl IntoResponse for ApiError {
 
                     DraftStoreError::CorruptRevision(_)
                     | DraftStoreError::CorruptDraft { .. }
+                    | DraftStoreError::CorruptRunSnapshot { .. }
                     | DraftStoreError::Serialization(_)
                     | DraftStoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
