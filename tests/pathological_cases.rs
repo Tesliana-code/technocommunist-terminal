@@ -23054,3 +23054,568 @@ fn path_058_h_poisoned_authority_record_can_authenticate_the_wrong_history() {
     let reality = Path058EvidenceReality::Forged;
     assert_eq!(reality, Path058EvidenceReality::Forged);
 }
+
+// =====================================================================
+// PATH-061 — USE-TIME TRUTH BOUNDARY
+// =====================================================================
+//
+// FIND-038 showed that bounded completeness and truthful point-in-time
+// currentness do not establish use-time latestness.
+//
+// PATH-061 attacks the boundary between the evidence observation boundary
+// O and the decision-use boundary U.
+//
+// H32 (predeclared):
+// A mechanism can establish use-time latestness in the modeled system only
+// if it carries information covering authoritative change THROUGH U.
+// A complete interval witness through U MAY suffice, but only under an
+// exogenous assumption that the witness is authentic and complete.
+//
+// Boundaries are deterministic event-sequence values, not wall-clock time.
+// A transition at sequence s is in effect at boundary b iff s <= b.
+//
+// Distinct properties kept separate:
+// - authenticity: did the claimed authority issue the witness?
+// - historical completeness: are transitions missing before a stated cut?
+// - interval completeness: are all transitions in (O, U] represented?
+// - observation-time currentness: was N latest at O?
+// - use-time latestness: is N latest at U?
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Path061ObservationBoundary(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Path061UseBoundary(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path061Transition {
+    sequence: u64,
+    epoch: u64,
+}
+
+// Ground truth only. Never passed to a candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path061World {
+    transitions: Vec<Path061Transition>,
+}
+
+impl Path061World {
+    fn new(transitions: &[(u64, u64)]) -> Self {
+        Self {
+            transitions: transitions
+                .iter()
+                .map(|&(sequence, epoch)| Path061Transition { sequence, epoch })
+                .collect(),
+        }
+    }
+
+    fn latest_at(&self, boundary: u64) -> u64 {
+        self.transitions
+            .iter()
+            .filter(|t| t.sequence <= boundary)
+            .max_by_key(|t| t.sequence)
+            .map(|t| t.epoch)
+            .expect("modeled world has a genesis transition")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path061UseVerdict {
+    CurrentLatest(u64),
+    Unresolved,
+}
+
+// Candidate-visible: "epoch N was current at observation boundary O".
+// Truthful by construction when produced from a world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path061CurrentnessObservation {
+    epoch: u64,
+    at: Path061ObservationBoundary,
+}
+
+fn path_061_truthful_observation(
+    world: &Path061World,
+    at: Path061ObservationBoundary,
+) -> Path061CurrentnessObservation {
+    Path061CurrentnessObservation {
+        epoch: world.latest_at(at.0),
+        at,
+    }
+}
+
+fn path_061_correct_verdict(
+    world: &Path061World,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    Path061UseVerdict::CurrentLatest(world.latest_at(use_at.0))
+}
+
+// Unresolved never asserts anything false. A CurrentLatest claim is sound
+// only if it names the ground-truth latest epoch at U.
+fn path_061_verdict_is_sound(
+    verdict: Path061UseVerdict,
+    world: &Path061World,
+    use_at: Path061UseBoundary,
+) -> bool {
+    match verdict {
+        Path061UseVerdict::Unresolved => true,
+        Path061UseVerdict::CurrentLatest(epoch) => {
+            epoch == world.latest_at(use_at.0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate A — "recent enough"
+// ---------------------------------------------------------------------
+
+fn path_061_candidate_a_recent_enough(
+    observation: Path061CurrentnessObservation,
+    use_at: Path061UseBoundary,
+    max_distance: u64,
+) -> Path061UseVerdict {
+    if use_at.0 >= observation.at.0
+        && use_at.0 - observation.at.0 <= max_distance
+    {
+        Path061UseVerdict::CurrentLatest(observation.epoch)
+    } else {
+        Path061UseVerdict::Unresolved
+    }
+}
+
+#[test]
+fn path_061_a_recent_observation_does_not_exclude_intervening_change() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(102);
+
+    // World A: no transition after O.
+    let world_a = Path061World::new(&[(10, 3)]);
+    // World B: epoch 4 occurs after O and before U.
+    let world_b = Path061World::new(&[(10, 3), (101, 4)]);
+
+    let visible_a = (path_061_truthful_observation(&world_a, observed_at), use_at);
+    let visible_b = (path_061_truthful_observation(&world_b, observed_at), use_at);
+
+    // Both observations are truthful about O, and identical.
+    assert_eq!(visible_a, visible_b);
+    assert_eq!(visible_a.0.epoch, 3);
+
+    let verdict_a = path_061_candidate_a_recent_enough(visible_a.0, visible_a.1, 2);
+    let verdict_b = path_061_candidate_a_recent_enough(visible_b.0, visible_b.1, 2);
+
+    assert_eq!(verdict_a, verdict_b);
+    assert_eq!(verdict_a, Path061UseVerdict::CurrentLatest(3));
+
+    assert_ne!(
+        path_061_correct_verdict(&world_a, use_at),
+        path_061_correct_verdict(&world_b, use_at),
+    );
+    assert!(path_061_verdict_is_sound(verdict_a, &world_a, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_b, &world_b, use_at));
+
+    // Any recency threshold admitting a distance with room for an
+    // intervening modeled event admits the same counterexample.
+    for max_distance in 2..=8 {
+        let use_at = Path061UseBoundary(observed_at.0 + max_distance);
+        let quiet = Path061World::new(&[(10, 3)]);
+        let changed = Path061World::new(&[(10, 3), (observed_at.0 + 1, 4)]);
+
+        let visible = path_061_truthful_observation(&quiet, observed_at);
+        assert_eq!(visible, path_061_truthful_observation(&changed, observed_at));
+
+        let verdict =
+            path_061_candidate_a_recent_enough(visible, use_at, max_distance);
+        assert!(path_061_verdict_is_sound(verdict, &quiet, use_at));
+        assert!(!path_061_verdict_is_sound(verdict, &changed, use_at));
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate B — re-read the same visible state at use
+// ---------------------------------------------------------------------
+
+// Ground truth only: what kind of read source the candidate is talking to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path061ReadSource {
+    CurrentThroughRead,
+    FrozenAt(u64),
+}
+
+// Candidate-visible read result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path061VisibleRead {
+    epoch: u64,
+    at: Path061UseBoundary,
+}
+
+fn path_061_read(
+    world: &Path061World,
+    source: Path061ReadSource,
+    at: Path061UseBoundary,
+) -> Path061VisibleRead {
+    let effective = match source {
+        Path061ReadSource::CurrentThroughRead => at.0,
+        Path061ReadSource::FrozenAt(sequence) => sequence,
+    };
+
+    Path061VisibleRead {
+        epoch: world.latest_at(effective),
+        at,
+    }
+}
+
+fn path_061_candidate_b_reread_equality(
+    observation: Path061CurrentnessObservation,
+    reread: Path061VisibleRead,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    if reread.at == use_at && reread.epoch == observation.epoch {
+        Path061UseVerdict::CurrentLatest(observation.epoch)
+    } else {
+        Path061UseVerdict::Unresolved
+    }
+}
+
+#[test]
+fn path_061_b_same_visible_reread_can_be_stale_at_use() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    // World A: 3 really remains latest; the read source is current.
+    let world_a = Path061World::new(&[(10, 3)]);
+    let source_a = Path061ReadSource::CurrentThroughRead;
+
+    // World B: epoch 4 exists before U; the read source is frozen at O.
+    let world_b = Path061World::new(&[(10, 3), (105, 4)]);
+    let source_b = Path061ReadSource::FrozenAt(observed_at.0);
+
+    let visible_a = (
+        path_061_truthful_observation(&world_a, observed_at),
+        path_061_read(&world_a, source_a, use_at),
+    );
+    let visible_b = (
+        path_061_truthful_observation(&world_b, observed_at),
+        path_061_read(&world_b, source_b, use_at),
+    );
+
+    assert_eq!(visible_a, visible_b);
+    assert_eq!(visible_a.1.epoch, 3);
+
+    let verdict_a =
+        path_061_candidate_b_reread_equality(visible_a.0, visible_a.1, use_at);
+    let verdict_b =
+        path_061_candidate_b_reread_equality(visible_b.0, visible_b.1, use_at);
+
+    assert_eq!(verdict_a, verdict_b);
+    assert_eq!(verdict_a, Path061UseVerdict::CurrentLatest(3));
+
+    assert_ne!(
+        path_061_correct_verdict(&world_a, use_at),
+        path_061_correct_verdict(&world_b, use_at),
+    );
+    assert!(path_061_verdict_is_sound(verdict_a, &world_a, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_b, &world_b, use_at));
+
+    // The read-source currentness property is what differs, and it is not
+    // part of the visible read.
+    assert_ne!(source_a, source_b);
+}
+
+// ---------------------------------------------------------------------
+// Candidate C — bounded interval-change witness
+// ---------------------------------------------------------------------
+
+// Candidate-visible, inert claim:
+// "authority-change history is complete over (from, complete_through],
+//  and these are the transitions in that interval".
+// It carries no authenticity information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path061IntervalWitness {
+    from: Path061ObservationBoundary,
+    complete_through: u64,
+    transitions: Vec<Path061Transition>,
+}
+
+// Ground truth only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path061WitnessReality {
+    Genuine,
+    Forged,
+}
+
+fn path_061_genuine_interval_witness(
+    world: &Path061World,
+    from: Path061ObservationBoundary,
+    complete_through: u64,
+) -> Path061IntervalWitness {
+    Path061IntervalWitness {
+        from,
+        complete_through,
+        transitions: world
+            .transitions
+            .iter()
+            .copied()
+            .filter(|t| t.sequence > from.0 && t.sequence <= complete_through)
+            .collect(),
+    }
+}
+
+fn path_061_candidate_c_interval_witness(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path061IntervalWitness>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let Some(witness) = witness else {
+        return Path061UseVerdict::Unresolved;
+    };
+
+    if witness.from != observation.at || witness.complete_through < use_at.0 {
+        return Path061UseVerdict::Unresolved;
+    }
+
+    if witness
+        .transitions
+        .iter()
+        .any(|t| t.sequence <= witness.from.0 || t.sequence > witness.complete_through)
+    {
+        return Path061UseVerdict::Unresolved;
+    }
+
+    match witness
+        .transitions
+        .iter()
+        .filter(|t| t.sequence <= use_at.0)
+        .max_by_key(|t| t.sequence)
+    {
+        Some(latest) => Path061UseVerdict::CurrentLatest(latest.epoch),
+        None => Path061UseVerdict::CurrentLatest(observation.epoch),
+    }
+}
+
+#[test]
+fn path_061_c_complete_interval_through_use_control() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3)]);
+
+    let observation = path_061_truthful_observation(&world, observed_at);
+    let witness = path_061_genuine_interval_witness(&world, observed_at, use_at.0);
+    assert!(witness.transitions.is_empty());
+
+    let verdict =
+        path_061_candidate_c_interval_witness(observation, Some(&witness), use_at);
+
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert_eq!(verdict, path_061_correct_verdict(&world, use_at));
+}
+
+#[test]
+fn path_061_d_interval_witness_exposes_intervening_transition() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    let quiet = Path061World::new(&[(10, 3)]);
+    let changed = Path061World::new(&[(10, 3), (105, 4)]);
+
+    // Observation-time currentness is identical: 3 was latest at O in both.
+    let observation = path_061_truthful_observation(&changed, observed_at);
+    assert_eq!(observation, path_061_truthful_observation(&quiet, observed_at));
+
+    let quiet_witness =
+        path_061_genuine_interval_witness(&quiet, observed_at, use_at.0);
+    let changed_witness =
+        path_061_genuine_interval_witness(&changed, observed_at, use_at.0);
+
+    // Unlike PATH-060, genuine interval witnesses differ between the worlds.
+    assert_ne!(quiet_witness, changed_witness);
+
+    let verdict = path_061_candidate_c_interval_witness(
+        observation,
+        Some(&changed_witness),
+        use_at,
+    );
+
+    assert_ne!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(4));
+    assert_eq!(verdict, path_061_correct_verdict(&changed, use_at));
+    assert!(path_061_verdict_is_sound(verdict, &changed, use_at));
+
+    // Transition exactly at U is in effect at U and is covered.
+    let at_use = Path061World::new(&[(10, 3), (110, 4)]);
+    let at_use_witness =
+        path_061_genuine_interval_witness(&at_use, observed_at, use_at.0);
+    assert_eq!(
+        path_061_candidate_c_interval_witness(observation, Some(&at_use_witness), use_at),
+        Path061UseVerdict::CurrentLatest(4),
+    );
+}
+
+#[test]
+fn path_061_e_witness_ending_before_use_remains_unresolved() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    let quiet = Path061World::new(&[(10, 3)]);
+    // Change exactly at U, i.e. in the one step the witness does not cover.
+    let changed_at_use = Path061World::new(&[(10, 3), (110, 4)]);
+
+    let observation = path_061_truthful_observation(&quiet, observed_at);
+
+    let quiet_witness =
+        path_061_genuine_interval_witness(&quiet, observed_at, use_at.0 - 1);
+    let changed_witness =
+        path_061_genuine_interval_witness(&changed_at_use, observed_at, use_at.0 - 1);
+
+    // Both are genuine and truthful through U-1, and identical.
+    assert_eq!(quiet_witness, changed_witness);
+
+    // Their correct use-time verdicts differ.
+    assert_ne!(
+        path_061_correct_verdict(&quiet, use_at),
+        path_061_correct_verdict(&changed_at_use, use_at),
+    );
+
+    let verdict = path_061_candidate_c_interval_witness(
+        observation,
+        Some(&quiet_witness),
+        use_at,
+    );
+
+    assert_eq!(verdict, Path061UseVerdict::Unresolved);
+    assert!(path_061_verdict_is_sound(verdict, &quiet, use_at));
+    assert!(path_061_verdict_is_sound(verdict, &changed_at_use, use_at));
+}
+
+#[test]
+fn path_061_f_missing_interval_witness_remains_unresolved() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3)]);
+
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    assert_eq!(
+        path_061_candidate_c_interval_witness(observation, None, use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // A witness starting after O leaves (O, from] uncovered.
+    let late_start = path_061_genuine_interval_witness(
+        &world,
+        Path061ObservationBoundary(101),
+        use_at.0,
+    );
+    assert_eq!(
+        path_061_candidate_c_interval_witness(observation, Some(&late_start), use_at),
+        Path061UseVerdict::Unresolved,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Candidate D — forged interval witness
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_061_g_genuine_and_forged_interval_witnesses_can_be_observationally_identical() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    // World G: genuine "complete through U, no change"; 3 is latest.
+    let world_g = Path061World::new(&[(10, 3)]);
+    let witness_g = path_061_genuine_interval_witness(&world_g, observed_at, use_at.0);
+    let reality_g = Path061WitnessReality::Genuine;
+
+    // World F: epoch 4 occurred before U; forged witness omits it.
+    let world_f = Path061World::new(&[(10, 3), (105, 4)]);
+    let witness_f = Path061IntervalWitness {
+        from: observed_at,
+        complete_through: use_at.0,
+        transitions: Vec::new(),
+    };
+    let reality_f = Path061WitnessReality::Forged;
+
+    assert_ne!(
+        witness_f,
+        path_061_genuine_interval_witness(&world_f, observed_at, use_at.0),
+    );
+
+    let visible_g = (
+        path_061_truthful_observation(&world_g, observed_at),
+        witness_g,
+        use_at,
+    );
+    let visible_f = (
+        path_061_truthful_observation(&world_f, observed_at),
+        witness_f,
+        use_at,
+    );
+
+    // Candidate-visible input is identical; only ground truth differs.
+    assert_eq!(visible_g, visible_f);
+    assert_ne!(reality_g, reality_f);
+    assert_ne!(
+        path_061_correct_verdict(&world_g, use_at),
+        path_061_correct_verdict(&world_f, use_at),
+    );
+
+    let verdict_g =
+        path_061_candidate_c_interval_witness(visible_g.0, Some(&visible_g.1), visible_g.2);
+    let verdict_f =
+        path_061_candidate_c_interval_witness(visible_f.0, Some(&visible_f.1), visible_f.2);
+
+    assert_eq!(verdict_g, verdict_f);
+    assert_eq!(verdict_g, Path061UseVerdict::CurrentLatest(3));
+    assert!(path_061_verdict_is_sound(verdict_g, &world_g, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_f, &world_f, use_at));
+}
+
+#[test]
+fn path_061_h_forged_complete_looking_witness_relocates_the_truth_boundary() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    let quiet = Path061World::new(&[(10, 3)]);
+    let changed = Path061World::new(&[(10, 3), (105, 4)]);
+
+    let observation = path_061_truthful_observation(&quiet, observed_at);
+    assert_eq!(observation, path_061_truthful_observation(&changed, observed_at));
+
+    let genuine_quiet =
+        path_061_genuine_interval_witness(&quiet, observed_at, use_at.0);
+    let genuine_changed =
+        path_061_genuine_interval_witness(&changed, observed_at, use_at.0);
+
+    // Forgery in each direction: each world is paired with the other
+    // world's genuine witness. Both forgeries are well-formed.
+    let cases = [
+        (&quiet, &genuine_quiet, Path061WitnessReality::Genuine),
+        (&changed, &genuine_changed, Path061WitnessReality::Genuine),
+        (&changed, &genuine_quiet, Path061WitnessReality::Forged),
+        (&quiet, &genuine_changed, Path061WitnessReality::Forged),
+    ];
+
+    for (world, witness, reality) in cases {
+        let verdict =
+            path_061_candidate_c_interval_witness(observation, Some(witness), use_at);
+
+        // The candidate always commits; the witness shape is acceptable.
+        assert!(matches!(verdict, Path061UseVerdict::CurrentLatest(_)));
+
+        // Soundness tracks witness reality exactly, and reality is not
+        // part of candidate input.
+        assert_eq!(
+            path_061_verdict_is_sound(verdict, world, use_at),
+            reality == Path061WitnessReality::Genuine,
+        );
+    }
+
+    // Forged "change" witness: invents epoch 4 that never occurred.
+    assert_eq!(
+        path_061_candidate_c_interval_witness(observation, Some(&genuine_changed), use_at),
+        Path061UseVerdict::CurrentLatest(4),
+    );
+    assert_eq!(
+        path_061_correct_verdict(&quiet, use_at),
+        Path061UseVerdict::CurrentLatest(3),
+    );
+}
