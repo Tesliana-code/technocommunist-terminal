@@ -1,4 +1,7 @@
-use std::{env, io, time::Duration};
+use std::{
+    env, io,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use distribution_machine::{
@@ -22,11 +25,27 @@ use ratatui::{
     },
 };
 
-const MINERAL: Color = Color::Rgb(108, 148, 132);
-const PURPLE: Color = Color::Rgb(174, 155, 208);
-const AMBER: Color = Color::Rgb(214, 168, 95);
-const MUTED: Color = Color::Rgb(122, 128, 132);
-const TEXT: Color = Color::Rgb(214, 216, 210);
+// SUBNOR CRT palette. Each color carries one meaning across every view:
+// AMBER    active selection / mutable operator focus / identity warmth
+// MINERAL  reconciled, accepted, immutable server-owned record
+// PURPLE   contributions / WHY inspection state
+// COBALT   structural framing of mutable sandbox and broadcast chrome
+// FAULT    refused, failed, unavailable, not reconciled
+// MUTED    secondary structure and labels
+// TEXT     primary phosphor text on the CRT_BACKGROUND field
+const MINERAL: Color = Color::Rgb(112, 178, 134);
+const PURPLE: Color = Color::Rgb(158, 138, 196);
+const AMBER: Color = Color::Rgb(226, 172, 84);
+const MUTED: Color = Color::Rgb(116, 128, 122);
+const TEXT: Color = Color::Rgb(208, 214, 200);
+const COBALT: Color = Color::Rgb(84, 116, 184);
+const FAULT: Color = Color::Rgb(212, 98, 82);
+const CRT_BACKGROUND: Color = Color::Rgb(11, 13, 16);
+
+const SUBNOR_NAME: &str = "SUBNOR";
+const SUBNOR_SUBTITLE: &str = "Distribution Engine Operator Terminal";
+const SUBNOR_PROMPT: &str = "Press Enter to continue";
+const CURSOR_BLINK_HALF_PERIOD_MS: u128 = 530;
 
 const OPERATOR_API_BASE_URL: &str = "http://127.0.0.1:18080";
 
@@ -877,22 +896,21 @@ impl OperatorState {
         }
     }
 
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-        while !self.quit {
-            terminal.draw(|frame| self.draw(frame))?;
-
-            if event::poll(Duration::from_millis(120))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key(key);
-            }
+    fn message_style(&self) -> Style {
+        let message = self.message.as_str();
+        if message.contains("ERROR")
+            || message.contains("unavailable")
+            || message.starts_with("Invalid")
+        {
+            Style::default().fg(FAULT)
+        } else {
+            Style::default().fg(PURPLE)
         }
-
-        Ok(())
     }
 
     fn draw(&self, frame: &mut Frame) {
+        frame.render_widget(Block::default().style(crt_base_style()), frame.area());
+
         let root = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1000,8 +1018,12 @@ impl OperatorState {
 
         let title = Line::from(vec![
             Span::styled(
-                " DISTRIBUTION-ENGINE ",
-                Style::default().fg(MINERAL).add_modifier(Modifier::BOLD),
+                " SUBNOR ",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "DISTRIBUTION-ENGINE ",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("// PP-0.1  DETERMINISTIC", Style::default().fg(PURPLE)),
             Span::styled("  NO AI / NO LLM ", Style::default().fg(MUTED)),
@@ -1022,7 +1044,7 @@ impl OperatorState {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(MINERAL)),
+                .border_style(Style::default().fg(COBALT)),
         );
 
         frame.render_widget(tabs, area);
@@ -1038,7 +1060,7 @@ impl OperatorState {
         let total_style = if (pool_total - 1.0).abs() < 1e-9 {
             Style::default().fg(MINERAL).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            Style::default().fg(FAULT).add_modifier(Modifier::BOLD)
         };
 
         let lines = vec![
@@ -1091,7 +1113,7 @@ impl OperatorState {
         let block = Block::default()
             .title(" MONEY + POOLS ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MINERAL));
+            .border_style(Style::default().fg(COBALT));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1132,7 +1154,7 @@ impl OperatorState {
         let total_style = if (total - 1.0).abs() < 1e-9 {
             Style::default().fg(MINERAL).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            Style::default().fg(FAULT).add_modifier(Modifier::BOLD)
         };
 
         let widget = Paragraph::new(vec![
@@ -1173,7 +1195,7 @@ impl OperatorState {
             Block::default()
                 .title(" CONTRIBUTION WEIGHTS ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(PURPLE)),
+                .border_style(Style::default().fg(COBALT)),
         );
 
         frame.render_widget(widget, area);
@@ -1236,7 +1258,7 @@ impl OperatorState {
         let block = Block::default()
             .title(" LIVE DISTRIBUTION PREVIEW ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MINERAL));
+            .border_style(Style::default().fg(COBALT));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1250,7 +1272,7 @@ impl OperatorState {
         let lines = vec![
             Line::from(Span::styled(
                 "PREVIEW UNAVAILABLE",
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                Style::default().fg(FAULT).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(error.to_string(), Style::default().fg(TEXT))),
@@ -1379,7 +1401,7 @@ impl OperatorState {
         let status_style = if reconciled {
             Style::default().fg(MINERAL).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            Style::default().fg(FAULT).add_modifier(Modifier::BOLD)
         };
 
         let footer_width = sections[5].width;
@@ -1826,7 +1848,7 @@ impl OperatorState {
                 Block::default()
                     .title(" FINALIZED RUN CONTRIBUTIONS ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MINERAL)),
+                    .border_style(Style::default().fg(PURPLE)),
             );
 
             frame.render_widget(widget, area);
@@ -1858,7 +1880,7 @@ impl OperatorState {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MINERAL));
+            .border_style(Style::default().fg(PURPLE));
 
         if contributions.contributions.is_empty() {
             let widget = Paragraph::new(vec![
@@ -1942,7 +1964,7 @@ impl OperatorState {
                 Block::default()
                     .title(" WHY THIS AMOUNT? · IMMUTABLE CALCULATION TRACE ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MINERAL)),
+                    .border_style(Style::default().fg(PURPLE)),
             );
 
             frame.render_widget(widget, area);
@@ -1952,7 +1974,7 @@ impl OperatorState {
         let block = Block::default()
             .title(" WHY THIS AMOUNT? · IMMUTABLE CALCULATION TRACE ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MINERAL));
+            .border_style(Style::default().fg(PURPLE));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -2133,10 +2155,7 @@ impl OperatorState {
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         } else if self.view == OperatorView::RunHistory {
             vec![
@@ -2154,10 +2173,7 @@ impl OperatorState {
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         } else if self.view == OperatorView::RunContributions {
             vec![
@@ -2171,10 +2187,7 @@ impl OperatorState {
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         } else if self.view == OperatorView::AllocationExplanation {
             vec![
@@ -2184,10 +2197,7 @@ impl OperatorState {
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         } else if self.editing {
             vec![
@@ -2201,10 +2211,7 @@ impl OperatorState {
                     Span::styled("[Esc]", Style::default().fg(MUTED)),
                     Span::raw(" Cancel"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         } else {
             vec![
@@ -2226,10 +2233,7 @@ impl OperatorState {
                     Span::styled("[Q]", Style::default().fg(MUTED)),
                     Span::raw(" Quit"),
                 ]),
-                Line::from(Span::styled(
-                    self.message.as_str(),
-                    Style::default().fg(PURPLE),
-                )),
+                Line::from(Span::styled(self.message.as_str(), self.message_style())),
             ]
         };
 
@@ -2241,6 +2245,315 @@ impl OperatorState {
 
         frame.render_widget(widget, area);
     }
+}
+
+/// Top-level application phase. `Startup` is the SUBNOR transmission ident and owns all key
+/// input until Enter; `Operator` delegates to the unchanged `OperatorState` views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppPhase {
+    Startup,
+    Operator,
+}
+
+struct App {
+    phase: AppPhase,
+    operator: OperatorState,
+    started: Instant,
+    quit: bool,
+}
+
+impl App {
+    fn new(operator: OperatorState) -> Self {
+        Self {
+            phase: AppPhase::Startup,
+            operator,
+            started: Instant::now(),
+            quit: false,
+        }
+    }
+
+    fn should_quit(&self) -> bool {
+        self.quit || self.operator.quit
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match self.phase {
+            AppPhase::Startup => self.handle_startup_key(key),
+            AppPhase::Operator => self.operator.handle_key(key),
+        }
+    }
+
+    /// Only Enter, Q and Esc act; every other key is swallowed so nothing reaches the
+    /// operator state behind the ident.
+    fn handle_startup_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.phase = AppPhase::Operator,
+            KeyCode::Esc => self.quit = true,
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        while !self.should_quit() {
+            terminal.draw(|frame| self.draw(frame))?;
+
+            if event::poll(Duration::from_millis(120))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        match self.phase {
+            AppPhase::Startup => draw_startup(frame, cursor_visible(self.started.elapsed())),
+            AppPhase::Operator => self.operator.draw(frame),
+        }
+    }
+}
+
+fn crt_base_style() -> Style {
+    Style::default().fg(TEXT).bg(CRT_BACKGROUND)
+}
+
+/// The startup cursor is a pure function of time since launch; the existing 120 ms poll loop
+/// redraws often enough for the phase change to show.
+fn cursor_visible(elapsed: Duration) -> bool {
+    (elapsed.as_millis() / CURSOR_BLINK_HALF_PERIOD_MS) % 2 == 0
+}
+
+const WORDMARK_LETTER_WIDTH: usize = 7;
+const WORDMARK_HELMET_WIDTH: usize = 11;
+/// S U B N [helmet] R, one column between glyphs.
+const WORDMARK_WIDTH: usize = 5 * WORDMARK_LETTER_WIDTH + WORDMARK_HELMET_WIDTH + 5;
+
+const GLYPH_S: [&str; 7] = [
+    " █████ ",
+    "██   ██",
+    "██     ",
+    " █████ ",
+    "     ██",
+    "██   ██",
+    " █████ ",
+];
+const GLYPH_U: [&str; 7] = [
+    "██   ██",
+    "██   ██",
+    "██   ██",
+    "██   ██",
+    "██   ██",
+    "██   ██",
+    " █████ ",
+];
+const GLYPH_B: [&str; 7] = [
+    "██████ ",
+    "██   ██",
+    "██   ██",
+    "██████ ",
+    "██   ██",
+    "██   ██",
+    "██████ ",
+];
+const GLYPH_N: [&str; 7] = [
+    "██   ██",
+    "███  ██",
+    "████ ██",
+    "██ ████",
+    "██  ███",
+    "██   ██",
+    "██   ██",
+];
+const GLYPH_R: [&str; 7] = [
+    "██████ ",
+    "██   ██",
+    "██   ██",
+    "██████ ",
+    "██ ██  ",
+    "██  ██ ",
+    "██   ██",
+];
+
+/// The O of SUBNOR as a cosmonaut helmet with a cat inside, after the reference ident.
+/// The shell uses the same two-column block stroke and rounded top/bottom rows as the
+/// letters, so it reads as a glyph of the wordmark. Each row is (shell-left, interior,
+/// shell-right); the star sits in the crown band.
+const HELMET: [(&str, &str, &str); 7] = [
+    (" ▄███", "*", "███▄ "),
+    ("██▀", "     ", "▀██"),
+    ("██ ", "/\\_/\\", " ██"),
+    ("██ ", "(o.o)", " ██"),
+    ("██ ", "> ^ <", " ██"),
+    ("██▄", "     ", "▄██"),
+    (" ▀", "███████", "▀ "),
+];
+
+/// Column of the helmet's centre within the full wordmark: S U B N plus separators.
+const WORDMARK_HELMET_CENTRE: usize = 4 * (WORDMARK_LETTER_WIDTH + 1) + WORDMARK_HELMET_WIDTH / 2;
+
+/// Control-room rule spanning exactly the wordmark, with a tick under the helmet centre.
+fn wordmark_rule() -> String {
+    (0..WORDMARK_WIDTH)
+        .map(|column| match column {
+            0 => '╺',
+            c if c == WORDMARK_WIDTH - 1 => '╸',
+            c if c == WORDMARK_HELMET_CENTRE => '┳',
+            _ => '━',
+        })
+        .collect()
+}
+
+/// Prompt with a hanging cursor: the leading pad equals the cursor cell plus its gap, so the
+/// text itself is centred and the cursor sits one space after it.
+fn prompt_line(cursor_on: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(SUBNOR_PROMPT, Style::default().fg(MUTED)),
+        Span::raw(" "),
+        Span::styled(
+            if cursor_on { "█" } else { " " },
+            Style::default().fg(AMBER),
+        ),
+    ])
+}
+
+fn wordmark_lines() -> Vec<Line<'static>> {
+    let letter = Style::default().fg(AMBER).add_modifier(Modifier::BOLD);
+    let outline = Style::default().fg(MINERAL);
+    let face = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
+    let star = Style::default().fg(AMBER).add_modifier(Modifier::BOLD);
+
+    (0..7)
+        .map(|row| {
+            let (left, interior, right) = HELMET[row];
+            let interior_style = if row == 0 { star } else { face };
+            let interior_style = if row == 6 { outline } else { interior_style };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {} {} {} ",
+                        GLYPH_S[row], GLYPH_U[row], GLYPH_B[row], GLYPH_N[row]
+                    ),
+                    letter,
+                ),
+                Span::styled(left, outline),
+                Span::styled(interior, interior_style),
+                Span::styled(right, outline),
+                Span::styled(format!(" {}", GLYPH_R[row]), letter),
+            ])
+        })
+        .collect()
+}
+
+fn compact_wordmark_lines() -> Vec<Line<'static>> {
+    let outline = Style::default().fg(MINERAL);
+    vec![
+        Line::from(vec![
+            Span::styled("▄█", outline),
+            Span::styled("*", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled("█▄", outline),
+        ]),
+        Line::from(vec![
+            Span::styled("█", outline),
+            Span::styled(
+                "o.o",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", outline),
+        ]),
+        Line::from(Span::styled("▀███▀", outline)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "S  U  B  N  O  R",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )),
+    ]
+}
+
+/// Startup content, degrading decoration before information: full block wordmark, then a
+/// compact helmet mark, then the bare identity. Subtitle and prompt are always present.
+fn startup_lines(width: u16, height: u16, cursor_on: bool) -> Vec<Line<'static>> {
+    let subtitle = Line::from(Span::styled(SUBNOR_SUBTITLE, Style::default().fg(TEXT)));
+    let prompt = prompt_line(cursor_on);
+
+    let width = width as usize;
+    let height = height as usize;
+
+    // Identity group (wordmark, rule, subtitle) is held together; the prompt stands apart.
+    if width >= WORDMARK_WIDTH + 2 && height >= 15 {
+        let mut lines = wordmark_lines();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            wordmark_rule(),
+            Style::default().fg(COBALT),
+        )));
+        lines.push(Line::from(""));
+        lines.push(subtitle);
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+        lines.push(prompt);
+        lines
+    } else if width >= SUBNOR_SUBTITLE.len() + 2 && height >= 9 {
+        let mut lines = compact_wordmark_lines();
+        lines.push(Line::from(""));
+        lines.push(subtitle);
+        lines.push(Line::from(""));
+        lines.push(prompt);
+        lines
+    } else {
+        vec![
+            Line::from(Span::styled(
+                SUBNOR_NAME,
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )),
+            subtitle,
+            prompt,
+        ]
+    }
+}
+
+fn draw_startup(frame: &mut Frame, cursor_on: bool) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(crt_base_style()), area);
+
+    let frame_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COBALT))
+        .title(Line::from(Span::styled(
+            format!(" {SUBNOR_NAME} "),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )))
+        .title(
+            Line::from(Span::styled(
+                " DISTRIBUTION MACHINE ",
+                Style::default().fg(MUTED),
+            ))
+            .right_aligned(),
+        )
+        .title_bottom(
+            Line::from(Span::styled(
+                " AWAITING TRANSMISSION ",
+                Style::default().fg(MUTED),
+            ))
+            .centered(),
+        );
+    let inner = frame_block.inner(area);
+    frame.render_widget(frame_block, area);
+
+    let lines = startup_lines(inner.width, inner.height, cursor_on);
+    let height = (lines.len() as u16).min(inner.height);
+    let content = Rect {
+        x: inner.x,
+        y: inner.y + (inner.height - height) / 2,
+        width: inner.width,
+        height,
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
 }
 
 fn slider(value: f64) -> String {
@@ -2358,7 +2671,7 @@ fn ladder_factor_lines(
 
 fn main() -> io::Result<()> {
     ratatui::run(|terminal| {
-        let mut app = OperatorState::from_environment();
+        let mut app = App::new(OperatorState::from_environment());
         app.run(terminal)
     })
 }
@@ -2968,5 +3281,179 @@ mod tests {
         assert_eq!(state.view, OperatorView::RunHistory);
         assert!(state.run_detail.is_none());
         assert!(state.message.contains("RUN DETAIL IDENTITY ERROR"));
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn render_startup(width: u16, height: u16, cursor_on: bool) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_startup(frame, cursor_on))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn app_begins_in_startup_state() {
+        let app = App::new(OperatorState::new());
+
+        assert_eq!(app.phase, AppPhase::Startup);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn enter_leaves_startup_for_operator_sandbox_without_editing() {
+        let mut app = App::new(OperatorState::new());
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.phase, AppPhase::Operator);
+        assert_eq!(app.operator.view, OperatorView::Sandbox);
+        assert!(!app.operator.editing);
+        assert_eq!(
+            app.operator.message,
+            "SANDBOX READY · deterministic preview · no writes"
+        );
+    }
+
+    #[test]
+    fn startup_swallows_non_action_keys() {
+        let mut app = App::new(OperatorState::new());
+        let before_message = app.operator.message.clone();
+
+        for code in [
+            KeyCode::Char('e'),
+            KeyCode::Char('E'),
+            KeyCode::Char('h'),
+            KeyCode::Char('c'),
+            KeyCode::Char('w'),
+            KeyCode::Char(']'),
+            KeyCode::Char('}'),
+            KeyCode::Char('7'),
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Backspace,
+        ] {
+            app.handle_key(press(code));
+        }
+
+        assert_eq!(app.phase, AppPhase::Startup);
+        assert!(!app.should_quit());
+        assert_eq!(app.operator.view, OperatorView::Sandbox);
+        assert!(!app.operator.editing);
+        assert!(app.operator.edit_buffer.is_empty());
+        assert_eq!(app.operator.field_index, 0);
+        assert_eq!(app.operator.contributor_index, 0);
+        assert!(app.operator.run_history.is_none());
+        assert_eq!(app.operator.message, before_message);
+        assert_eq!(app.operator.pools.contribution, 0.35);
+        assert_eq!(app.operator.weights.criticality, 0.30);
+    }
+
+    #[test]
+    fn quit_keys_work_from_startup() {
+        for code in [KeyCode::Char('q'), KeyCode::Char('Q'), KeyCode::Esc] {
+            let mut app = App::new(OperatorState::new());
+            app.handle_key(press(code));
+
+            assert!(app.should_quit());
+            assert_eq!(app.phase, AppPhase::Startup);
+        }
+    }
+
+    #[test]
+    fn startup_identity_strings_are_exact() {
+        assert_eq!(SUBNOR_NAME, "SUBNOR");
+        assert_eq!(SUBNOR_SUBTITLE, "Distribution Engine Operator Terminal");
+        assert_eq!(SUBNOR_PROMPT, "Press Enter to continue");
+
+        // Full, compact and minimal layouts all carry the exact identity strings.
+        for (width, height) in [(120, 36), (80, 24), (60, 16), (42, 12), (40, 8)] {
+            let screen = render_startup(width, height, true);
+            assert!(screen.contains(SUBNOR_NAME), "{width}x{height}");
+            assert!(screen.contains(SUBNOR_SUBTITLE), "{width}x{height}");
+            assert!(screen.contains(SUBNOR_PROMPT), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn startup_cursor_blinks_without_blinking_the_prompt() {
+        assert!(cursor_visible(Duration::ZERO));
+        assert!(!cursor_visible(Duration::from_millis(
+            CURSOR_BLINK_HALF_PERIOD_MS as u64
+        )));
+        assert!(cursor_visible(Duration::from_millis(
+            2 * CURSOR_BLINK_HALF_PERIOD_MS as u64
+        )));
+
+        let on = render_startup(80, 24, true);
+        let off = render_startup(80, 24, false);
+        assert!(on.contains(&format!("{SUBNOR_PROMPT} █")));
+        assert!(!off.contains(&format!("{SUBNOR_PROMPT} █")));
+        assert!(off.contains(SUBNOR_PROMPT));
+    }
+
+    #[test]
+    fn wordmark_rows_are_aligned() {
+        for glyph in [GLYPH_S, GLYPH_U, GLYPH_B, GLYPH_N, GLYPH_R] {
+            for row in glyph {
+                assert_eq!(row.chars().count(), WORDMARK_LETTER_WIDTH);
+            }
+        }
+        for (left, interior, right) in HELMET {
+            assert_eq!(
+                left.chars().count() + interior.chars().count() + right.chars().count(),
+                WORDMARK_HELMET_WIDTH
+            );
+        }
+        for line in wordmark_lines() {
+            assert_eq!(line.width(), WORDMARK_WIDTH);
+        }
+    }
+
+    #[test]
+    fn operator_behavior_is_unchanged_after_startup() {
+        let mut app = App::new(OperatorState::new());
+        app.handle_key(press(KeyCode::Enter));
+
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.operator.field_index, 1);
+
+        // Enter inside the sandbox keeps its existing meaning: edit a numeric field.
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.operator.editing);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.operator.editing);
+        assert!(!app.should_quit());
+
+        app.handle_key(press(KeyCode::Char('q')));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn fault_messages_use_fault_style() {
+        let mut state = OperatorState::new();
+        assert_eq!(state.message_style(), Style::default().fg(PURPLE));
+
+        state.message = "RUN HISTORY ERROR · refused".into();
+        assert_eq!(state.message_style(), Style::default().fg(FAULT));
+
+        state.message = "WHY unavailable · no contribution selected".into();
+        assert_eq!(state.message_style(), Style::default().fg(FAULT));
     }
 }
