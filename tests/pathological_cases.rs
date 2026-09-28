@@ -24665,3 +24665,870 @@ fn path_062_l_completeness_grant_is_load_bearing_not_derived() {
     assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
     assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
 }
+
+// =====================================================================
+// PATH-063 — SOURCE FRONTIER / COMPLETENESS EVIDENCE BOUNDARY
+// =====================================================================
+//
+// FIND-040 showed that a trusted pinned root authenticates witness origin
+// but not interval completeness. The remaining load-bearing assumption is
+// "the authenticated issuer's source is complete through U".
+//
+// H34 (predeclared):
+// Authenticated source metadata (a claimed high-water mark, a fresh
+// response, contiguous records, dense "no change" coverage) cannot by
+// itself establish that the source is semantically complete through U if
+// a stale source can emit the same candidate-visible evidence. A frontier
+// mechanism becomes sufficient only under an explicit producer invariant
+// tying "frontier >= U" to actual observation of every authoritative event
+// through U. Serializing, authenticating, or freshly returning the frontier
+// does not establish that invariant.
+//
+// Properties kept separate:
+// - issuer authenticity: tag verifies under the pinned verifier
+// - response freshness: the response binds the candidate's challenge
+// - source frontier: the issuer's claimed `frontier`
+// - structural coverage: contiguous record ids, dense slots
+// - semantic completeness: every authoritative event <= U is in the source
+// - use-time latestness: the verdict names the latest epoch at U
+//
+// Reuses PATH-061 world / observation / verdict / soundness and the
+// PATH-062 test-local mix, signing key, verifier id, and idealized
+// unforgeability assumption. Nothing here is cryptography, networking,
+// storage, or a real clock. A challenge id is an opaque number supplied by
+// the candidate at or after U; binding it proves only that the response was
+// produced after the candidate chose it, within the model.
+
+// Ground truth only: what the issuer's underlying source actually holds.
+// `view_through`: how far the source has observed authoritative history.
+// `dropped`: authoritative sequences that never entered the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path063Source {
+    view_through: u64,
+    dropped: Vec<u64>,
+}
+
+impl Path063Source {
+    fn current() -> Self {
+        Self {
+            view_through: u64::MAX,
+            dropped: Vec::new(),
+        }
+    }
+
+    fn frozen_at(sequence: u64) -> Self {
+        Self {
+            view_through: sequence,
+            dropped: Vec::new(),
+        }
+    }
+
+    fn lossy(dropped: &[u64]) -> Self {
+        Self {
+            view_through: u64::MAX,
+            dropped: dropped.to_vec(),
+        }
+    }
+
+    fn contents(&self, world: &Path061World) -> Vec<Path061Transition> {
+        world
+            .transitions
+            .iter()
+            .copied()
+            .filter(|t| t.sequence <= self.view_through && !self.dropped.contains(&t.sequence))
+            .collect()
+    }
+}
+
+// Ground truth only: how the issuer derives the frontier it reports.
+// `SourceView`: the source's own observed position (honest about what the
+// source knows). `AnswerBoundary`: the boundary at which it answers, i.e. a
+// liveness position, not a source position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path063FrontierReport {
+    SourceView,
+    AnswerBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path063Issuer {
+    key: Path062SigningKey,
+    source: Path063Source,
+    report: Path063FrontierReport,
+    anchor_record: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path063Record {
+    record_id: u64,
+    transition: Path061Transition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path063SlotContent {
+    Transition(u64),
+    NoChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path063Slot {
+    sequence: u64,
+    content: Path063SlotContent,
+}
+
+// Candidate-visible. `frontier` is a plain number: no constructor restricts
+// it. Only the idealized-unforgeability assumption restricts who can tag it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path063Response {
+    issuer: Path062VerifierId,
+    challenge: Option<u64>,
+    from: Path061ObservationBoundary,
+    anchor_record: u64,
+    frontier: u64,
+    records: Vec<Path063Record>,
+    slots: Vec<Path063Slot>,
+    tag: Path062Tag,
+}
+
+fn path_063_digest(response: &Path063Response) -> u64 {
+    let mut state = PATH_062_FNV_OFFSET;
+    state = path_062_mix(state, response.issuer.0);
+    match response.challenge {
+        Some(challenge) => {
+            state = path_062_mix(state, 1);
+            state = path_062_mix(state, challenge);
+        }
+        None => state = path_062_mix(state, 0),
+    }
+    state = path_062_mix(state, response.from.0);
+    state = path_062_mix(state, response.anchor_record);
+    state = path_062_mix(state, response.frontier);
+    state = path_062_mix(state, response.records.len() as u64);
+    for record in &response.records {
+        state = path_062_mix(state, record.record_id);
+        state = path_062_mix(state, record.transition.sequence);
+        state = path_062_mix(state, record.transition.epoch);
+    }
+    state = path_062_mix(state, response.slots.len() as u64);
+    for slot in &response.slots {
+        state = path_062_mix(state, slot.sequence);
+        match slot.content {
+            Path063SlotContent::Transition(epoch) => {
+                state = path_062_mix(state, 1);
+                state = path_062_mix(state, epoch);
+            }
+            Path063SlotContent::NoChange => state = path_062_mix(state, 0),
+        }
+    }
+    state
+}
+
+// The issuer answers from its source. It emits records and dense slots
+// through min(frontier, U) and signs the whole response.
+fn path_063_respond(
+    issuer: &Path063Issuer,
+    world: &Path061World,
+    from: Path061ObservationBoundary,
+    use_at: Path061UseBoundary,
+    answered_at: u64,
+    challenge: Option<u64>,
+) -> Path063Response {
+    let frontier = match issuer.report {
+        // A source cannot have observed past the boundary at which it answers.
+        Path063FrontierReport::SourceView => issuer.source.view_through.min(answered_at),
+        Path063FrontierReport::AnswerBoundary => answered_at,
+    };
+    let emit_through = frontier.min(use_at.0);
+    let contents: Vec<Path061Transition> = issuer
+        .source
+        .contents(world)
+        .into_iter()
+        .filter(|t| t.sequence > from.0 && t.sequence <= emit_through)
+        .collect();
+
+    let records = contents
+        .iter()
+        .enumerate()
+        .map(|(index, &transition)| Path063Record {
+            record_id: issuer.anchor_record + 1 + index as u64,
+            transition,
+        })
+        .collect();
+
+    let slots = (from.0 + 1..=emit_through)
+        .map(|sequence| Path063Slot {
+            sequence,
+            content: match contents.iter().find(|t| t.sequence == sequence) {
+                Some(t) => Path063SlotContent::Transition(t.epoch),
+                None => Path063SlotContent::NoChange,
+            },
+        })
+        .collect();
+
+    let mut response = Path063Response {
+        issuer: issuer.key.verifier(),
+        challenge,
+        from,
+        anchor_record: issuer.anchor_record,
+        frontier,
+        records,
+        slots,
+        tag: Path062Tag { key_id: 0, value: 0 },
+    };
+    response.tag = path_062_sign(issuer.key, path_063_digest(&response));
+    response
+}
+
+// ---- Oracle-only predicates ----
+
+// Every authoritative event at or before `through` is in the source.
+fn path_063_oracle_source_complete_through(
+    world: &Path061World,
+    source: &Path063Source,
+    through: u64,
+) -> bool {
+    let contents = source.contents(world);
+    world
+        .transitions
+        .iter()
+        .filter(|t| t.sequence <= through)
+        .all(|t| contents.contains(t))
+}
+
+// Producer invariant: the issued frontier f implies the source holds every
+// authoritative event through f.
+fn path_063_oracle_producer_invariant_holds(
+    world: &Path061World,
+    issuer: &Path063Issuer,
+    response: &Path063Response,
+) -> bool {
+    path_063_oracle_source_complete_through(world, &issuer.source, response.frontier)
+}
+
+fn path_063_oracle_slot_is_true(world: &Path061World, slot: Path063Slot) -> bool {
+    let actual = world.transitions.iter().find(|t| t.sequence == slot.sequence);
+    match (slot.content, actual) {
+        (Path063SlotContent::NoChange, None) => true,
+        (Path063SlotContent::Transition(epoch), Some(t)) => t.epoch == epoch,
+        _ => false,
+    }
+}
+
+// ---- Candidate logic: sees only the response, pin, challenge, U ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path063Require {
+    contiguous_records: bool,
+    dense_slots: bool,
+    challenge: Option<u64>,
+}
+
+fn path_063_records_contiguous(response: &Path063Response) -> bool {
+    response
+        .records
+        .iter()
+        .enumerate()
+        .all(|(index, record)| record.record_id == response.anchor_record + 1 + index as u64)
+}
+
+fn path_063_slots_dense(response: &Path063Response, use_at: Path061UseBoundary) -> bool {
+    let expected: Vec<u64> = (response.from.0 + 1..=use_at.0).collect();
+    let actual: Vec<u64> = response.slots.iter().map(|s| s.sequence).collect();
+    actual.len() >= expected.len() && actual[..expected.len()] == expected[..]
+}
+
+fn path_063_slots_agree_with_records(response: &Path063Response) -> bool {
+    let from_slots: Vec<Path061Transition> = response
+        .slots
+        .iter()
+        .filter_map(|slot| match slot.content {
+            Path063SlotContent::Transition(epoch) => Some(Path061Transition {
+                sequence: slot.sequence,
+                epoch,
+            }),
+            Path063SlotContent::NoChange => None,
+        })
+        .collect();
+    let from_records: Vec<Path061Transition> =
+        response.records.iter().map(|r| r.transition).collect();
+    from_slots == from_records
+}
+
+fn path_063_evaluate(
+    observation: Path061CurrentnessObservation,
+    response: Option<&Path063Response>,
+    pinned: Option<Path062VerifierId>,
+    use_at: Path061UseBoundary,
+    require: Path063Require,
+) -> Path061UseVerdict {
+    let (Some(response), Some(pinned)) = (response, pinned) else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if response.issuer != pinned || !path_062_verify(pinned, path_063_digest(response), response.tag)
+    {
+        return Path061UseVerdict::Unresolved;
+    }
+    if response.from != observation.at || response.frontier < use_at.0 {
+        return Path061UseVerdict::Unresolved;
+    }
+    let mut previous = response.from.0;
+    for record in &response.records {
+        if record.transition.sequence <= previous || record.transition.sequence > response.frontier
+        {
+            return Path061UseVerdict::Unresolved;
+        }
+        previous = record.transition.sequence;
+    }
+    if require.contiguous_records && !path_063_records_contiguous(response) {
+        return Path061UseVerdict::Unresolved;
+    }
+    if let Some(challenge) = require.challenge {
+        if response.challenge != Some(challenge) {
+            return Path061UseVerdict::Unresolved;
+        }
+    }
+    if require.dense_slots
+        && (!path_063_slots_dense(response, use_at) || !path_063_slots_agree_with_records(response))
+    {
+        return Path061UseVerdict::Unresolved;
+    }
+    match response
+        .records
+        .iter()
+        .filter(|r| r.transition.sequence <= use_at.0)
+        .last()
+    {
+        Some(record) => Path061UseVerdict::CurrentLatest(record.transition.epoch),
+        None => Path061UseVerdict::CurrentLatest(observation.epoch),
+    }
+}
+
+const PATH_063_A: Path063Require = Path063Require {
+    contiguous_records: false,
+    dense_slots: false,
+    challenge: None,
+};
+
+const PATH_063_B: Path063Require = Path063Require {
+    contiguous_records: true,
+    dense_slots: false,
+    challenge: None,
+};
+
+const PATH_063_C: Path063Require = Path063Require {
+    contiguous_records: false,
+    dense_slots: true,
+    challenge: None,
+};
+
+const PATH_063_CHALLENGE: u64 = 77;
+
+const PATH_063_D: Path063Require = Path063Require {
+    contiguous_records: false,
+    dense_slots: false,
+    challenge: Some(PATH_063_CHALLENGE),
+};
+
+// Candidate E (and F): every visible mechanism at once.
+const PATH_063_E: Path063Require = Path063Require {
+    contiguous_records: true,
+    dense_slots: true,
+    challenge: Some(PATH_063_CHALLENGE),
+};
+
+const PATH_063_AUTHORITY: Path062SigningKey = Path062SigningKey { id: 0xA11CE };
+
+fn path_063_issuer(source: Path063Source, report: Path063FrontierReport) -> Path063Issuer {
+    Path063Issuer {
+        key: PATH_063_AUTHORITY,
+        source,
+        report,
+        anchor_record: 500,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate A — authenticated high-water mark
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_063_a_authenticated_frontier_control() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let issuer = path_063_issuer(Path063Source::current(), Path063FrontierReport::AnswerBoundary);
+    let response = path_063_respond(&issuer, &world, observed_at, use_at, use_at.0, None);
+    assert_eq!(response.frontier, use_at.0);
+    assert!(path_063_oracle_source_complete_through(&world, &issuer.source, use_at.0));
+
+    let verdict = path_063_evaluate(observation, Some(&response), pinned, use_at, PATH_063_A);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(4));
+    assert_eq!(verdict, path_061_correct_verdict(&world, use_at));
+
+    // Missing pin: the source is complete here, so Unresolved means
+    // "completeness unavailable", not "source incomplete".
+    assert_eq!(
+        path_063_evaluate(observation, Some(&response), None, use_at, PATH_063_A),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // A frontier short of U: Unresolved, not a claim of incompleteness.
+    let short = path_063_respond(&issuer, &world, observed_at, use_at, use_at.0 - 1, None);
+    assert_eq!(
+        path_063_evaluate(observation, Some(&short), pinned, use_at, PATH_063_A),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // A frozen source that reports its own position honestly claims O < U.
+    let honest_frozen =
+        path_063_issuer(Path063Source::frozen_at(observed_at.0), Path063FrontierReport::SourceView);
+    let response = path_063_respond(&honest_frozen, &world, observed_at, use_at, use_at.0, None);
+    assert_eq!(response.frontier, observed_at.0);
+    assert_eq!(
+        path_063_evaluate(observation, Some(&response), pinned, use_at, PATH_063_A),
+        Path061UseVerdict::Unresolved,
+    );
+}
+
+#[test]
+fn path_063_b_authenticated_frontier_from_stale_source_is_indistinguishable() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    // World Q: no change; source current.
+    let world_q = Path061World::new(&[(10, 3)]);
+    let issuer_q = path_063_issuer(Path063Source::current(), Path063FrontierReport::AnswerBoundary);
+
+    // World L: epoch 4 at 105; same trusted issuer and key, but its source
+    // is frozen at O and it reports the boundary at which it answers.
+    let world_l = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer_l = path_063_issuer(
+        Path063Source::frozen_at(observed_at.0),
+        Path063FrontierReport::AnswerBoundary,
+    );
+
+    let response_q = path_063_respond(&issuer_q, &world_q, observed_at, use_at, use_at.0, None);
+    let response_l = path_063_respond(&issuer_l, &world_l, observed_at, use_at, use_at.0, None);
+
+    let visible_q = (path_061_truthful_observation(&world_q, observed_at), response_q, use_at);
+    let visible_l = (path_061_truthful_observation(&world_l, observed_at), response_l, use_at);
+    assert_eq!(visible_q, visible_l);
+    assert_eq!(visible_l.1.frontier, use_at.0);
+
+    assert!(path_063_oracle_producer_invariant_holds(&world_q, &issuer_q, &visible_q.1));
+    assert!(!path_063_oracle_producer_invariant_holds(&world_l, &issuer_l, &visible_l.1));
+
+    let verdict_q = path_063_evaluate(visible_q.0, Some(&visible_q.1), pinned, use_at, PATH_063_A);
+    let verdict_l = path_063_evaluate(visible_l.0, Some(&visible_l.1), pinned, use_at, PATH_063_A);
+    assert_eq!(verdict_q, verdict_l);
+    assert!(path_061_verdict_is_sound(verdict_q, &world_q, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_l, &world_l, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate B — contiguous visible record ids
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_063_c_contiguous_record_ids_do_not_expose_a_never_ingested_event() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    // World K: epoch 4 at 102 only; source complete.
+    let world_k = Path061World::new(&[(10, 3), (102, 4)]);
+    let issuer_k = path_063_issuer(Path063Source::current(), Path063FrontierReport::SourceView);
+
+    // World D: epoch 4 at 102 and epoch 5 at 105; event 105 never entered
+    // the source. The source honestly reports its own (unbounded) view.
+    let world_d = Path061World::new(&[(10, 3), (102, 4), (105, 5)]);
+    let issuer_d = path_063_issuer(Path063Source::lossy(&[105]), Path063FrontierReport::SourceView);
+
+    let response_k = path_063_respond(&issuer_k, &world_k, observed_at, use_at, use_at.0, None);
+    let response_d = path_063_respond(&issuer_d, &world_d, observed_at, use_at, use_at.0, None);
+
+    // Records 501.. with no visible gap in either world.
+    assert!(path_063_records_contiguous(&response_d));
+    assert_eq!(response_d.records.len(), 1);
+    assert_eq!(response_d.records[0].record_id, 501);
+
+    let visible_k = (path_061_truthful_observation(&world_k, observed_at), response_k, use_at);
+    let visible_d = (path_061_truthful_observation(&world_d, observed_at), response_d, use_at);
+    assert_eq!(visible_k, visible_d);
+
+    let verdict_k = path_063_evaluate(visible_k.0, Some(&visible_k.1), pinned, use_at, PATH_063_B);
+    let verdict_d = path_063_evaluate(visible_d.0, Some(&visible_d.1), pinned, use_at, PATH_063_B);
+    assert_eq!(verdict_k, verdict_d);
+    assert_eq!(verdict_d, Path061UseVerdict::CurrentLatest(4));
+    assert!(path_061_verdict_is_sound(verdict_k, &world_k, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_d, &world_d, use_at));
+
+    // A visible gap IS detected: structural coverage is a real property.
+    let mut gapped = visible_k.1.clone();
+    gapped.records[0].record_id = 502;
+    gapped.tag = path_062_sign(PATH_063_AUTHORITY, path_063_digest(&gapped));
+    assert_eq!(
+        path_063_evaluate(visible_k.0, Some(&gapped), pinned, use_at, PATH_063_B),
+        Path061UseVerdict::Unresolved,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Candidate C — dense slot coverage
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_063_d_dense_slots_from_stale_source_are_indistinguishable() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    let world_q = Path061World::new(&[(10, 3)]);
+    let issuer_q = path_063_issuer(Path063Source::current(), Path063FrontierReport::AnswerBoundary);
+
+    let world_l = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer_l = path_063_issuer(
+        Path063Source::frozen_at(observed_at.0),
+        Path063FrontierReport::AnswerBoundary,
+    );
+
+    let response_q = path_063_respond(&issuer_q, &world_q, observed_at, use_at, use_at.0, None);
+    let response_l = path_063_respond(&issuer_l, &world_l, observed_at, use_at, use_at.0, None);
+
+    // Every slot in (O, U] has a record in both worlds.
+    assert!(path_063_slots_dense(&response_q, use_at));
+    assert!(path_063_slots_dense(&response_l, use_at));
+    assert_eq!(response_l.slots.len(), 10);
+
+    // Every slot record is true in Q; slot 105 is false in L.
+    assert!(response_q.slots.iter().all(|&s| path_063_oracle_slot_is_true(&world_q, s)));
+    let slot_105 = response_l.slots.iter().find(|s| s.sequence == 105).copied().unwrap();
+    assert_eq!(slot_105.content, Path063SlotContent::NoChange);
+    assert!(!path_063_oracle_slot_is_true(&world_l, slot_105));
+
+    let visible_q = (path_061_truthful_observation(&world_q, observed_at), response_q, use_at);
+    let visible_l = (path_061_truthful_observation(&world_l, observed_at), response_l, use_at);
+    assert_eq!(visible_q, visible_l);
+
+    let verdict_q = path_063_evaluate(visible_q.0, Some(&visible_q.1), pinned, use_at, PATH_063_C);
+    let verdict_l = path_063_evaluate(visible_l.0, Some(&visible_l.1), pinned, use_at, PATH_063_C);
+    assert_eq!(verdict_q, verdict_l);
+    assert!(path_061_verdict_is_sound(verdict_q, &world_q, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_l, &world_l, use_at));
+
+    // A missing slot IS detected.
+    let mut holed = visible_q.1.clone();
+    holed.slots.remove(4);
+    holed.tag = path_062_sign(PATH_063_AUTHORITY, path_063_digest(&holed));
+    assert_eq!(
+        path_063_evaluate(visible_q.0, Some(&holed), pinned, use_at, PATH_063_C),
+        Path061UseVerdict::Unresolved,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Candidate D — post-U challenge / fresh response
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_063_e_fresh_challenge_rejects_replay_but_not_stale_source() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    // Control: current source answers the post-U challenge.
+    let current = path_063_issuer(Path063Source::current(), Path063FrontierReport::AnswerBoundary);
+    let fresh = path_063_respond(
+        &current,
+        &world,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    let verdict = path_063_evaluate(observation, Some(&fresh), pinned, use_at, PATH_063_D);
+    assert_eq!(verdict, path_061_correct_verdict(&world, use_at));
+
+    // Replay: a genuine response bound to an earlier challenge (12).
+    let replayed = path_063_respond(&current, &world, observed_at, use_at, use_at.0, Some(12));
+    assert!(path_062_verify(
+        PATH_063_AUTHORITY.verifier(),
+        path_063_digest(&replayed),
+        replayed.tag,
+    ));
+    assert_eq!(
+        path_063_evaluate(observation, Some(&replayed), pinned, use_at, PATH_063_D),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Rebinding a genuine response to the new challenge breaks the tag.
+    let mut rebound = replayed.clone();
+    rebound.challenge = Some(PATH_063_CHALLENGE);
+    assert_eq!(
+        path_063_evaluate(observation, Some(&rebound), pinned, use_at, PATH_063_D),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Unbound response.
+    let unbound = path_063_respond(&current, &world, observed_at, use_at, use_at.0, None);
+    assert_eq!(
+        path_063_evaluate(observation, Some(&unbound), pinned, use_at, PATH_063_D),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Attack: a live issuer whose source is frozen at O answers the same
+    // fresh challenge correctly and reports stale world state.
+    let stale = path_063_issuer(
+        Path063Source::frozen_at(observed_at.0),
+        Path063FrontierReport::AnswerBoundary,
+    );
+    let live_stale = path_063_respond(
+        &stale,
+        &world,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    let verdict = path_063_evaluate(observation, Some(&live_stale), pinned, use_at, PATH_063_D);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate E — challenge + dense coverage + contiguous records + frontier
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_063_f_all_visible_mechanisms_combined_are_indistinguishable() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    // Same trusted root, same genuine issuer key, same frontier policy
+    // (honest report of the source's own view). Only the hidden source
+    // completeness differs.
+    let world_q = Path061World::new(&[(10, 3)]);
+    let issuer_q = path_063_issuer(Path063Source::lossy(&[]), Path063FrontierReport::SourceView);
+
+    let world_l = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer_l = path_063_issuer(Path063Source::lossy(&[105]), Path063FrontierReport::SourceView);
+
+    assert_eq!(issuer_q.key, issuer_l.key);
+    assert_eq!(issuer_q.report, issuer_l.report);
+    assert_eq!(issuer_q.source.view_through, issuer_l.source.view_through);
+    assert_ne!(issuer_q.source, issuer_l.source);
+
+    let response_q = path_063_respond(
+        &issuer_q,
+        &world_q,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    let response_l = path_063_respond(
+        &issuer_l,
+        &world_l,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+
+    // All visible mechanisms pass in both worlds.
+    for response in [&response_q, &response_l] {
+        assert!(path_062_verify(
+            PATH_063_AUTHORITY.verifier(),
+            path_063_digest(response),
+            response.tag,
+        ));
+        assert_eq!(response.challenge, Some(PATH_063_CHALLENGE));
+        assert!(response.frontier >= use_at.0);
+        assert!(path_063_records_contiguous(response));
+        assert!(path_063_slots_dense(response, use_at));
+        assert!(path_063_slots_agree_with_records(response));
+    }
+
+    assert!(path_063_oracle_source_complete_through(&world_q, &issuer_q.source, use_at.0));
+    assert!(!path_063_oracle_source_complete_through(&world_l, &issuer_l.source, use_at.0));
+
+    let visible_q = (
+        path_061_truthful_observation(&world_q, observed_at),
+        response_q,
+        pinned,
+        PATH_063_CHALLENGE,
+        use_at,
+    );
+    let visible_l = (
+        path_061_truthful_observation(&world_l, observed_at),
+        response_l,
+        pinned,
+        PATH_063_CHALLENGE,
+        use_at,
+    );
+    assert_eq!(visible_q, visible_l);
+    assert_ne!(
+        path_061_correct_verdict(&world_q, use_at),
+        path_061_correct_verdict(&world_l, use_at),
+    );
+
+    let verdict_q = path_063_evaluate(visible_q.0, Some(&visible_q.1), pinned, use_at, PATH_063_E);
+    let verdict_l = path_063_evaluate(visible_l.0, Some(&visible_l.1), pinned, use_at, PATH_063_E);
+    assert_eq!(verdict_q, verdict_l);
+    assert_eq!(verdict_l, Path061UseVerdict::CurrentLatest(3));
+    assert!(path_061_verdict_is_sound(verdict_q, &world_q, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_l, &world_l, use_at));
+
+    // The frozen-source variant (liveness-position frontier) fails E too.
+    let frozen = path_063_issuer(
+        Path063Source::frozen_at(observed_at.0),
+        Path063FrontierReport::AnswerBoundary,
+    );
+    let response = path_063_respond(
+        &frozen,
+        &world_l,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    assert_eq!(response, visible_q.1);
+}
+
+// ---------------------------------------------------------------------
+// Candidate F — conditional positive under the producer invariant
+// ---------------------------------------------------------------------
+
+fn path_063_f_cases() -> Vec<(Path061World, Path063Issuer)> {
+    let observed_at = 100;
+    let worlds = [
+        Path061World::new(&[(10, 3)]),
+        Path061World::new(&[(10, 3), (101, 4)]),
+        Path061World::new(&[(10, 3), (105, 4)]),
+        Path061World::new(&[(10, 3), (110, 4)]),
+        Path061World::new(&[(10, 3), (103, 4), (108, 5)]),
+        Path061World::new(&[(10, 3), (111, 4)]),
+    ];
+    let sources = [
+        (Path063Source::current(), Path063FrontierReport::SourceView),
+        (Path063Source::current(), Path063FrontierReport::AnswerBoundary),
+        (Path063Source::frozen_at(observed_at), Path063FrontierReport::SourceView),
+        (Path063Source::frozen_at(observed_at), Path063FrontierReport::AnswerBoundary),
+        (Path063Source::frozen_at(105), Path063FrontierReport::SourceView),
+        (Path063Source::lossy(&[105]), Path063FrontierReport::SourceView),
+        (Path063Source::lossy(&[103, 108]), Path063FrontierReport::SourceView),
+    ];
+    let mut cases = Vec::new();
+    for world in &worlds {
+        for (source, report) in &sources {
+            cases.push((world.clone(), path_063_issuer(source.clone(), *report)));
+        }
+    }
+    cases
+}
+
+#[test]
+fn path_063_g_sound_under_the_producer_invariant() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    let mut held = 0;
+    let mut committed = 0;
+    for (world, issuer) in path_063_f_cases() {
+        let observation = path_061_truthful_observation(&world, observed_at);
+        let response = path_063_respond(
+            &issuer,
+            &world,
+            observed_at,
+            use_at,
+            use_at.0,
+            Some(PATH_063_CHALLENGE),
+        );
+        if !path_063_oracle_producer_invariant_holds(&world, &issuer, &response) {
+            continue;
+        }
+        held += 1;
+        let verdict = path_063_evaluate(observation, Some(&response), pinned, use_at, PATH_063_E);
+        assert!(path_061_verdict_is_sound(verdict, &world, use_at));
+        if verdict != Path061UseVerdict::Unresolved {
+            committed += 1;
+            assert_eq!(verdict, path_061_correct_verdict(&world, use_at));
+        }
+    }
+    // The invariant holds in a non-trivial set, including frozen sources
+    // that report their own position (frontier < U, hence Unresolved).
+    assert!(held > 12);
+    assert!(committed >= 12);
+}
+
+#[test]
+fn path_063_h_candidate_does_not_derive_the_producer_invariant() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let pinned = Some(PATH_063_AUTHORITY.verifier());
+
+    let mut violated_and_accepted = 0;
+    for (world, issuer) in path_063_f_cases() {
+        let observation = path_061_truthful_observation(&world, observed_at);
+        let response = path_063_respond(
+            &issuer,
+            &world,
+            observed_at,
+            use_at,
+            use_at.0,
+            Some(PATH_063_CHALLENGE),
+        );
+        let verdict = path_063_evaluate(observation, Some(&response), pinned, use_at, PATH_063_E);
+        if verdict == Path061UseVerdict::Unresolved {
+            continue;
+        }
+        let invariant = path_063_oracle_producer_invariant_holds(&world, &issuer, &response);
+        // Whenever the candidate commits, it is sound exactly when the
+        // hidden producer invariant holds.
+        assert_eq!(path_061_verdict_is_sound(verdict, &world, use_at), invariant);
+        if !invariant {
+            violated_and_accepted += 1;
+        }
+    }
+    assert!(violated_and_accepted > 0);
+
+    // The same visible token is admitted with and without the invariant.
+    let world_ok = Path061World::new(&[(10, 3)]);
+    let issuer_ok = path_063_issuer(Path063Source::current(), Path063FrontierReport::SourceView);
+    let world_bad = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer_bad =
+        path_063_issuer(Path063Source::lossy(&[105]), Path063FrontierReport::SourceView);
+
+    let token_ok = path_063_respond(
+        &issuer_ok,
+        &world_ok,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    let token_bad = path_063_respond(
+        &issuer_bad,
+        &world_bad,
+        observed_at,
+        use_at,
+        use_at.0,
+        Some(PATH_063_CHALLENGE),
+    );
+    assert_eq!(token_ok, token_bad);
+    assert!(path_063_oracle_producer_invariant_holds(&world_ok, &issuer_ok, &token_ok));
+    assert!(!path_063_oracle_producer_invariant_holds(&world_bad, &issuer_bad, &token_bad));
+
+    // Honest self-reporting does not enforce the invariant: issuer_bad
+    // reports exactly its source's own view, and its loss is unknown to it.
+    assert_eq!(issuer_bad.report, Path063FrontierReport::SourceView);
+    assert_eq!(token_bad.frontier, issuer_bad.source.view_through.min(use_at.0));
+}
