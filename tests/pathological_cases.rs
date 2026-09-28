@@ -23619,3 +23619,1049 @@ fn path_061_h_forged_complete_looking_witness_relocates_the_truth_boundary() {
         Path061UseVerdict::CurrentLatest(3),
     );
 }
+
+// =====================================================================
+// PATH-062 — AUTHENTICATED WITNESS / TRUST-ROOT BOUNDARY
+// =====================================================================
+//
+// FIND-039 showed that a genuine interval-complete witness over (O, U]
+// adds the temporal information needed for use-time latestness, but a
+// forged witness with the same visible shape makes the candidate wrong.
+//
+// PATH-062 asks whether visible integrity / authentication structure can
+// make witness authenticity and interval completeness candidate-visible
+// without another exogenous trust assumption.
+//
+// H33 (predeclared):
+// Self-contained integrity or authentication metadata cannot establish the
+// authenticity of an interval witness when an attacker can reproduce or
+// substitute all candidate-visible trust material. An external pinned root
+// may establish "authenticated under that root", conditional on the root.
+// Authenticated issuer origin does not by itself establish interval
+// completeness unless the model separately grants that property.
+//
+// Properties kept separate:
+// - byte integrity: the body matches its digest
+// - structural consistency: links / ranges / ordering are well formed
+// - issuer authenticity: the holder of key K produced the tag
+// - root trust: K is the key of the authority the candidate should trust
+// - semantic truth / interval completeness: every authoritative
+//   transition in (O, U] is listed
+// - use-time latestness: the verdict names the latest epoch at U
+//
+// Reuses the PATH-061 world, observation, witness body, verdict, and
+// Candidate C latestness rule. PATH-062 candidates only gate whether the
+// PATH-061 rule is applied.
+//
+// TEST-LOCAL PRIMITIVES, NOT CRYPTOGRAPHY:
+// - `path_062_digest` is a public, keyless FNV-1a style mix. Anyone can
+//   compute it. It models accidental-mutation detection only. No collision
+//   resistance is claimed or needed: attacks below recompute it honestly.
+// - `path_062_sign` / `path_062_verify` are a transparent, trivially
+//   forgeable mix. The ONLY modeled security assumption is idealized
+//   unforgeability: a tag with `key_id == k` is constructed only by the
+//   holder of `Path062SigningKey { id: k }`. Every attacker in these tests
+//   calls `path_062_sign` only with keys it holds. No signature, PKI, or
+//   key-management property is claimed.
+
+const PATH_062_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const PATH_062_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const PATH_062_SEAL_DOMAIN: u64 = 0x5345_414c;
+const PATH_062_TAG_DOMAIN: u64 = 0x5441_4721;
+
+fn path_062_mix(state: u64, word: u64) -> u64 {
+    let mut state = state;
+    for byte in word.to_le_bytes() {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(PATH_062_FNV_PRIME);
+    }
+    state
+}
+
+fn path_062_digest(witness: &Path061IntervalWitness) -> u64 {
+    let mut state = PATH_062_FNV_OFFSET;
+    state = path_062_mix(state, witness.from.0);
+    state = path_062_mix(state, witness.complete_through);
+    state = path_062_mix(state, witness.transitions.len() as u64);
+    for transition in &witness.transitions {
+        state = path_062_mix(state, transition.sequence);
+        state = path_062_mix(state, transition.epoch);
+    }
+    state
+}
+
+// ---------------------------------------------------------------------
+// Candidate A — self-hashed witness
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path062SelfHashedWitness {
+    body: Path061IntervalWitness,
+    digest: u64,
+}
+
+// Public construction: the honest producer and any forger use the same
+// function, because the digest is keyless.
+fn path_062_self_hash(body: Path061IntervalWitness) -> Path062SelfHashedWitness {
+    let digest = path_062_digest(&body);
+    Path062SelfHashedWitness { body, digest }
+}
+
+fn path_062_candidate_a_self_hashed(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path062SelfHashedWitness>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let Some(witness) = witness else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if path_062_digest(&witness.body) != witness.digest {
+        return Path061UseVerdict::Unresolved;
+    }
+    path_061_candidate_c_interval_witness(observation, Some(&witness.body), use_at)
+}
+
+#[test]
+fn path_062_a_self_digest_detects_accidental_mutation() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let genuine =
+        path_062_self_hash(path_061_genuine_interval_witness(&world, observed_at, use_at.0));
+    let verdict = path_062_candidate_a_self_hashed(observation, Some(&genuine), use_at);
+    assert_eq!(verdict, path_061_correct_verdict(&world, use_at));
+
+    // Accidental mutation in transit: the body changes, the digest does not.
+    let mut mutated = genuine.clone();
+    mutated.body.transitions.clear();
+    assert_ne!(path_062_digest(&mutated.body), mutated.digest);
+    assert_eq!(
+        path_062_candidate_a_self_hashed(observation, Some(&mutated), use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Byte integrity is a real, separate property: it is what this detects.
+}
+
+#[test]
+fn path_062_b_forger_recomputes_self_digest_indistinguishably() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    // World G: no change in (O, U]; the witness is genuine.
+    let world_g = Path061World::new(&[(10, 3)]);
+    let witness_g =
+        path_062_self_hash(path_061_genuine_interval_witness(&world_g, observed_at, use_at.0));
+
+    // World F: epoch 4 at 105; the forger omits it and recomputes the digest.
+    let world_f = Path061World::new(&[(10, 3), (105, 4)]);
+    let witness_f = path_062_self_hash(Path061IntervalWitness {
+        from: observed_at,
+        complete_through: use_at.0,
+        transitions: Vec::new(),
+    });
+    assert_eq!(path_062_digest(&witness_f.body), witness_f.digest);
+
+    let visible_g = (path_061_truthful_observation(&world_g, observed_at), witness_g, use_at);
+    let visible_f = (path_061_truthful_observation(&world_f, observed_at), witness_f, use_at);
+
+    // Identical candidate-visible input, including a matching digest.
+    assert_eq!(visible_g, visible_f);
+    assert_ne!(
+        path_061_correct_verdict(&world_g, use_at),
+        path_061_correct_verdict(&world_f, use_at),
+    );
+
+    let verdict_g = path_062_candidate_a_self_hashed(visible_g.0, Some(&visible_g.1), use_at);
+    let verdict_f = path_062_candidate_a_self_hashed(visible_f.0, Some(&visible_f.1), use_at);
+    assert_eq!(verdict_g, verdict_f);
+    assert!(path_061_verdict_is_sound(verdict_g, &world_g, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_f, &world_f, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate B — internally consistent, hash-linked witness
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062LinkedEntry {
+    transition: Path061Transition,
+    prev_link: u64,
+    link: u64,
+}
+
+// The chain is anchored to the observation (epoch at O), links every listed
+// transition to its predecessor, and seals the completeness claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path062LinkedWitness {
+    from: Path061ObservationBoundary,
+    anchor_epoch: u64,
+    anchor_link: u64,
+    entries: Vec<Path062LinkedEntry>,
+    complete_through: u64,
+    seal: u64,
+}
+
+fn path_062_anchor_link(from: Path061ObservationBoundary, anchor_epoch: u64) -> u64 {
+    path_062_mix(path_062_mix(PATH_062_FNV_OFFSET, from.0), anchor_epoch)
+}
+
+fn path_062_entry_link(prev_link: u64, transition: Path061Transition) -> u64 {
+    path_062_mix(path_062_mix(prev_link, transition.sequence), transition.epoch)
+}
+
+fn path_062_seal(last_link: u64, complete_through: u64) -> u64 {
+    path_062_mix(path_062_mix(last_link, complete_through), PATH_062_SEAL_DOMAIN)
+}
+
+// Public construction, used by both honest producer and forger.
+fn path_062_build_linked(
+    from: Path061ObservationBoundary,
+    anchor_epoch: u64,
+    transitions: &[Path061Transition],
+    complete_through: u64,
+) -> Path062LinkedWitness {
+    let anchor_link = path_062_anchor_link(from, anchor_epoch);
+    let mut prev_link = anchor_link;
+    let mut entries = Vec::new();
+    for &transition in transitions {
+        let link = path_062_entry_link(prev_link, transition);
+        entries.push(Path062LinkedEntry {
+            transition,
+            prev_link,
+            link,
+        });
+        prev_link = link;
+    }
+    Path062LinkedWitness {
+        from,
+        anchor_epoch,
+        anchor_link,
+        entries,
+        complete_through,
+        seal: path_062_seal(prev_link, complete_through),
+    }
+}
+
+fn path_062_genuine_linked(
+    world: &Path061World,
+    from: Path061ObservationBoundary,
+    complete_through: u64,
+) -> Path062LinkedWitness {
+    let body = path_061_genuine_interval_witness(world, from, complete_through);
+    path_062_build_linked(
+        from,
+        world.latest_at(from.0),
+        &body.transitions,
+        complete_through,
+    )
+}
+
+fn path_062_linked_is_structurally_consistent(witness: &Path062LinkedWitness) -> bool {
+    if witness.anchor_link != path_062_anchor_link(witness.from, witness.anchor_epoch) {
+        return false;
+    }
+    let mut prev_link = witness.anchor_link;
+    let mut prev_sequence = witness.from.0;
+    for entry in &witness.entries {
+        if entry.prev_link != prev_link
+            || entry.link != path_062_entry_link(prev_link, entry.transition)
+            || entry.transition.sequence <= prev_sequence
+            || entry.transition.sequence > witness.complete_through
+        {
+            return false;
+        }
+        prev_link = entry.link;
+        prev_sequence = entry.transition.sequence;
+    }
+    witness.seal == path_062_seal(prev_link, witness.complete_through)
+}
+
+fn path_062_candidate_b_linked(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path062LinkedWitness>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let Some(witness) = witness else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if !path_062_linked_is_structurally_consistent(witness)
+        || witness.anchor_epoch != observation.epoch
+    {
+        return Path061UseVerdict::Unresolved;
+    }
+    let body = Path061IntervalWitness {
+        from: witness.from,
+        complete_through: witness.complete_through,
+        transitions: witness.entries.iter().map(|e| e.transition).collect(),
+    };
+    path_061_candidate_c_interval_witness(observation, Some(&body), use_at)
+}
+
+#[test]
+fn path_062_c_hash_chain_detects_mutation_and_truncation() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3), (104, 4), (107, 5)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let genuine = path_062_genuine_linked(&world, observed_at, use_at.0);
+    assert!(path_062_linked_is_structurally_consistent(&genuine));
+    assert_eq!(
+        path_062_candidate_b_linked(observation, Some(&genuine), use_at),
+        path_061_correct_verdict(&world, use_at),
+    );
+
+    // Mutate one entry without relinking.
+    let mut mutated = genuine.clone();
+    mutated.entries[0].transition.epoch = 9;
+    assert!(!path_062_linked_is_structurally_consistent(&mutated));
+
+    // Drop the last entry without resealing.
+    let mut truncated = genuine.clone();
+    truncated.entries.pop();
+    assert!(!path_062_linked_is_structurally_consistent(&truncated));
+
+    // Wrong anchor for the observation.
+    let mut reanchored = genuine.clone();
+    reanchored.anchor_epoch = 2;
+    assert!(!path_062_linked_is_structurally_consistent(&reanchored));
+
+    for broken in [&mutated, &truncated, &reanchored] {
+        assert_eq!(
+            path_062_candidate_b_linked(observation, Some(broken), use_at),
+            Path061UseVerdict::Unresolved,
+        );
+    }
+}
+
+#[test]
+fn path_062_d_fabricated_self_consistent_chain_is_indistinguishable() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+
+    let world_g = Path061World::new(&[(10, 3)]);
+    let witness_g = path_062_genuine_linked(&world_g, observed_at, use_at.0);
+
+    // World F: epoch 4 at 105. The forger fabricates an entire alternative
+    // history from the public anchor, omitting 105, and links and seals it.
+    let world_f = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation_f = path_061_truthful_observation(&world_f, observed_at);
+    let witness_f = path_062_build_linked(observed_at, observation_f.epoch, &[], use_at.0);
+    assert!(path_062_linked_is_structurally_consistent(&witness_f));
+    assert_ne!(witness_f, path_062_genuine_linked(&world_f, observed_at, use_at.0));
+
+    let visible_g = (path_061_truthful_observation(&world_g, observed_at), witness_g, use_at);
+    let visible_f = (observation_f, witness_f, use_at);
+    assert_eq!(visible_g, visible_f);
+
+    let verdict_g = path_062_candidate_b_linked(visible_g.0, Some(&visible_g.1), use_at);
+    let verdict_f = path_062_candidate_b_linked(visible_f.0, Some(&visible_f.1), use_at);
+    assert_eq!(verdict_g, verdict_f);
+    assert!(path_061_verdict_is_sound(verdict_g, &world_g, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_f, &world_f, use_at));
+
+    // Invented history is also self-consistent: epoch 4 that never occurred.
+    let invented = path_062_build_linked(
+        observed_at,
+        3,
+        &[Path061Transition {
+            sequence: 106,
+            epoch: 4,
+        }],
+        use_at.0,
+    );
+    let verdict = path_062_candidate_b_linked(visible_g.0, Some(&invented), use_at);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(4));
+    assert!(!path_061_verdict_is_sound(verdict, &world_g, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate C — self-contained authentication material
+// ---------------------------------------------------------------------
+
+// Holding this value is the capability to sign under `id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062SigningKey {
+    id: u64,
+}
+
+// Public verification identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062VerifierId(u64);
+
+impl Path062SigningKey {
+    fn verifier(self) -> Path062VerifierId {
+        Path062VerifierId(self.id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062Tag {
+    key_id: u64,
+    value: u64,
+}
+
+fn path_062_tag_value(key_id: u64, digest: u64) -> u64 {
+    path_062_mix(
+        path_062_mix(path_062_mix(PATH_062_FNV_OFFSET, PATH_062_TAG_DOMAIN), key_id),
+        digest,
+    )
+}
+
+fn path_062_sign(key: Path062SigningKey, digest: u64) -> Path062Tag {
+    Path062Tag {
+        key_id: key.id,
+        value: path_062_tag_value(key.id, digest),
+    }
+}
+
+// Under the idealized-unforgeability assumption above, `true` means: the
+// holder of key `verifier` produced `tag` over `digest`. Nothing more.
+fn path_062_verify(verifier: Path062VerifierId, digest: u64, tag: Path062Tag) -> bool {
+    tag.key_id == verifier.0 && tag.value == path_062_tag_value(verifier.0, digest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path062AuthenticatedWitness {
+    body: Path061IntervalWitness,
+    digest: u64,
+    claimed_verifier: Path062VerifierId,
+    tag: Path062Tag,
+}
+
+fn path_062_authenticate(
+    key: Path062SigningKey,
+    body: Path061IntervalWitness,
+) -> Path062AuthenticatedWitness {
+    let digest = path_062_digest(&body);
+    Path062AuthenticatedWitness {
+        body,
+        digest,
+        claimed_verifier: key.verifier(),
+        tag: path_062_sign(key, digest),
+    }
+}
+
+fn path_062_witness_authenticates_under(
+    witness: &Path062AuthenticatedWitness,
+    verifier: Path062VerifierId,
+) -> bool {
+    path_062_digest(&witness.body) == witness.digest
+        && path_062_verify(verifier, witness.digest, witness.tag)
+}
+
+// Verifies the witness against the verifier identity the witness carries.
+fn path_062_candidate_c_self_authenticated(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path062AuthenticatedWitness>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let Some(witness) = witness else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if !path_062_witness_authenticates_under(witness, witness.claimed_verifier) {
+        return Path061UseVerdict::Unresolved;
+    }
+    path_061_candidate_c_interval_witness(observation, Some(&witness.body), use_at)
+}
+
+#[test]
+fn path_062_e_self_carried_verifier_accepts_attacker_signed_forgery() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let authority = Path062SigningKey { id: 0xA11CE };
+    let attacker = Path062SigningKey { id: 0xBAD };
+
+    let genuine = path_062_authenticate(
+        authority,
+        path_061_genuine_interval_witness(&world, observed_at, use_at.0),
+    );
+    let verdict = path_062_candidate_c_self_authenticated(observation, Some(&genuine), use_at);
+    assert!(path_061_verdict_is_sound(verdict, &world, use_at));
+    assert!(matches!(verdict, Path061UseVerdict::CurrentLatest(_)));
+
+    // Tampering with the body under the authority's tag is detected.
+    let mut tampered = genuine.clone();
+    tampered.body.transitions.clear();
+    tampered.digest = path_062_digest(&tampered.body);
+    assert_eq!(
+        path_062_candidate_c_self_authenticated(observation, Some(&tampered), use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // The attacker substitutes body, digest, tag, AND carried verifier. It
+    // uses only its own key; no unforgeability assumption is violated.
+    let forged = path_062_authenticate(
+        attacker,
+        Path061IntervalWitness {
+            from: observed_at,
+            complete_through: use_at.0,
+            transitions: Vec::new(),
+        },
+    );
+    assert!(path_062_witness_authenticates_under(&forged, forged.claimed_verifier));
+    assert!(!path_062_witness_authenticates_under(&forged, authority.verifier()));
+
+    let verdict = path_062_candidate_c_self_authenticated(observation, Some(&forged), use_at);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
+}
+
+// Ground truth only: which key belongs to the authority the candidate
+// should trust in this world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062TrustedAuthority {
+    key: Path062SigningKey,
+}
+
+#[test]
+fn path_062_f_carried_key_identity_does_not_identify_the_trusted_authority() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let key_k = Path062SigningKey { id: 0x4B };
+
+    // World G: K is the authority's key; the witness is genuine.
+    let world_g = Path061World::new(&[(10, 3)]);
+    let authority_g = Path062TrustedAuthority { key: key_k };
+    let witness_g = path_062_authenticate(
+        authority_g.key,
+        path_061_genuine_interval_witness(&world_g, observed_at, use_at.0),
+    );
+
+    // World F: the authority holds a different key; the attacker holds K
+    // and signs a witness omitting epoch 4 at 105.
+    let world_f = Path061World::new(&[(10, 3), (105, 4)]);
+    let authority_f = Path062TrustedAuthority {
+        key: Path062SigningKey { id: 0x99 },
+    };
+    let attacker_f = key_k;
+    let witness_f = path_062_authenticate(
+        attacker_f,
+        Path061IntervalWitness {
+            from: observed_at,
+            complete_through: use_at.0,
+            transitions: Vec::new(),
+        },
+    );
+
+    let visible_g = (path_061_truthful_observation(&world_g, observed_at), witness_g, use_at);
+    let visible_f = (path_061_truthful_observation(&world_f, observed_at), witness_f, use_at);
+
+    // Identical, validly authenticated candidate-visible input.
+    assert_eq!(visible_g, visible_f);
+    assert_ne!(authority_g, authority_f);
+
+    let verdict_g =
+        path_062_candidate_c_self_authenticated(visible_g.0, Some(&visible_g.1), use_at);
+    let verdict_f =
+        path_062_candidate_c_self_authenticated(visible_f.0, Some(&visible_f.1), use_at);
+    assert_eq!(verdict_g, verdict_f);
+    assert!(path_061_verdict_is_sound(verdict_g, &world_g, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_f, &world_f, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate D — externally pinned trust root
+// ---------------------------------------------------------------------
+
+// `pinned` is supplied independently of the witness. The candidate treats
+// it as given; nothing in the witness can authenticate it.
+fn path_062_candidate_d_pinned_root(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path062AuthenticatedWitness>,
+    pinned: Option<Path062VerifierId>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let (Some(witness), Some(pinned)) = (witness, pinned) else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if witness.claimed_verifier != pinned
+        || !path_062_witness_authenticates_under(witness, pinned)
+    {
+        return Path061UseVerdict::Unresolved;
+    }
+    path_061_candidate_c_interval_witness(observation, Some(&witness.body), use_at)
+}
+
+#[test]
+fn path_062_g_pinned_root_accepts_genuine_and_rejects_foreign_or_missing() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let authority = Path062SigningKey { id: 0xA11CE };
+    let attacker = Path062SigningKey { id: 0xBAD };
+    let pinned = Some(authority.verifier());
+
+    let genuine = path_062_authenticate(
+        authority,
+        path_061_genuine_interval_witness(&world, observed_at, use_at.0),
+    );
+    let forged_body = Path061IntervalWitness {
+        from: observed_at,
+        complete_through: use_at.0,
+        transitions: Vec::new(),
+    };
+
+    // Genuine witness + trusted pinned root.
+    let verdict = path_062_candidate_d_pinned_root(observation, Some(&genuine), pinned, use_at);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(4));
+    assert!(path_061_verdict_is_sound(verdict, &world, use_at));
+
+    // Forgery signed by the attacker's own key.
+    let foreign = path_062_authenticate(attacker, forged_body.clone());
+    assert_eq!(
+        path_062_candidate_d_pinned_root(observation, Some(&foreign), pinned, use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Forgery claiming the pinned identity, tagged by the attacker's key.
+    let mut impersonating = path_062_authenticate(attacker, forged_body.clone());
+    impersonating.claimed_verifier = authority.verifier();
+    assert_eq!(
+        path_062_candidate_d_pinned_root(observation, Some(&impersonating), pinned, use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Genuine tag replayed over a substituted body.
+    let mut spliced = genuine.clone();
+    spliced.body = forged_body;
+    spliced.digest = path_062_digest(&spliced.body);
+    assert_eq!(
+        path_062_candidate_d_pinned_root(observation, Some(&spliced), pinned, use_at),
+        Path061UseVerdict::Unresolved,
+    );
+
+    // Missing root: the witness here is genuine, so Unresolved means
+    // "authentication unavailable", not "forged".
+    assert_eq!(
+        path_062_candidate_d_pinned_root(observation, Some(&genuine), None, use_at),
+        Path061UseVerdict::Unresolved,
+    );
+}
+
+// Ground truth only: whether the independently supplied root is the real
+// authority's verifier or was substituted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path062RootReality {
+    Trusted,
+    Substituted,
+}
+
+#[test]
+fn path_062_h_substituted_root_is_indistinguishable_from_trusted_root() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let key_k = Path062SigningKey { id: 0x4B };
+
+    // World T: pinned root K is the authority's; the witness is genuine.
+    let world_t = Path061World::new(&[(10, 3)]);
+    let witness_t = path_062_authenticate(
+        key_k,
+        path_061_genuine_interval_witness(&world_t, observed_at, use_at.0),
+    );
+    let root_t = Path062RootReality::Trusted;
+
+    // World S: the pin was substituted with the attacker's K; the attacker
+    // signs a witness omitting epoch 4 at 105.
+    let world_s = Path061World::new(&[(10, 3), (105, 4)]);
+    let witness_s = path_062_authenticate(
+        key_k,
+        Path061IntervalWitness {
+            from: observed_at,
+            complete_through: use_at.0,
+            transitions: Vec::new(),
+        },
+    );
+    let root_s = Path062RootReality::Substituted;
+
+    let visible_t = (
+        path_061_truthful_observation(&world_t, observed_at),
+        witness_t,
+        Some(key_k.verifier()),
+        use_at,
+    );
+    let visible_s = (
+        path_061_truthful_observation(&world_s, observed_at),
+        witness_s,
+        Some(key_k.verifier()),
+        use_at,
+    );
+
+    assert_eq!(visible_t, visible_s);
+    assert_ne!(root_t, root_s);
+
+    let verdict_t =
+        path_062_candidate_d_pinned_root(visible_t.0, Some(&visible_t.1), visible_t.2, use_at);
+    let verdict_s =
+        path_062_candidate_d_pinned_root(visible_s.0, Some(&visible_s.1), visible_s.2, use_at);
+    assert_eq!(verdict_t, verdict_s);
+    assert!(path_061_verdict_is_sound(verdict_t, &world_t, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_s, &world_s, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate E — authentic but incomplete witness
+// ---------------------------------------------------------------------
+
+// An honest issuer signs exactly what its read source shows it, and claims
+// completeness through `claim_through`. Its read source (PATH-061 model) is
+// ground truth only: a frozen source makes the claim false without making
+// the issuer dishonest about origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062HonestIssuer {
+    key: Path062SigningKey,
+    source: Path061ReadSource,
+}
+
+fn path_062_issue(
+    issuer: Path062HonestIssuer,
+    world: &Path061World,
+    from: Path061ObservationBoundary,
+    claim_through: u64,
+) -> Path062AuthenticatedWitness {
+    let seen_through = match issuer.source {
+        Path061ReadSource::CurrentThroughRead => claim_through,
+        Path061ReadSource::FrozenAt(sequence) => sequence.min(claim_through),
+    };
+    let mut body = path_061_genuine_interval_witness(world, from, seen_through);
+    body.complete_through = claim_through;
+    path_062_authenticate(issuer.key, body)
+}
+
+// Ground truth only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path062IntervalCompleteness {
+    Complete,
+    Incomplete,
+}
+
+fn path_062_oracle_completeness(
+    world: &Path061World,
+    witness: &Path061IntervalWitness,
+) -> Path062IntervalCompleteness {
+    let truth = path_061_genuine_interval_witness(world, witness.from, witness.complete_through);
+    if truth == *witness {
+        Path062IntervalCompleteness::Complete
+    } else {
+        Path062IntervalCompleteness::Incomplete
+    }
+}
+
+#[test]
+fn path_062_i_authentic_but_incomplete_witness_is_indistinguishable() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let authority = Path062SigningKey { id: 0xA11CE };
+    let pinned = Some(authority.verifier());
+
+    // World Q: no change; the authority's source is current.
+    let world_q = Path061World::new(&[(10, 3)]);
+    let issuer_q = Path062HonestIssuer {
+        key: authority,
+        source: Path061ReadSource::CurrentThroughRead,
+    };
+    let witness_q = path_062_issue(issuer_q, &world_q, observed_at, use_at.0);
+
+    // World L: epoch 4 at 105; the same authority, same key, but its
+    // source lags at O. It honestly signs what it sees and claims through U.
+    let world_l = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer_l = Path062HonestIssuer {
+        key: authority,
+        source: Path061ReadSource::FrozenAt(observed_at.0),
+    };
+    let witness_l = path_062_issue(issuer_l, &world_l, observed_at, use_at.0);
+
+    // Both are authentic under the genuinely trusted pinned root.
+    assert!(path_062_witness_authenticates_under(&witness_q, authority.verifier()));
+    assert!(path_062_witness_authenticates_under(&witness_l, authority.verifier()));
+
+    // Origin is genuine in both worlds; completeness differs.
+    assert_eq!(
+        path_062_oracle_completeness(&world_q, &witness_q.body),
+        Path062IntervalCompleteness::Complete,
+    );
+    assert_eq!(
+        path_062_oracle_completeness(&world_l, &witness_l.body),
+        Path062IntervalCompleteness::Incomplete,
+    );
+
+    let visible_q = (
+        path_061_truthful_observation(&world_q, observed_at),
+        witness_q,
+        pinned,
+        use_at,
+    );
+    let visible_l = (
+        path_061_truthful_observation(&world_l, observed_at),
+        witness_l,
+        pinned,
+        use_at,
+    );
+
+    // Identical candidate-visible input, including a valid tag under a
+    // trusted root. No forger, no substituted root.
+    assert_eq!(visible_q, visible_l);
+    assert_ne!(
+        path_061_correct_verdict(&world_q, use_at),
+        path_061_correct_verdict(&world_l, use_at),
+    );
+
+    let verdict_q =
+        path_062_candidate_d_pinned_root(visible_q.0, Some(&visible_q.1), visible_q.2, use_at);
+    let verdict_l =
+        path_062_candidate_d_pinned_root(visible_l.0, Some(&visible_l.1), visible_l.2, use_at);
+    assert_eq!(verdict_q, verdict_l);
+    assert_eq!(verdict_l, Path061UseVerdict::CurrentLatest(3));
+    assert!(path_061_verdict_is_sound(verdict_q, &world_q, use_at));
+    assert!(!path_061_verdict_is_sound(verdict_l, &world_l, use_at));
+}
+
+// Attempt to strengthen E: require two independently pinned authorities to
+// produce authentic, agreeing witnesses.
+fn path_062_candidate_e_dual_pinned_agreement(
+    observation: Path061CurrentnessObservation,
+    witnesses: [Option<&Path062AuthenticatedWitness>; 2],
+    pinned: [Option<Path062VerifierId>; 2],
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let first = path_062_candidate_d_pinned_root(observation, witnesses[0], pinned[0], use_at);
+    let second = path_062_candidate_d_pinned_root(observation, witnesses[1], pinned[1], use_at);
+    let same_body = match witnesses {
+        [Some(a), Some(b)] => a.body == b.body,
+        _ => false,
+    };
+    if same_body && first == second {
+        first
+    } else {
+        Path061UseVerdict::Unresolved
+    }
+}
+
+#[test]
+fn path_062_j_agreeing_authenticated_issuers_share_incompleteness() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let observation = path_061_truthful_observation(&world, observed_at);
+
+    let key_a = Path062SigningKey { id: 0xA };
+    let key_b = Path062SigningKey { id: 0xB };
+    let pinned = [Some(key_a.verifier()), Some(key_b.verifier())];
+
+    // Both honest; both read the same upstream that lags at O.
+    let lagging = Path061ReadSource::FrozenAt(observed_at.0);
+    let witness_a = path_062_issue(
+        Path062HonestIssuer { key: key_a, source: lagging },
+        &world,
+        observed_at,
+        use_at.0,
+    );
+    let witness_b = path_062_issue(
+        Path062HonestIssuer { key: key_b, source: lagging },
+        &world,
+        observed_at,
+        use_at.0,
+    );
+
+    let verdict = path_062_candidate_e_dual_pinned_agreement(
+        observation,
+        [Some(&witness_a), Some(&witness_b)],
+        pinned,
+        use_at,
+    );
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
+
+    // With current sources, the same candidate is sound.
+    let current = Path061ReadSource::CurrentThroughRead;
+    let witness_a = path_062_issue(
+        Path062HonestIssuer { key: key_a, source: current },
+        &world,
+        observed_at,
+        use_at.0,
+    );
+    let witness_b = path_062_issue(
+        Path062HonestIssuer { key: key_b, source: current },
+        &world,
+        observed_at,
+        use_at.0,
+    );
+    let verdict = path_062_candidate_e_dual_pinned_agreement(
+        observation,
+        [Some(&witness_a), Some(&witness_b)],
+        pinned,
+        use_at,
+    );
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(4));
+    assert!(path_061_verdict_is_sound(verdict, &world, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate F — conditional positive control
+// ---------------------------------------------------------------------
+
+// Explicit, externally supplied grant: "the issuer behind `verifier` is
+// interval-complete through `through`". The candidate cannot check it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path062CompletenessGrant {
+    verifier: Path062VerifierId,
+    through: u64,
+}
+
+fn path_062_candidate_f_pinned_root_with_grant(
+    observation: Path061CurrentnessObservation,
+    witness: Option<&Path062AuthenticatedWitness>,
+    pinned: Option<Path062VerifierId>,
+    grant: Option<Path062CompletenessGrant>,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    let (Some(pinned), Some(grant)) = (pinned, grant) else {
+        return Path061UseVerdict::Unresolved;
+    };
+    if grant.verifier != pinned || grant.through < use_at.0 {
+        return Path061UseVerdict::Unresolved;
+    }
+    path_062_candidate_d_pinned_root(observation, witness, Some(pinned), use_at)
+}
+
+#[test]
+fn path_062_k_trusted_root_plus_granted_completeness_is_conditionally_sound() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let authority = Path062SigningKey { id: 0xA11CE };
+    let pinned = Some(authority.verifier());
+    let issuer = Path062HonestIssuer {
+        key: authority,
+        source: Path061ReadSource::CurrentThroughRead,
+    };
+    let grant = Some(Path062CompletenessGrant {
+        verifier: authority.verifier(),
+        through: use_at.0,
+    });
+
+    let worlds = [
+        Path061World::new(&[(10, 3)]),
+        Path061World::new(&[(10, 3), (101, 4)]),
+        Path061World::new(&[(10, 3), (105, 4)]),
+        Path061World::new(&[(10, 3), (110, 4)]),
+        Path061World::new(&[(10, 3), (103, 4), (108, 5)]),
+        Path061World::new(&[(10, 3), (111, 4)]),
+    ];
+
+    for world in &worlds {
+        let observation = path_061_truthful_observation(world, observed_at);
+        let witness = path_062_issue(issuer, world, observed_at, use_at.0);
+
+        // The assumptions hold in these worlds (checked by the oracle only).
+        assert_eq!(
+            path_062_oracle_completeness(world, &witness.body),
+            Path062IntervalCompleteness::Complete,
+        );
+
+        let verdict = path_062_candidate_f_pinned_root_with_grant(
+            observation,
+            Some(&witness),
+            pinned,
+            grant,
+            use_at,
+        );
+        assert_eq!(verdict, path_061_correct_verdict(world, use_at));
+
+        // Without the grant, the same authentic witness stays Unresolved.
+        assert_eq!(
+            path_062_candidate_f_pinned_root_with_grant(
+                observation,
+                Some(&witness),
+                pinned,
+                None,
+                use_at,
+            ),
+            Path061UseVerdict::Unresolved,
+        );
+
+        // A grant ending before U does not cover the use boundary.
+        let short = Some(Path062CompletenessGrant {
+            verifier: authority.verifier(),
+            through: use_at.0 - 1,
+        });
+        assert_eq!(
+            path_062_candidate_f_pinned_root_with_grant(
+                observation,
+                Some(&witness),
+                pinned,
+                short,
+                use_at,
+            ),
+            Path061UseVerdict::Unresolved,
+        );
+    }
+}
+
+#[test]
+fn path_062_l_completeness_grant_is_load_bearing_not_derived() {
+    let observed_at = Path061ObservationBoundary(100);
+    let use_at = Path061UseBoundary(110);
+    let authority = Path062SigningKey { id: 0xA11CE };
+    let pinned = Some(authority.verifier());
+    let grant = Some(Path062CompletenessGrant {
+        verifier: authority.verifier(),
+        through: use_at.0,
+    });
+
+    // The grant is false in this world: the authority's source lags.
+    let world = Path061World::new(&[(10, 3), (105, 4)]);
+    let issuer = Path062HonestIssuer {
+        key: authority,
+        source: Path061ReadSource::FrozenAt(observed_at.0),
+    };
+    let observation = path_061_truthful_observation(&world, observed_at);
+    let witness = path_062_issue(issuer, &world, observed_at, use_at.0);
+
+    assert!(path_062_witness_authenticates_under(&witness, authority.verifier()));
+    assert_eq!(
+        path_062_oracle_completeness(&world, &witness.body),
+        Path062IntervalCompleteness::Incomplete,
+    );
+
+    let verdict = path_062_candidate_f_pinned_root_with_grant(
+        observation,
+        Some(&witness),
+        pinned,
+        grant,
+        use_at,
+    );
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
+
+    // A substituted root with a matching grant for the attacker is also
+    // accepted: the grant is bound to whatever root is pinned.
+    let attacker = Path062SigningKey { id: 0xBAD };
+    let forged = path_062_authenticate(
+        attacker,
+        Path061IntervalWitness {
+            from: observed_at,
+            complete_through: use_at.0,
+            transitions: Vec::new(),
+        },
+    );
+    let verdict = path_062_candidate_f_pinned_root_with_grant(
+        observation,
+        Some(&forged),
+        Some(attacker.verifier()),
+        Some(Path062CompletenessGrant {
+            verifier: attacker.verifier(),
+            through: use_at.0,
+        }),
+        use_at,
+    );
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(!path_061_verdict_is_sound(verdict, &world, use_at));
+}
