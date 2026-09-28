@@ -25532,3 +25532,909 @@ fn path_063_h_candidate_does_not_derive_the_producer_invariant() {
     assert_eq!(issuer_bad.report, Path063FrontierReport::SourceView);
     assert_eq!(token_bad.frontier, issuer_bad.source.view_through.min(use_at.0));
 }
+
+// =====================================================================
+// PATH-064 — SINGLE AUTHORITATIVE WRITE PATH / STRUCTURAL COMPLETENESS
+// =====================================================================
+//
+// FIND-041 left one load-bearing producer invariant:
+//   issued frontier f => source contains every authoritative event <= f.
+//
+// PATH-064 asks whether that invariant can be discharged structurally by
+// making canonical source append the only way an event becomes
+// authoritative.
+//
+// H35 (predeclared):
+// If an event becomes authoritative ONLY by successfully entering a single
+// canonical source log, source completeness through its committed frontier
+// is structural rather than observational, and "frontier >= U" may suffice
+// for latestness without a separate completeness grant. This is conditional
+// on exclusivity and atomicity of the write path. If authoritative state can
+// be created before append, beside append, or through a bypass/fork, the old
+// completeness counterexample returns.
+//
+// Model vocabulary (kept distinct):
+// - PROPOSED event: in `proposals`; never authoritative by itself.
+// - COMMITTED event: a `Transition` entry in the canonical log.
+// - AUTHORITATIVE event: `path_064_oracle_authoritative`, defined PER
+//   ARCHITECTURE. This is the only place authority is defined.
+// - SOURCE FRONTIER: highest committed canonical sequence (transition or
+//   checkpoint entry).
+//
+// Each architecture is a transition system: `apply` rejects operations the
+// architecture does not have. "Unconstructible under this model" means no
+// accepted operation sequence reaches the state. Bounded exhaustive search
+// (`path_064_explore`) enumerates accepted sequences over a fixed alphabet.
+//
+// Reuses PATH-061 `Path061Transition`, `Path061World`, `Path061UseBoundary`,
+// `Path061UseVerdict`. No storage, network, consensus, or clock is modeled.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path064Architecture {
+    // A: authority arises in the world; the source append mirrors it later.
+    AuthorityBeforeAppend,
+    // B: append commits; a separate later step makes the entry authoritative.
+    AppendThenPromote,
+    // C / F: one atomic step commits and creates authority; monotone log.
+    AtomicCommit,
+    // F': atomic, but the log accepts appends below its frontier.
+    AtomicCommitWithBackfill,
+    // D: atomic canonical path plus a bypass path that creates authority.
+    AtomicCommitWithBypass,
+    // E: atomic canonical log plus a second authority-producing log.
+    TwoAuthorityLogs,
+    // G1: consumers treat an acknowledgement as authority; ACK may precede commit.
+    PreCommitAck,
+    // G2: acknowledgement is only issued for committed entries.
+    PostCommitAck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path064Op {
+    Propose { id: u8, sequence: u64, epoch: u64 },
+    DeclareWorld { id: u8, sequence: u64, epoch: u64 },
+    Append { id: u8 },
+    FailAppend { id: u8 },
+    Abort { id: u8 },
+    Promote { id: u8 },
+    Ack { id: u8 },
+    Checkpoint { sequence: u64 },
+    Bypass { sequence: u64, epoch: u64 },
+    ForkCommit { sequence: u64, epoch: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path064Entry {
+    Transition(Path061Transition),
+    Checkpoint(u64),
+}
+
+impl Path064Entry {
+    fn sequence(self) -> u64 {
+        match self {
+            Self::Transition(t) => t.sequence,
+            Self::Checkpoint(sequence) => sequence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Path064Rejected;
+
+// Candidate-visible: the canonical log and its frontier. Nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Path064Visible {
+    entries: Vec<Path064Entry>,
+    frontier: u64,
+}
+
+const PATH_064_GENESIS: Path061Transition = Path061Transition {
+    sequence: 10,
+    epoch: 3,
+};
+
+#[derive(Debug, Clone)]
+struct Path064System {
+    arch: Path064Architecture,
+    proposals: Vec<(u8, Path061Transition)>,
+    canonical: Vec<Path064Entry>,
+    committed_ids: Vec<(u8, Path061Transition)>,
+    // Oracle-only state. Which of these counts as authority depends on arch.
+    world: Vec<Path061Transition>,
+    promoted: Vec<Path061Transition>,
+    bypass: Vec<Path061Transition>,
+    fork: Vec<Path061Transition>,
+    acked: Vec<Path061Transition>,
+}
+
+impl Path064System {
+    fn new(arch: Path064Architecture) -> Self {
+        Self {
+            arch,
+            proposals: Vec::new(),
+            canonical: vec![Path064Entry::Transition(PATH_064_GENESIS)],
+            committed_ids: Vec::new(),
+            world: vec![PATH_064_GENESIS],
+            promoted: vec![PATH_064_GENESIS],
+            bypass: Vec::new(),
+            fork: Vec::new(),
+            acked: Vec::new(),
+        }
+    }
+
+    fn frontier(&self) -> u64 {
+        self.canonical
+            .iter()
+            .map(|e| e.sequence())
+            .max()
+            .expect("genesis entry")
+    }
+
+    fn can_place(&self, sequence: u64) -> bool {
+        match self.arch {
+            Path064Architecture::AtomicCommitWithBackfill => {
+                !self.canonical.iter().any(|e| e.sequence() == sequence)
+            }
+            _ => sequence > self.frontier(),
+        }
+    }
+
+    fn place(&mut self, entry: Path064Entry) {
+        self.canonical.push(entry);
+        self.canonical.sort_by_key(|e| e.sequence());
+    }
+
+    fn pending(&self, id: u8) -> Option<Path061Transition> {
+        self.proposals
+            .iter()
+            .find(|(pid, _)| *pid == id)
+            .map(|(_, t)| *t)
+    }
+
+    fn committed(&self, id: u8) -> Option<Path061Transition> {
+        self.committed_ids
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .map(|(_, t)| *t)
+    }
+
+    fn id_in_use(&self, id: u8) -> bool {
+        self.pending(id).is_some() || self.committed(id).is_some()
+    }
+
+    fn apply(&mut self, op: Path064Op) -> Result<(), Path064Rejected> {
+        use Path064Architecture as Arch;
+        let arch = self.arch;
+        match op {
+            Path064Op::Propose {
+                id,
+                sequence,
+                epoch,
+            } => {
+                if arch == Arch::AuthorityBeforeAppend || self.id_in_use(id) {
+                    return Err(Path064Rejected);
+                }
+                self.proposals
+                    .push((id, Path061Transition { sequence, epoch }));
+            }
+            Path064Op::DeclareWorld {
+                id,
+                sequence,
+                epoch,
+            } => {
+                if arch != Arch::AuthorityBeforeAppend || self.id_in_use(id) {
+                    return Err(Path064Rejected);
+                }
+                let transition = Path061Transition { sequence, epoch };
+                self.world.push(transition);
+                self.proposals.push((id, transition));
+            }
+            Path064Op::Append { id } => {
+                let Some(transition) = self.pending(id) else {
+                    return Err(Path064Rejected);
+                };
+                if !self.can_place(transition.sequence) {
+                    return Err(Path064Rejected);
+                }
+                self.proposals.retain(|(pid, _)| *pid != id);
+                self.committed_ids.push((id, transition));
+                self.place(Path064Entry::Transition(transition));
+            }
+            Path064Op::FailAppend { id } => {
+                if self.pending(id).is_none() {
+                    return Err(Path064Rejected);
+                }
+                // A failed append commits nothing and creates no authority.
+                // In A the mirror is lost; elsewhere the proposal may retry.
+                if arch == Arch::AuthorityBeforeAppend {
+                    self.proposals.retain(|(pid, _)| *pid != id);
+                }
+            }
+            Path064Op::Abort { id } => {
+                if arch == Arch::AuthorityBeforeAppend || self.pending(id).is_none() {
+                    return Err(Path064Rejected);
+                }
+                self.proposals.retain(|(pid, _)| *pid != id);
+            }
+            Path064Op::Promote { id } => {
+                if arch != Arch::AppendThenPromote {
+                    return Err(Path064Rejected);
+                }
+                let Some(transition) = self.committed(id) else {
+                    return Err(Path064Rejected);
+                };
+                if self.promoted.contains(&transition) {
+                    return Err(Path064Rejected);
+                }
+                self.promoted.push(transition);
+            }
+            Path064Op::Ack { id } => {
+                let transition = match arch {
+                    Arch::PreCommitAck => self.pending(id),
+                    Arch::PostCommitAck => self.committed(id),
+                    _ => None,
+                };
+                let Some(transition) = transition else {
+                    return Err(Path064Rejected);
+                };
+                if self.acked.contains(&transition) {
+                    return Err(Path064Rejected);
+                }
+                self.acked.push(transition);
+            }
+            Path064Op::Checkpoint { sequence } => {
+                if !self.can_place(sequence) {
+                    return Err(Path064Rejected);
+                }
+                self.place(Path064Entry::Checkpoint(sequence));
+            }
+            Path064Op::Bypass { sequence, epoch } => {
+                if arch != Arch::AtomicCommitWithBypass {
+                    return Err(Path064Rejected);
+                }
+                self.bypass.push(Path061Transition { sequence, epoch });
+            }
+            Path064Op::ForkCommit { sequence, epoch } => {
+                if arch != Arch::TwoAuthorityLogs {
+                    return Err(Path064Rejected);
+                }
+                self.fork.push(Path061Transition { sequence, epoch });
+            }
+        }
+        Ok(())
+    }
+
+    fn visible(&self) -> Path064Visible {
+        Path064Visible {
+            entries: self.canonical.clone(),
+            frontier: self.frontier(),
+        }
+    }
+
+    fn committed_transitions(&self) -> Vec<Path061Transition> {
+        self.canonical
+            .iter()
+            .filter_map(|e| match *e {
+                Path064Entry::Transition(t) => Some(t),
+                Path064Entry::Checkpoint(_) => None,
+            })
+            .collect()
+    }
+}
+
+fn path_064_union(a: Vec<Path061Transition>, b: &[Path061Transition]) -> Vec<Path061Transition> {
+    let mut out = a;
+    for t in b {
+        if !out.contains(t) {
+            out.push(*t);
+        }
+    }
+    out
+}
+
+// The single definition of authority, per architecture. Oracle-only.
+fn path_064_oracle_authoritative(sys: &Path064System) -> Vec<Path061Transition> {
+    use Path064Architecture as Arch;
+    let committed = sys.committed_transitions();
+    match sys.arch {
+        Arch::AuthorityBeforeAppend => sys.world.clone(),
+        Arch::AppendThenPromote => sys.promoted.clone(),
+        Arch::AtomicCommit | Arch::AtomicCommitWithBackfill => committed,
+        Arch::AtomicCommitWithBypass => path_064_union(committed, &sys.bypass),
+        Arch::TwoAuthorityLogs => path_064_union(committed, &sys.fork),
+        Arch::PreCommitAck | Arch::PostCommitAck => path_064_union(committed, &sys.acked),
+    }
+}
+
+// Direction "authoritative => committed" fails.
+fn path_064_oracle_hidden_authority(sys: &Path064System) -> bool {
+    let committed = sys.committed_transitions();
+    path_064_oracle_authoritative(sys)
+        .iter()
+        .any(|t| !committed.contains(t))
+}
+
+// Direction "committed => authoritative" fails.
+fn path_064_oracle_unauthorized_commit(sys: &Path064System) -> bool {
+    let authoritative = path_064_oracle_authoritative(sys);
+    sys.committed_transitions()
+        .iter()
+        .any(|t| !authoritative.contains(t))
+}
+
+fn path_064_oracle_latest(sys: &Path064System, use_at: Path061UseBoundary) -> u64 {
+    Path061World {
+        transitions: path_064_oracle_authoritative(sys),
+    }
+    .latest_at(use_at.0)
+}
+
+fn path_064_verdict_is_sound(
+    verdict: Path061UseVerdict,
+    sys: &Path064System,
+    use_at: Path061UseBoundary,
+) -> bool {
+    match verdict {
+        Path061UseVerdict::Unresolved => true,
+        Path061UseVerdict::CurrentLatest(epoch) => epoch == path_064_oracle_latest(sys, use_at),
+    }
+}
+
+// Candidate: sees only the canonical log. Commits iff frontier >= U.
+fn path_064_candidate_latest(
+    visible: &Path064Visible,
+    use_at: Path061UseBoundary,
+) -> Path061UseVerdict {
+    if visible.frontier < use_at.0 {
+        return Path061UseVerdict::Unresolved;
+    }
+    match visible
+        .entries
+        .iter()
+        .filter_map(|e| match *e {
+            Path064Entry::Transition(t) if t.sequence <= use_at.0 => Some(t),
+            _ => None,
+        })
+        .max_by_key(|t| t.sequence)
+    {
+        Some(t) => Path061UseVerdict::CurrentLatest(t.epoch),
+        None => Path061UseVerdict::Unresolved,
+    }
+}
+
+fn path_064_try(
+    arch: Path064Architecture,
+    ops: &[Path064Op],
+) -> Result<Path064System, (usize, Path064Op)> {
+    let mut sys = Path064System::new(arch);
+    for (index, &op) in ops.iter().enumerate() {
+        sys.apply(op).map_err(|_| (index, op))?;
+    }
+    Ok(sys)
+}
+
+fn path_064_run(arch: Path064Architecture, ops: &[Path064Op]) -> Path064System {
+    path_064_try(arch, ops).expect("operation sequence accepted by the architecture")
+}
+
+const PATH_064_USE: Path061UseBoundary = Path061UseBoundary(110);
+
+fn path_064_alphabet() -> Vec<Path064Op> {
+    use Path064Op::*;
+    vec![
+        Propose {
+            id: 1,
+            sequence: 105,
+            epoch: 4,
+        },
+        Propose {
+            id: 2,
+            sequence: 110,
+            epoch: 5,
+        },
+        Propose {
+            id: 3,
+            sequence: 115,
+            epoch: 6,
+        },
+        DeclareWorld {
+            id: 1,
+            sequence: 105,
+            epoch: 4,
+        },
+        Append { id: 1 },
+        Append { id: 2 },
+        Append { id: 3 },
+        FailAppend { id: 1 },
+        Abort { id: 1 },
+        Promote { id: 1 },
+        Ack { id: 1 },
+        Checkpoint { sequence: 110 },
+        Checkpoint { sequence: 120 },
+        Bypass {
+            sequence: 105,
+            epoch: 4,
+        },
+        ForkCommit {
+            sequence: 105,
+            epoch: 4,
+        },
+    ]
+}
+
+// Bounded exhaustive enumeration of accepted operation sequences.
+fn path_064_explore(
+    sys: &Path064System,
+    alphabet: &[Path064Op],
+    depth: usize,
+    path: &mut Vec<Path064Op>,
+    visit: &mut dyn FnMut(&[Path064Op], &Path064System),
+) {
+    visit(path, sys);
+    if depth == 0 {
+        return;
+    }
+    for &op in alphabet {
+        let mut next = sys.clone();
+        if next.apply(op).is_ok() {
+            path.push(op);
+            path_064_explore(&next, alphabet, depth - 1, path, visit);
+            path.pop();
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Path064Reachability {
+    states: usize,
+    hidden_authority: bool,
+    unauthorized_commit: bool,
+    unsound_commitment: bool,
+}
+
+fn path_064_reachability(arch: Path064Architecture, depth: usize) -> Path064Reachability {
+    let mut result = Path064Reachability::default();
+    let alphabet = path_064_alphabet();
+    path_064_explore(
+        &Path064System::new(arch),
+        &alphabet,
+        depth,
+        &mut Vec::new(),
+        &mut |_, sys| {
+            result.states += 1;
+            result.hidden_authority |= path_064_oracle_hidden_authority(sys);
+            result.unauthorized_commit |= path_064_oracle_unauthorized_commit(sys);
+            let verdict = path_064_candidate_latest(&sys.visible(), PATH_064_USE);
+            result.unsound_commitment |= !path_064_verdict_is_sound(verdict, sys, PATH_064_USE);
+        },
+    );
+    result
+}
+
+const PATH_064_DEPTH: usize = 6;
+
+// Asserts an identical-visible-input pair with different oracle latest at U,
+// and that the candidate commits the same verdict in both.
+fn path_064_assert_indistinguishable(quiet: &Path064System, loss: &Path064System) {
+    let use_at = PATH_064_USE;
+    assert_eq!(quiet.visible(), loss.visible());
+    assert!(quiet.visible().frontier >= use_at.0);
+    assert_ne!(
+        path_064_oracle_latest(quiet, use_at),
+        path_064_oracle_latest(loss, use_at)
+    );
+    let verdict_q = path_064_candidate_latest(&quiet.visible(), use_at);
+    let verdict_l = path_064_candidate_latest(&loss.visible(), use_at);
+    assert_eq!(verdict_q, verdict_l);
+    assert!(matches!(verdict_q, Path061UseVerdict::CurrentLatest(_)));
+    assert!(path_064_verdict_is_sound(verdict_q, quiet, use_at));
+    assert!(!path_064_verdict_is_sound(verdict_l, loss, use_at));
+}
+
+// ---------------------------------------------------------------------
+// Candidate A — authority before source append
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_a_authority_before_append_returns_hidden_loss() {
+    use Path064Op::*;
+    let arch = Path064Architecture::AuthorityBeforeAppend;
+
+    // Positive control: declared, then mirrored successfully.
+    let mirrored = path_064_run(
+        arch,
+        &[
+            DeclareWorld {
+                id: 1,
+                sequence: 105,
+                epoch: 4,
+            },
+            Append { id: 1 },
+            Checkpoint { sequence: 110 },
+        ],
+    );
+    assert!(!path_064_oracle_hidden_authority(&mirrored));
+    assert_eq!(
+        path_064_candidate_latest(&mirrored.visible(), PATH_064_USE),
+        Path061UseVerdict::CurrentLatest(4)
+    );
+
+    // Q: nothing happens; the source checkpoints through U.
+    let quiet = path_064_run(arch, &[Checkpoint { sequence: 110 }]);
+    // L: epoch 4 becomes authoritative at 105; its append is lost; the
+    // source then advances its frontier through other activity.
+    let loss = path_064_run(
+        arch,
+        &[
+            DeclareWorld {
+                id: 1,
+                sequence: 105,
+                epoch: 4,
+            },
+            FailAppend { id: 1 },
+            Checkpoint { sequence: 110 },
+        ],
+    );
+    assert!(path_064_oracle_hidden_authority(&loss));
+    path_064_assert_indistinguishable(&quiet, &loss);
+
+    // A late mirror cannot repair it: 105 is below the frontier.
+    let late = path_064_try(
+        arch,
+        &[
+            DeclareWorld {
+                id: 1,
+                sequence: 105,
+                epoch: 4,
+            },
+            Checkpoint { sequence: 110 },
+            Append { id: 1 },
+        ],
+    );
+    assert_eq!(late.err(), Some((2, Append { id: 1 })));
+}
+
+// ---------------------------------------------------------------------
+// Candidate B — append before authority (separate promotion step)
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_b_append_then_promote_closes_hidden_authority_but_opens_the_converse() {
+    use Path064Op::*;
+    let arch = Path064Architecture::AppendThenPromote;
+    let p1 = Propose {
+        id: 1,
+        sequence: 105,
+        epoch: 4,
+    };
+
+    // Failed append and abort create nothing authoritative.
+    let failed = path_064_run(arch, &[p1, FailAppend { id: 1 }, Checkpoint { sequence: 110 }]);
+    assert_eq!(path_064_oracle_latest(&failed, PATH_064_USE), 3);
+    let aborted = path_064_run(arch, &[p1, Abort { id: 1 }, Checkpoint { sequence: 110 }]);
+    assert_eq!(path_064_oracle_latest(&aborted, PATH_064_USE), 3);
+    // Promotion requires a committed entry.
+    assert!(path_064_try(arch, &[p1, Promote { id: 1 }]).is_err());
+    // Retry after failure succeeds; duplicate id is rejected.
+    let retried = path_064_run(
+        arch,
+        &[p1, FailAppend { id: 1 }, Append { id: 1 }, Promote { id: 1 }],
+    );
+    assert_eq!(path_064_oracle_latest(&retried, PATH_064_USE), 4);
+    assert!(path_064_try(arch, &[p1, p1]).is_err());
+
+    // Exhaustive: authority => committed always holds; the converse does not.
+    let reach = path_064_reachability(arch, PATH_064_DEPTH);
+    assert!(!reach.hidden_authority);
+    assert!(reach.unauthorized_commit);
+    assert!(reach.unsound_commitment);
+
+    // Pair: same log (epoch 4 committed at 105), promoted in one world only.
+    let promoted = path_064_run(
+        arch,
+        &[p1, Append { id: 1 }, Promote { id: 1 }, Checkpoint { sequence: 110 }],
+    );
+    let unpromoted = path_064_run(arch, &[p1, Append { id: 1 }, Checkpoint { sequence: 110 }]);
+    assert!(path_064_oracle_unauthorized_commit(&unpromoted));
+    path_064_assert_indistinguishable(&promoted, &unpromoted);
+}
+
+// ---------------------------------------------------------------------
+// Candidate C — atomic append/commit
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_c_atomic_commit_makes_hidden_authority_unconstructible() {
+    use Path064Op::*;
+    let arch = Path064Architecture::AtomicCommit;
+
+    // Exhaustive over the alphabet: neither direction of the iff fails,
+    // and the candidate never commits an unsound verdict.
+    let reach = path_064_reachability(arch, PATH_064_DEPTH);
+    assert!(reach.states > 100);
+    assert!(!reach.hidden_authority);
+    assert!(!reach.unauthorized_commit);
+    assert!(!reach.unsound_commitment);
+
+    // Every negative construction from A, D, E, G1 is rejected at the first
+    // operation the architecture does not have.
+    let attempts: [&[Path064Op]; 4] = [
+        &[DeclareWorld {
+            id: 1,
+            sequence: 105,
+            epoch: 4,
+        }],
+        &[Bypass {
+            sequence: 105,
+            epoch: 4,
+        }],
+        &[ForkCommit {
+            sequence: 105,
+            epoch: 4,
+        }],
+        &[
+            Propose {
+                id: 1,
+                sequence: 105,
+                epoch: 4,
+            },
+            Ack { id: 1 },
+        ],
+    ];
+    for ops in attempts {
+        let rejected = path_064_try(arch, ops).err().expect("rejected");
+        assert_eq!(rejected.0, ops.len() - 1);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Candidate D — hidden bypass write path
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_d_bypass_write_path_is_indistinguishable() {
+    use Path064Op::*;
+    let arch = Path064Architecture::AtomicCommitWithBypass;
+
+    let quiet = path_064_run(arch, &[Checkpoint { sequence: 110 }]);
+    let bypassed = path_064_run(
+        arch,
+        &[
+            Bypass {
+                sequence: 105,
+                epoch: 4,
+            },
+            Checkpoint { sequence: 110 },
+        ],
+    );
+    assert!(path_064_oracle_hidden_authority(&bypassed));
+    assert!(!path_064_oracle_unauthorized_commit(&bypassed));
+    path_064_assert_indistinguishable(&quiet, &bypassed);
+
+    let reach = path_064_reachability(arch, PATH_064_DEPTH);
+    assert!(reach.hidden_authority);
+    assert!(!reach.unauthorized_commit);
+}
+
+// ---------------------------------------------------------------------
+// Candidate E — two authoritative writers / fork
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_e_complete_log_does_not_cover_a_second_authority_log() {
+    use Path064Op::*;
+    let arch = Path064Architecture::TwoAuthorityLogs;
+
+    let quiet = path_064_run(arch, &[Checkpoint { sequence: 110 }]);
+    let forked = path_064_run(
+        arch,
+        &[
+            ForkCommit {
+                sequence: 105,
+                epoch: 4,
+            },
+            Checkpoint { sequence: 110 },
+        ],
+    );
+    // Log A is internally complete: every entry it committed is authoritative.
+    assert!(!path_064_oracle_unauthorized_commit(&forked));
+    assert!(path_064_oracle_hidden_authority(&forked));
+    path_064_assert_indistinguishable(&quiet, &forked);
+}
+
+// ---------------------------------------------------------------------
+// Candidate F — canonical log defines authority (positive control)
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_f_canonical_log_defines_authority_positive_control() {
+    use Path064Op::*;
+    let arch = Path064Architecture::AtomicCommit;
+    let p = |id, sequence, epoch| Propose {
+        id,
+        sequence,
+        epoch,
+    };
+    let cp = |sequence| Checkpoint { sequence };
+
+    let cases: Vec<(&str, Vec<Path064Op>, Path061UseVerdict)> = vec![
+        ("no change", vec![cp(110)], Path061UseVerdict::CurrentLatest(3)),
+        (
+            "one change",
+            vec![p(1, 105, 4), Append { id: 1 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(4),
+        ),
+        (
+            "multiple changes",
+            vec![p(1, 103, 4), Append { id: 1 }, p(2, 107, 5), Append { id: 2 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(5),
+        ),
+        (
+            "failed proposal before U",
+            vec![p(1, 105, 4), FailAppend { id: 1 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(3),
+        ),
+        (
+            "failed then successful retry",
+            vec![p(1, 105, 4), FailAppend { id: 1 }, Append { id: 1 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(4),
+        ),
+        (
+            "duplicate content, second append refused",
+            vec![p(1, 105, 4), p(2, 105, 4), Append { id: 1 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(4),
+        ),
+        (
+            "change exactly at U",
+            vec![p(1, 110, 4), Append { id: 1 }],
+            Path061UseVerdict::CurrentLatest(4),
+        ),
+        (
+            "proposal after U",
+            vec![p(1, 115, 4), Append { id: 1 }],
+            Path061UseVerdict::CurrentLatest(3),
+        ),
+        (
+            "aborted transition",
+            vec![p(1, 105, 4), Abort { id: 1 }, cp(110)],
+            Path061UseVerdict::CurrentLatest(3),
+        ),
+        (
+            "frontier short of U",
+            vec![p(1, 105, 4), Append { id: 1 }],
+            Path061UseVerdict::Unresolved,
+        ),
+    ];
+
+    for (name, ops, expected) in cases {
+        let sys = path_064_run(arch, &ops);
+        assert!(!path_064_oracle_hidden_authority(&sys), "{name}");
+        assert!(!path_064_oracle_unauthorized_commit(&sys), "{name}");
+        let verdict = path_064_candidate_latest(&sys.visible(), PATH_064_USE);
+        assert_eq!(verdict, expected, "{name}");
+        assert!(path_064_verdict_is_sound(verdict, &sys, PATH_064_USE), "{name}");
+    }
+
+    // Refusals that keep the log closed.
+    assert!(path_064_try(arch, &[p(1, 105, 4), p(1, 106, 5)]).is_err()); // duplicate id
+    assert!(
+        path_064_try(arch, &[p(1, 105, 4), p(2, 105, 4), Append { id: 1 }, Append { id: 2 }])
+            .is_err()
+    );
+    assert!(path_064_try(arch, &[p(1, 105, 4), Abort { id: 1 }, Append { id: 1 }]).is_err());
+    assert!(path_064_try(arch, &[p(1, 105, 4), cp(110), Append { id: 1 }]).is_err());
+}
+
+#[test]
+fn path_064_g_frontier_closes_history_only_under_monotone_sequencing() {
+    use Path064Op::*;
+
+    // Monotone log: from any reachable state with frontier >= U, no accepted
+    // operation changes the authoritative latest at U (one-step, exhaustive).
+    let arch = Path064Architecture::AtomicCommit;
+    let alphabet = path_064_alphabet();
+    let mut closed_states = 0;
+    path_064_explore(
+        &Path064System::new(arch),
+        &alphabet,
+        PATH_064_DEPTH - 1,
+        &mut Vec::new(),
+        &mut |_, sys| {
+            if sys.frontier() < PATH_064_USE.0 {
+                return;
+            }
+            closed_states += 1;
+            let before = path_064_oracle_latest(sys, PATH_064_USE);
+            for &op in &alphabet {
+                let mut next = sys.clone();
+                if next.apply(op).is_ok() {
+                    assert_eq!(path_064_oracle_latest(&next, PATH_064_USE), before);
+                }
+            }
+        },
+    );
+    assert!(closed_states > 10);
+
+    // Backfill: atomic and exclusive, but the log accepts appends below its
+    // frontier. A verdict issued at frontier >= U is invalidated later.
+    let arch = Path064Architecture::AtomicCommitWithBackfill;
+    let mut sys = path_064_run(arch, &[Checkpoint { sequence: 110 }]);
+    let verdict = path_064_candidate_latest(&sys.visible(), PATH_064_USE);
+    assert_eq!(verdict, Path061UseVerdict::CurrentLatest(3));
+    assert!(path_064_verdict_is_sound(verdict, &sys, PATH_064_USE));
+    sys.apply(Propose {
+        id: 1,
+        sequence: 105,
+        epoch: 4,
+    })
+    .unwrap();
+    sys.apply(Append { id: 1 }).unwrap();
+    assert!(!path_064_oracle_hidden_authority(&sys));
+    assert!(!path_064_verdict_is_sound(verdict, &sys, PATH_064_USE));
+
+    // At each instant the backfill log is still complete (iff holds).
+    let reach = path_064_reachability(arch, PATH_064_DEPTH);
+    assert!(!reach.hidden_authority);
+    assert!(!reach.unauthorized_commit);
+}
+
+// ---------------------------------------------------------------------
+// Candidate G — acknowledgement semantics
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_h_pre_commit_ack_recreates_authoritative_but_unlogged_state() {
+    use Path064Op::*;
+    let p1 = Propose {
+        id: 1,
+        sequence: 105,
+        epoch: 4,
+    };
+
+    // G1: ACK before commit, then the proposal is lost (crash = abort).
+    let arch = Path064Architecture::PreCommitAck;
+    let quiet = path_064_run(arch, &[Checkpoint { sequence: 110 }]);
+    let acked_lost = path_064_run(
+        arch,
+        &[p1, Ack { id: 1 }, Abort { id: 1 }, Checkpoint { sequence: 110 }],
+    );
+    assert!(path_064_oracle_hidden_authority(&acked_lost));
+    path_064_assert_indistinguishable(&quiet, &acked_lost);
+
+    // G2: ACK only after commit. A pre-commit ACK is not an operation.
+    let arch = Path064Architecture::PostCommitAck;
+    assert!(path_064_try(arch, &[p1, Ack { id: 1 }]).is_err());
+    let acked = path_064_run(arch, &[p1, Append { id: 1 }, Ack { id: 1 }]);
+    assert!(!path_064_oracle_hidden_authority(&acked));
+    let reach = path_064_reachability(arch, PATH_064_DEPTH);
+    assert!(!reach.hidden_authority);
+    assert!(!reach.unauthorized_commit);
+    assert!(!reach.unsound_commitment);
+}
+
+// ---------------------------------------------------------------------
+// Central invariant: authoritative(e) <=> committed(e)
+// ---------------------------------------------------------------------
+
+#[test]
+fn path_064_i_central_iff_matrix() {
+    use Path064Architecture as Arch;
+    // (arch, authoritative=>committed fails?, committed=>authoritative fails?)
+    let expected = [
+        (Arch::AuthorityBeforeAppend, true, false),
+        (Arch::AppendThenPromote, false, true),
+        (Arch::AtomicCommit, false, false),
+        (Arch::AtomicCommitWithBackfill, false, false),
+        (Arch::AtomicCommitWithBypass, true, false),
+        (Arch::TwoAuthorityLogs, true, false),
+        (Arch::PreCommitAck, true, false),
+        (Arch::PostCommitAck, false, false),
+    ];
+    for (arch, hidden, unauthorized) in expected {
+        let reach = path_064_reachability(arch, PATH_064_DEPTH);
+        assert_eq!(reach.hidden_authority, hidden, "{arch:?}");
+        assert_eq!(reach.unauthorized_commit, unauthorized, "{arch:?}");
+        // The candidate is unsound somewhere iff either direction fails.
+        assert_eq!(reach.unsound_commitment, hidden || unauthorized, "{arch:?}");
+    }
+}
