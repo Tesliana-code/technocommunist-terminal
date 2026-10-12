@@ -39,3 +39,23 @@ jobs:
             clippy) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings ;;
             *) exit 2 ;;
           esac
+
+  adversarial:
+    name: Adversarial ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - path_059_authority_recovery
+          - path_060_history_completeness_witness
+          - pathological_cases
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install stable Rust without third-party actions
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Verify ${{ matrix.suite }} without suppressing failures
+        run: cargo test --locked --test ${{ matrix.suite }}
