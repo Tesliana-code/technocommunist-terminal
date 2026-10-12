@@ -1,0 +1,53 @@
+name: Distribution operator sandbox smoke
+
+on:
+  pull_request:
+    paths:
+      - 'src/bin/distribution-engine-operator.rs'
+      - '.github/workflows/operator-ui-smoke.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-operator-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  operator:
+    name: Operator ${{ matrix.gate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [format, check, tests]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Verify operator binary without running interactive UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.gate }}' in
+            format) rustfmt --check --edition 2024 src/bin/distribution-engine-operator.rs ;;
+            check) cargo check --locked --bin distribution-engine-operator ;;
+            tests) cargo test --locked --bin distribution-engine-operator ;;
+            *) exit 2 ;;
+          esac
+
+  diff-check:
+    name: Operator CI-only diff check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - run: git diff --check ${{ github.event.pull_request.base.sha }}...HEAD
