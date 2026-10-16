@@ -4,7 +4,7 @@
 
 > Old-school terminal aesthetics. Modern deterministic economics.
 
-Technocommunistic COBOL Terminal is a Rust research laboratory at the intersection of finance, economics, mathematics, graph theory, mechanism design, adversarial testing, and deterministic software engineering.
+Technocommunist Terminal is a Rust research laboratory at the intersection of finance, economics, mathematics, graph theory, mechanism design, adversarial testing, and deterministic software engineering.
 
 Its central research question:
 
@@ -72,7 +72,7 @@ Graph-derived dependency independence → shared bottleneck detection → counte
 
 ---
 
-*Technocommunistic COBOL Terminal → adversarially auditable economic attribution engine*
+*Technocommunist Terminal → adversarially auditable economic attribution engine*
 
 *based deterministic distribution protocol*
 
