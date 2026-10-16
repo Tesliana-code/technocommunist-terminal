@@ -1,4 +1,4 @@
-# Technocommunistic COBOL Terminal
+# Technocommunistic Terminal
 
 ### Experimental Economic Protocol Laboratory
 
