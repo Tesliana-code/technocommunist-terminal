@@ -1,4 +1,4 @@
-# Technocommunistic Terminal
+# Technocommunist Terminal
 
 ### Experimental Economic Protocol Laboratory
 
